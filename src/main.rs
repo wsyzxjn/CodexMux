@@ -1,13 +1,9 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use modelmux::{
-    catalog,
-    codex_config::{ConfigManager, ManagedConfig, PROXY_TOKEN_ENV},
+    codex_config::{ConfigManager, PROXY_TOKEN_ENV},
     config::{Credentials, Paths, Settings},
     launch_agent, secrets,
     server::{self, AppState},
@@ -26,13 +22,13 @@ enum Command {
     Init,
     /// Run the loopback proxy in the foreground.
     Serve,
-    /// Merge the current bundled catalog and point Codex at ModelMux.
+    /// Point Codex at ModelMux's dynamic model catalog and Responses proxy.
     Enable,
     /// Restore the Codex configuration ModelMux previously changed.
     Disable,
     /// Show paths and managed configuration state.
     Status,
-    /// Validate config, credentials, catalog, and the managed Codex block.
+    /// Validate config, credentials, snapshot, and the managed Codex block.
     Doctor,
     /// Install and start the per-user macOS LaunchAgent.
     Install,
@@ -54,10 +50,7 @@ async fn main() -> Result<()> {
         Command::Serve => {
             let settings = Settings::load(&paths.settings)?;
             let credentials = secrets::load(&paths.credentials)?;
-            let codex = codex_binary()?;
-            let bundled = catalog::query_bundled_catalog(&codex)?;
-            let official_models = catalog::model_slugs(&bundled)?;
-            server::serve(AppState::new(settings, credentials, official_models)?).await
+            server::serve(AppState::new(settings, credentials, paths.catalog.clone())?).await
         }
         Command::Enable => enable(&paths),
         Command::Disable => config_manager(&paths)?.disable(),
@@ -88,16 +81,18 @@ fn init(paths: &Paths) -> Result<()> {
         secrets::save(
             &paths.credentials,
             &Credentials {
-                schema_version: 1,
                 proxy_token: uuid::Uuid::new_v4().simple().to_string(),
-                providers: HashMap::new(),
+                cpa_token: uuid::Uuid::new_v4().simple().to_string(),
             },
         )?;
     }
     println!("initialized {}", paths.root.display());
-    println!("edit {} to add providers", paths.settings.display());
     println!(
-        "edit {} to add provider credentials",
+        "edit {} to configure the CPA endpoint",
+        paths.settings.display()
+    );
+    println!(
+        "set cpa_token in {} to the token accepted by CPA",
         paths.credentials.display()
     );
     println!("set {PROXY_TOKEN_ENV} from credentials.json before starting Codex");
@@ -107,16 +102,9 @@ fn init(paths: &Paths) -> Result<()> {
 fn enable(paths: &Paths) -> Result<()> {
     let settings = Settings::load(&paths.settings)?;
     secrets::load(&paths.credentials)?;
-    let codex = codex_binary()?;
-    let base = catalog::query_bundled_catalog(&codex)?;
-    let merged = catalog::merge(&base, &settings)?;
-    catalog::save(&paths.catalog, &merged)?;
-    config_manager(paths)?.enable(&ManagedConfig {
-        catalog_path: paths.catalog.clone(),
-        loopback_base_url: format!("http://{}/v1", settings.listen),
-    })?;
+    config_manager(paths)?.enable(&format!("http://{}/v1", settings.listen))?;
     println!("enabled ModelMux in {}", codex_config_path()?.display());
-    println!("catalog: {}", paths.catalog.display());
+    println!("catalog: http://{}/v1/models", settings.listen);
     println!("proxy: http://{}/v1", settings.listen);
     Ok(())
 }
@@ -140,22 +128,7 @@ async fn doctor(paths: &Paths) -> Result<()> {
         std::env::var(PROXY_TOKEN_ENV).as_deref() == Ok(credentials.proxy_token.as_str()),
         "{PROXY_TOKEN_ENV} is missing or does not match credentials.json"
     );
-    for provider in settings.providers.iter().filter(|provider| {
-        provider.enabled && provider.kind == modelmux::config::ProviderKind::External
-    }) {
-        anyhow::ensure!(
-            credentials.providers.contains_key(&provider.id),
-            "provider {} has no credential",
-            provider.id
-        );
-    }
-    let codex = codex_binary().context("codex binary check failed")?;
-    let bundled = catalog::query_bundled_catalog(&codex).context("bundled catalog check failed")?;
-    catalog::merge(&bundled, &settings).context("catalog merge check failed")?;
     let status = config_manager(paths)?.status()?;
-    if status.enabled {
-        anyhow::ensure!(paths.catalog.is_file(), "managed catalog is missing");
-    }
     match reqwest::Client::new()
         .get(format!("http://{}/health", settings.listen))
         .header("x-modelmux-token", &credentials.proxy_token)
@@ -165,9 +138,33 @@ async fn doctor(paths: &Paths) -> Result<()> {
         Ok(response) if response.status().is_success() => println!("proxy: reachable"),
         _ => println!("proxy: not running"),
     }
+    let cpa_base = settings.cpa.base_url.trim_end_matches('/');
+    let cpa_health = format!(
+        "{}/health",
+        cpa_base.strip_suffix("/v1").unwrap_or(cpa_base)
+    );
+    match reqwest::Client::new()
+        .get(cpa_health)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", credentials.cpa_token),
+        )
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => println!("CPA: reachable"),
+        _ => println!("CPA: not reachable"),
+    }
     println!("settings: ok");
     println!("credentials: ok");
-    println!("bundled catalog: ok ({})", codex.display());
+    println!(
+        "catalog snapshot: {}",
+        if paths.catalog.is_file() {
+            "available"
+        } else {
+            "not fetched yet"
+        }
+    );
     println!(
         "managed config: {}",
         if status.enabled {
@@ -189,25 +186,4 @@ fn config_manager(paths: &Paths) -> Result<ConfigManager> {
 
 fn codex_config_path() -> Result<PathBuf> {
     modelmux::codex_config::codex_config_path()
-}
-
-fn codex_binary() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("CODEX_BINARY") {
-        let path = PathBuf::from(path);
-        anyhow::ensure!(path.is_file(), "CODEX_BINARY does not point to a file");
-        return Ok(path);
-    }
-    let bundled = Path::new("/Applications/ChatGPT.app/Contents/Resources/codex");
-    if bundled.is_file() {
-        return Ok(bundled.to_path_buf());
-    }
-    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
-    if let Some(path) = std::env::var_os("PATH").as_deref().and_then(|search| {
-        std::env::split_paths(search)
-            .map(|dir| dir.join(name))
-            .find(|path| path.is_file())
-    }) {
-        return Ok(path);
-    }
-    anyhow::bail!("cannot find codex; set CODEX_BINARY")
 }

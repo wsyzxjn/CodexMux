@@ -185,7 +185,10 @@ pub fn portable_input_items(input: Option<&Value>) -> Vec<Value> {
             "role": "user",
             "content": [{"type": "input_text", "text": text}]
         })],
-        Some(Value::Array(items)) => items.iter().filter_map(portable_item).collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| portable_item(item, true))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -193,7 +196,10 @@ pub fn portable_input_items(input: Option<&Value>) -> Vec<Value> {
 /// Filter a response `output` array to its portable items.
 pub fn portable_output_items(output: Option<&Value>) -> Vec<Value> {
     match output {
-        Some(Value::Array(items)) => items.iter().filter_map(portable_item).collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| portable_item(item, false))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -201,7 +207,7 @@ pub fn portable_output_items(output: Option<&Value>) -> Vec<Value> {
 /// Keep an item only when its type is portable; strip the provider-assigned
 /// `id` and `status` fields so a replay never carries another provider's
 /// identifiers.
-fn portable_item(item: &Value) -> Option<Value> {
+fn portable_item(item: &Value, allow_images: bool) -> Option<Value> {
     let object = item.as_object()?;
     let kind = object.get("type").and_then(Value::as_str);
     match kind {
@@ -209,23 +215,33 @@ fn portable_item(item: &Value) -> Option<Value> {
             let mut kept = Map::new();
             kept.insert("type".into(), json!("message"));
             copy_string(&mut kept, object, "role");
-            kept.insert("content".into(), public_content(object.get("content"))?);
+            kept.insert(
+                "content".into(),
+                public_content(object.get("content"), allow_images)?,
+            );
             Some(Value::Object(kept))
         }
-        Some("function_call") | Some("custom_tool_call") => {
+        Some("function_call") => {
             let mut kept = Map::new();
-            kept.insert("type".into(), Value::String(kind?.into()));
-            copy_string(&mut kept, object, "call_id");
-            copy_string(&mut kept, object, "name");
-            copy_value(&mut kept, object, "arguments");
-            copy_value(&mut kept, object, "input");
+            kept.insert("type".into(), json!("function_call"));
+            kept.insert("call_id".into(), required_string(object, "call_id")?);
+            kept.insert("name".into(), required_string(object, "name")?);
+            kept.insert("arguments".into(), required_string(object, "arguments")?);
+            Some(Value::Object(kept))
+        }
+        Some("custom_tool_call") => {
+            let mut kept = Map::new();
+            kept.insert("type".into(), json!("custom_tool_call"));
+            kept.insert("call_id".into(), required_string(object, "call_id")?);
+            kept.insert("name".into(), required_string(object, "name")?);
+            kept.insert("input".into(), required_string(object, "input")?);
             Some(Value::Object(kept))
         }
         Some("function_call_output") | Some("custom_tool_call_output") => {
             let mut kept = Map::new();
             kept.insert("type".into(), Value::String(kind?.into()));
-            copy_string(&mut kept, object, "call_id");
-            copy_value(&mut kept, object, "output");
+            kept.insert("call_id".into(), required_string(object, "call_id")?);
+            kept.insert("output".into(), public_tool_output(object.get("output"))?);
             Some(Value::Object(kept))
         }
         Some("compaction") => {
@@ -234,7 +250,7 @@ fn portable_item(item: &Value) -> Option<Value> {
             if let Some(summary) = public_text_value(object.get("summary")) {
                 kept.insert("summary".into(), summary);
             }
-            if let Some(content) = public_content(object.get("content")) {
+            if let Some(content) = public_content(object.get("content"), allow_images) {
                 kept.insert("content".into(), content);
             }
             (kept.len() > 1).then_some(Value::Object(kept))
@@ -242,7 +258,10 @@ fn portable_item(item: &Value) -> Option<Value> {
         None if object.contains_key("role") => {
             let mut kept = Map::new();
             copy_string(&mut kept, object, "role");
-            kept.insert("content".into(), public_content(object.get("content"))?);
+            kept.insert(
+                "content".into(),
+                public_content(object.get("content"), allow_images)?,
+            );
             Some(Value::Object(kept))
         }
         _ => None,
@@ -255,9 +274,24 @@ fn copy_string(target: &mut Map<String, Value>, source: &Map<String, Value>, key
     }
 }
 
-fn copy_value(target: &mut Map<String, Value>, source: &Map<String, Value>, key: &str) {
-    if let Some(value) = source.get(key).filter(|value| !value.is_null()) {
-        target.insert(key.into(), value.clone());
+fn required_string(source: &Map<String, Value>, key: &str) -> Option<Value> {
+    source
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|value| Value::String(value.to_owned()))
+}
+
+fn public_tool_output(value: Option<&Value>) -> Option<Value> {
+    match value? {
+        Value::String(text) => Some(Value::String(text.clone())),
+        Value::Array(parts) => {
+            let sanitized: Vec<Value> = parts
+                .iter()
+                .filter_map(|part| public_content_part(part, true))
+                .collect();
+            (!sanitized.is_empty()).then_some(Value::Array(sanitized))
+        }
+        _ => None,
     }
 }
 
@@ -279,18 +313,21 @@ fn public_text_value(value: Option<&Value>) -> Option<Value> {
     }
 }
 
-fn public_content(value: Option<&Value>) -> Option<Value> {
+fn public_content(value: Option<&Value>, allow_images: bool) -> Option<Value> {
     match value? {
         Value::String(text) => Some(Value::String(text.clone())),
         Value::Array(parts) => {
-            let sanitized: Vec<Value> = parts.iter().filter_map(public_content_part).collect();
+            let sanitized: Vec<Value> = parts
+                .iter()
+                .filter_map(|part| public_content_part(part, allow_images))
+                .collect();
             (!sanitized.is_empty()).then_some(Value::Array(sanitized))
         }
         _ => None,
     }
 }
 
-fn public_content_part(part: &Value) -> Option<Value> {
+fn public_content_part(part: &Value, allow_images: bool) -> Option<Value> {
     if let Value::String(text) = part {
         return Some(Value::String(text.clone()));
     }
@@ -302,17 +339,7 @@ fn public_content_part(part: &Value) -> Option<Value> {
         "input_text" | "output_text" | "text" => {
             copy_string(&mut kept, object, "text");
         }
-        "input_image" | "image_url" => {
-            let url = object
-                .get("image_url")
-                .and_then(|value| match value {
-                    Value::String(url) => Some(url.as_str()),
-                    Value::Object(image) => image.get("url").and_then(Value::as_str),
-                    _ => None,
-                })
-                .or_else(|| object.get("url").and_then(Value::as_str))?;
-            kept.insert("image_url".into(), Value::String(url.to_owned()));
-        }
+        "input_image" | "image_url" if allow_images => return None,
         _ => return None,
     }
     (kept.len() > 1).then_some(Value::Object(kept))
@@ -427,27 +454,59 @@ mod tests {
     }
 
     #[test]
-    fn image_replay_keeps_only_the_public_url() {
+    fn image_replay_is_dropped_even_for_public_urls() {
         let input = json!([{
             "type": "message",
             "role": "user",
             "content": [{
                 "type": "input_image",
-                "image_url": {
-                    "url": "https://example.com/image.png",
-                    "encrypted_content": "never-forward",
-                    "provider_state": {"secret": true}
-                }
+                "image_url": "https://example.com/image.png"
             }]
+        }]);
+        assert!(portable_input_items(Some(&input)).is_empty());
+    }
+
+    #[test]
+    fn tool_outputs_strip_nested_private_state() {
+        let input = json!([{
+            "type":"function_call_output", "call_id":"call-1",
+            "output":[
+                {"type":"input_text","text":"public","encrypted_content":"secret"},
+                {"type":"private","signature":"secret"}
+            ],
+            "provider_state":"secret"
         }]);
         let items = portable_input_items(Some(&input));
         assert_eq!(
-            items[0]["content"][0],
-            json!({"type": "input_image", "image_url": "https://example.com/image.png"})
+            items,
+            vec![json!({
+                "type":"function_call_output", "call_id":"call-1",
+                "output":[{"type":"input_text","text":"public"}]
+            })]
         );
         let text = serde_json::to_string(&items).unwrap();
-        assert!(!text.contains("never-forward"));
-        assert!(!text.contains("provider_state"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("signature"));
+    }
+
+    #[test]
+    fn image_replay_rejects_nonpublic_urls() {
+        for url in [
+            "file:///tmp/private",
+            "data:image/png;base64,AA==",
+            "http://example.com/image.png",
+            "https://user:pass@example.com/image.png",
+            "https://127.0.0.1/image.png",
+            "https://10.0.0.1/image.png",
+            "https://[::1]/image.png",
+            "https://[::ffff:127.0.0.1]/image.png",
+        ] {
+            let input = json!([{
+                "type":"message", "role":"user",
+                "content":[{"type":"input_image","image_url":url}]
+            }]);
+            assert!(portable_input_items(Some(&input)).is_empty(), "{url}");
+        }
     }
 
     #[test]

@@ -1,35 +1,47 @@
 # ModelMux
 
-ModelMux is a small local Responses router for Codex Desktop and Codex CLI. It
-keeps Codex on one global `model_provider`, adds explicitly configured external
-models to the bundled model catalog, and selects the real upstream from each
-request's exact `model` value.
+ModelMux is a small, macOS-first Responses router for Codex Desktop and Codex
+CLI. Codex uses ModelMux as its single model provider. ModelMux fetches and merges
+two native Codex model catalogs:
 
-It is deliberately not a general LLM gateway. The only upstream dialects are:
+- the current account's official ChatGPT Codex catalog;
+- CPA's (`router-for-me/CLIProxyAPI`) Codex catalog.
 
-- `responses`: native OpenAI Responses, passed through unchanged;
-- `openai_chat`: Responses requests converted to Chat Completions and JSON/SSE
-  responses converted back;
-- `anthropic_messages`: Responses requests converted to Messages and JSON/SSE
-  responses converted back.
+Official model slugs remain unchanged. CPA models receive a stable `cpa/`
+namespace, so the official `gpt-5.6` and CPA's `cpa/gpt-5.6` can coexist in the
+Codex model picker. Requests route by the exact selected slug.
 
-## Status
-
-The initial implementation includes loopback admission, official OAuth versus
-external credential isolation, merged model catalogs, reversible Codex config
-management, Chat and Messages translation, and in-memory cross-provider public
-history replay. `responses/compact` is currently supported only by native
-Responses providers; translated providers receive an explicit 501 response.
+ModelMux does not translate Chat Completions or Anthropic Messages. CPA owns all
+external-provider protocol conversion and compatibility behavior. ModelMux stays
+focused on catalog aggregation, credential isolation, exact routing, and safe
+conversation handoff when the selected model changes.
 
 ## Build
 
 ```bash
 cargo build --release
-cargo test --all-targets
+cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
 ```
 
-## Configure
+## Configure CPA
+
+Run CPA on loopback and configure provider credentials, aliases, and models there.
+CPA's top-level `api-keys` must include the same token stored as `cpa_token` in
+ModelMux:
+
+```yaml
+host: 127.0.0.1
+port: 8317
+api-keys:
+  - replace-with-a-private-cpa-token
+```
+
+Provider credentials remain in CPA. ModelMux never stores final provider API
+keys.
+
+## Configure ModelMux
 
 Initialize the data directory:
 
@@ -40,78 +52,92 @@ cargo run -- init
 On macOS it defaults to `~/Library/Application Support/ModelMux/`. Set
 `MODELMUX_HOME` to use another root.
 
-`config.toml` starts with the official provider. Add external providers using
-unique model slugs:
+`config.toml` only configures the loopback services:
 
 ```toml
-schema_version = 1
 listen = "127.0.0.1:48682"
 
-[[providers]]
-id = "openai"
-name = "OpenAI"
-kind = "official"
-dialect = "responses"
-base_url = "https://chatgpt.com/backend-api/codex"
-enabled = true
-allow_cross_model_previous_response_id = true
-
-[[providers]]
-id = "deepseek"
-name = "DeepSeek"
-kind = "external"
-dialect = "openai_chat"
-base_url = "https://api.deepseek.com/v1"
-enabled = true
-allow_cross_model_previous_response_id = false
-
-[[providers.models]]
-slug = "deepseek-chat"
-display_name = "DeepSeek Chat"
-context_window = 128000
-accepts_images = false
-
-[[providers]]
-id = "anthropic"
-name = "Anthropic"
-kind = "external"
-dialect = "anthropic_messages"
-base_url = "https://api.anthropic.com/v1"
-credential_header = "x-api-key"
-headers = { anthropic-version = "2023-06-01" }
-enabled = true
-allow_cross_model_previous_response_id = false
-
-[[providers.models]]
-slug = "claude-custom"
-display_name = "Claude Custom"
-context_window = 200000
-accepts_images = true
+[cpa]
+base_url = "http://127.0.0.1:8317/v1"
 ```
 
-Put only secrets in `credentials.json`; ModelMux enforces mode 0600:
+Models are not configured manually. CPA's live catalog is the source of truth.
+
+Put only the two local access tokens in `credentials.json`; ModelMux enforces
+mode 0600:
 
 ```json
 {
-  "schema_version": 1,
   "proxy_token": "generated-by-modelmux-init",
-  "providers": {
-    "deepseek": "provider-api-key",
-    "anthropic": "provider-api-key"
-  }
+  "cpa_token": "replace-with-the-token-in-cpa-api-keys"
 }
 ```
 
-Generate the merged catalog and install the reversible block in Codex's
-`config.toml`:
+`proxy_token` authenticates Codex to ModelMux. `cpa_token` authenticates ModelMux
+to CPA. They must be different. `init` generates both random values; copy the
+generated `cpa_token` into CPA or replace both sides with the same private value.
+
+Enable ModelMux and run the service:
 
 ```bash
 cargo run -- enable
 cargo run -- serve
 ```
 
-To run the compiled binary as a per-user macOS LaunchAgent, place it at a
-stable path and run:
+`enable` installs a reversible Codex provider block. It does not set
+`model_catalog_json`; Codex fetches its catalog dynamically from ModelMux. Restart
+Codex after enabling. Restore the exact prior Codex configuration with:
+
+```bash
+cargo run -- disable
+```
+
+## Dynamic model catalog
+
+Codex requests:
+
+```http
+GET http://127.0.0.1:48682/v1/models?client_version=<Codex version>
+```
+
+ModelMux forwards the same `client_version` in parallel to:
+
+```text
+https://chatgpt.com/backend-api/codex/models
+http://127.0.0.1:8317/v1/models
+```
+
+The official request receives the incoming ChatGPT OAuth and account headers.
+The CPA request receives only the configured CPA bearer token. Credentials cannot
+cross routes.
+
+Both upstream responses must be valid native Codex catalogs before ModelMux
+replaces its state. CPA model objects are preserved, including unknown future
+fields; ModelMux only:
+
+- changes `slug` from `<model>` to `cpa/<model>`;
+- appends ` · CPA` to `display_name`;
+- places CPA entries after official entries;
+- excludes entries with `visibility = "hide"` or `supported_in_api = false`.
+
+The complete merged catalog is atomically saved as `model-catalog.json`. It is
+also the exact route table. A daemon restart restores it, and unknown model slugs
+fail closed. If either catalog refresh fails, ModelMux serves the last complete
+snapshot instead of installing a partial result. Before the first successful
+refresh, model requests fail clearly because no route is known.
+
+When forwarding a CPA request, only its top-level model identity changes:
+
+```text
+cpa/gpt-5.6 → gpt-5.6
+```
+
+The remaining native Responses request is unchanged unless conversation
+continuity also requires public-history replay.
+
+## macOS LaunchAgent
+
+Place the compiled binary at a stable path, then run:
 
 ```bash
 ./modelmux install
@@ -119,41 +145,47 @@ stable path and run:
 ```
 
 `install` records the current executable's absolute path. Move or replace the
-binary before installing, not afterwards. Remove the agent with
-`./modelmux uninstall`; this does not alter Codex's configuration, so use
-`./modelmux disable` separately when you want to restore that file.
-
-Restart Codex after changing the model catalog. To restore the original Codex
-configuration:
-
-```bash
-cargo run -- disable
-```
+binary before installing, not afterwards. Remove the service with
+`./modelmux uninstall`; use `./modelmux disable` separately to restore Codex's
+configuration.
 
 ## Switching models in one thread
 
-Response ids belong to the provider that issued them. When a request references
-an id created on another route, ModelMux removes `previous_response_id` and
-replays only public messages and supported tool call/result items. Reasoning and
-encrypted provider state never cross providers. The store is currently bounded
-and in-memory, so restarting ModelMux removes this switching history.
+Response IDs belong to the exact backend and model that issued them.
+
+- A follow-up on the same official model keeps `previous_response_id` and is
+  forwarded unchanged.
+- Every CPA follow-up removes `previous_response_id` and replays locally recorded
+  public history. CPA may translate Responses to a stateless Chat or Messages
+  provider.
+- Switching official models, switching CPA models, or switching between official
+  and CPA also removes the ID and replays public history.
+
+Only allow-listed text messages, tool calls/results, and public compaction
+content are replayed. Images are deliberately dropped during a handoff because a
+URL cannot be proven public without allowing DNS or redirect-based local access.
+Reasoning, signatures, encrypted content, provider item IDs, statuses, and
+unknown item types never cross routes.
+
+The history store is bounded and in-memory. Restarting ModelMux removes it. An
+unknown, ambiguous, evicted, incomplete, or non-completed response chain is
+rejected rather than forwarding an ID to the wrong backend.
 
 ## Security
 
-- The server refuses non-loopback listen addresses.
-- Every Responses request requires `x-modelmux-token`.
-- Official routes require and retain the incoming Codex OAuth header.
-- External routes remove OAuth, cookies, account headers, and organization
-  headers before injecting the provider's private credential.
-- Credentials are separate from provider configuration and the generated model
-  catalog.
-- `enable` refuses to replace user-owned model provider settings, and `disable`
+- ModelMux binds loopback only and requires `x-modelmux-token` on every route.
+- CPA's configured endpoint must also be loopback.
+- Official routes use only incoming Codex OAuth credentials and the fixed
+  canonical ChatGPT Codex endpoint.
+- CPA routes remove incoming authorization, cookies, account, organization,
+  project, API-key, proxy-auth, and ModelMux-token headers before injecting the
+  private CPA bearer token.
+- Credentials remain in a separate mode-0600 file and are never written into the
+  model catalog, Codex configuration, or API responses.
+- `enable` refuses to overwrite user-owned Codex provider settings, and `disable`
   restores exact original bytes or removes only the unchanged managed block.
 
 ## Attribution
 
-The Anthropic Messages translator, continuity store, catalog shaping rules, and
-reversible config manager were extracted from the ModelMux implementation in
-CodexLoader and then reduced for this standalone project. CC Switch was studied
-for its separation of request conversion, SSE state, and bounded history; no CC
-Switch source code is included.
+CPA (`router-for-me/CLIProxyAPI`) provides external-provider protocol conversion
+and its native Codex model catalog. ModelMux does not include CPA source code.

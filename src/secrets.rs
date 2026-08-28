@@ -22,38 +22,12 @@ pub fn load(path: &Path) -> Result<Credentials> {
         .with_context(|| format!("failed to read credentials file {}", path.display()))?;
     let credentials: Credentials =
         serde_json::from_slice(&bytes).context("invalid credentials.json")?;
-    if credentials.schema_version != 1 {
-        bail!(
-            "unsupported credentials schema version {}",
-            credentials.schema_version
-        );
-    }
-    if credentials.proxy_token.trim().is_empty() {
-        bail!("credentials.json has an empty proxy_token");
-    }
-    for (provider, credential) in &credentials.providers {
-        if credential.trim().is_empty() {
-            bail!("provider {provider} has an empty credential");
-        }
-    }
+    credentials.validate()?;
     Ok(credentials)
 }
 
 pub fn save(path: &Path, credentials: &Credentials) -> Result<()> {
-    if credentials.schema_version != 1 {
-        bail!(
-            "unsupported credentials schema version {}",
-            credentials.schema_version
-        );
-    }
-    if credentials.proxy_token.trim().is_empty() {
-        bail!("credentials.json has an empty proxy_token");
-    }
-    for (provider, credential) in &credentials.providers {
-        if credential.trim().is_empty() {
-            bail!("provider {provider} has an empty credential");
-        }
-    }
+    credentials.validate()?;
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
@@ -74,29 +48,35 @@ pub fn save(path: &Path, credentials: &Credentials) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use tempfile::tempdir;
 
     use super::*;
+
+    fn credentials() -> Credentials {
+        Credentials {
+            proxy_token: "proxy-token".into(),
+            cpa_token: "cpa-token".into(),
+        }
+    }
 
     #[test]
     fn writes_private_permissions() {
         let root = tempdir().unwrap();
         let path = root.path().join("credentials.json");
-        save(
-            &path,
-            &Credentials {
-                schema_version: 1,
-                proxy_token: "token".into(),
-                providers: HashMap::new(),
-            },
-        )
-        .unwrap();
+        save(&path, &credentials()).unwrap();
         #[cfg(unix)]
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn requires_separate_nonempty_tokens() {
+        let mut credentials = credentials();
+        credentials.cpa_token = credentials.proxy_token.clone();
+        assert!(credentials.validate().is_err());
+        credentials.cpa_token.clear();
+        assert!(credentials.validate().is_err());
     }
 }

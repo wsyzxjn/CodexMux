@@ -1,0 +1,6 @@
+{
+  "model" : "cpa/external-model",
+  "input" : "你好 CPA",
+  "metadata" : { "unknown_field" : true },
+  "stream" : false
+}

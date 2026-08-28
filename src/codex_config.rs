@@ -21,15 +21,9 @@ pub struct ConfigManager {
     backup_dir: PathBuf,
 }
 
-#[derive(Clone, Debug)]
-pub struct ManagedConfig {
-    pub catalog_path: PathBuf,
-    pub loopback_base_url: String,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigState {
-    schema_version: u32,
     config_path: PathBuf,
     backup_path: PathBuf,
     original_exists: bool,
@@ -54,9 +48,9 @@ impl ConfigManager {
         }
     }
 
-    pub fn enable(&self, managed: &ManagedConfig) -> Result<()> {
+    pub fn enable(&self, loopback_base_url: &str) -> Result<()> {
         if self.state_path.exists() {
-            return self.replace(managed);
+            return self.replace(loopback_base_url);
         }
         let original_exists = self.config_path.exists();
         let original = if original_exists {
@@ -66,7 +60,7 @@ impl ConfigManager {
         };
         let text = std::str::from_utf8(&original).context("Codex config is not UTF-8")?;
         validate_existing(text)?;
-        let block = managed_block(managed);
+        let block = managed_block(loopback_base_url);
         let section = if text.is_empty() {
             block
         } else {
@@ -81,7 +75,6 @@ impl ConfigManager {
         atomic_write(&backup_path, &original)?;
         atomic_write(&self.config_path, output.as_bytes())?;
         let state = ConfigState {
-            schema_version: 1,
             config_path: self.config_path.clone(),
             backup_path,
             original_exists,
@@ -100,22 +93,26 @@ impl ConfigManager {
         Ok(())
     }
 
-    fn replace(&self, managed: &ManagedConfig) -> Result<()> {
+    fn replace(&self, loopback_base_url: &str) -> Result<()> {
         let mut state = self.load_state()?;
         ensure_same_path(&state.config_path, &self.config_path)?;
         let current = fs::read_to_string(&self.config_path)?;
         if current.matches(&state.managed_block).count() != 1 {
             bail!("Codex config changed inside the managed ModelMux block");
         }
-        let block = managed_block(managed);
-        let section = if current.is_empty() {
-            block
-        } else {
+        let block = managed_block(loopback_base_url);
+        let section = if state.managed_block.ends_with("\n\n") {
             format!("{block}\n")
+        } else {
+            block
         };
         let next = current.replacen(&state.managed_block, &section, 1);
+        let unchanged_outside_managed_block =
+            sha256_bytes(current.as_bytes()) == state.managed_sha256;
         state.managed_block = section;
-        state.managed_sha256 = sha256_bytes(next.as_bytes());
+        if unchanged_outside_managed_block {
+            state.managed_sha256 = sha256_bytes(next.as_bytes());
+        }
         let state_bytes = serde_json::to_vec_pretty(&state)?;
         atomic_write(&self.config_path, next.as_bytes())?;
         if let Err(error) = atomic_write(&self.state_path, &state_bytes) {
@@ -181,9 +178,7 @@ impl ConfigManager {
     }
 
     fn load_state(&self) -> Result<ConfigState> {
-        let state: ConfigState = serde_json::from_slice(&fs::read(&self.state_path)?)?;
-        anyhow::ensure!(state.schema_version == 1, "unsupported config state schema");
-        Ok(state)
+        Ok(serde_json::from_slice(&fs::read(&self.state_path)?)?)
     }
 }
 
@@ -206,13 +201,10 @@ fn ensure_same_path(recorded: &Path, current: &Path) -> Result<()> {
     Ok(())
 }
 
-fn managed_block(managed: &ManagedConfig) -> String {
-    let catalog =
-        toml_edit::Value::from(managed.catalog_path.to_string_lossy().into_owned()).to_string();
-    let base_url = toml_edit::Value::from(managed.loopback_base_url.clone()).to_string();
+fn managed_block(loopback_base_url: &str) -> String {
+    let base_url = toml_edit::Value::from(loopback_base_url).to_string();
     format!(
         "{START_MARKER}\n\
-         model_catalog_json = {catalog}\n\
          model_provider = \"modelmux\"\n\
          model_providers.modelmux = {{ name = \"ModelMux\", base_url = {base_url}, wire_api = \"responses\", requires_openai_auth = true, supports_websockets = false, env_http_headers = {{ x-modelmux-token = \"{PROXY_TOKEN_ENV}\" }} }}\n\
          {END_MARKER}\n"
@@ -243,6 +235,8 @@ mod tests {
 
     use super::*;
 
+    const LOOPBACK_BASE_URL: &str = "http://127.0.0.1:48682/v1";
+
     #[test]
     fn enable_and_disable_restore_exact_bytes() {
         let root = tempdir().unwrap();
@@ -253,17 +247,36 @@ mod tests {
             root.path().join("state.json"),
             root.path().join("backups"),
         );
-        manager
-            .enable(&ManagedConfig {
-                catalog_path: root.path().join("models.json"),
-                loopback_base_url: "http://127.0.0.1:48682/v1".into(),
-            })
-            .unwrap();
+        manager.enable(LOOPBACK_BASE_URL).unwrap();
         let enabled = fs::read_to_string(&config).unwrap();
         assert!(enabled.contains("requires_openai_auth = true"));
+        assert!(!enabled.contains("model_catalog_json"));
         assert!(enabled.contains("env_http_headers"));
         assert!(enabled.contains(PROXY_TOKEN_ENV));
         manager.disable().unwrap();
         assert_eq!(fs::read(&config).unwrap(), b"model = \"gpt\"\n");
+    }
+
+    #[test]
+    fn reenable_never_discards_changes_outside_the_managed_block() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        fs::write(&config, b"model = \"gpt\"\n").unwrap();
+        let manager = ConfigManager::new(
+            config.clone(),
+            root.path().join("state.json"),
+            root.path().join("backups"),
+        );
+        manager.enable(LOOPBACK_BASE_URL).unwrap();
+        let current = fs::read_to_string(&config).unwrap();
+        fs::write(&config, format!("{current}approval_policy = \"never\"\n")).unwrap();
+
+        manager.enable(LOOPBACK_BASE_URL).unwrap();
+        manager.disable().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "model = \"gpt\"\napproval_policy = \"never\"\n"
+        );
     }
 }
