@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{future::Future, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -20,19 +20,15 @@ struct Cli {
 enum Command {
     /// Create the private data directory and starter configuration.
     Init,
-    /// Run the loopback proxy in the foreground.
+    /// Run the proxy in the foreground and manage Codex configuration.
     Serve,
-    /// Point Codex at ModelMux's dynamic model catalog and Responses proxy.
-    Enable,
-    /// Restore the Codex configuration ModelMux previously changed.
-    Disable,
     /// Show paths and managed configuration state.
     Status,
     /// Validate config, credentials, snapshot, and the managed Codex block.
     Doctor,
     /// Install and start the per-user macOS LaunchAgent.
     Install,
-    /// Stop and remove the per-user macOS LaunchAgent.
+    /// Stop the LaunchAgent and restore Codex configuration.
     Uninstall,
 }
 
@@ -47,28 +43,16 @@ async fn main() -> Result<()> {
     let paths = Paths::discover()?;
     match Cli::parse().command {
         Command::Init => init(&paths),
-        Command::Serve => {
-            let settings = Settings::load(&paths.settings)?;
-            let credentials = secrets::load(&paths.credentials)?;
-            server::serve(AppState::new(settings, credentials, paths.catalog.clone())?).await
-        }
-        Command::Enable => enable(&paths),
-        Command::Disable => config_manager(&paths)?.disable(),
+        Command::Serve => serve(&paths).await,
         Command::Status => status(&paths),
         Command::Doctor => doctor(&paths).await,
         Command::Install => {
             let executable = std::env::current_exe()?.canonicalize()?;
-            let plist = launch_agent::install(&paths, &executable)?;
+            let plist = launch_agent::install(&paths, &executable, &codex_config_path()?)?;
             println!("installed {}", plist.display());
             Ok(())
         }
-        Command::Uninstall => {
-            match launch_agent::uninstall()? {
-                Some(path) => println!("removed {}", path.display()),
-                None => println!("LaunchAgent is not installed"),
-            }
-            Ok(())
-        }
+        Command::Uninstall => uninstall(&paths),
     }
 }
 
@@ -99,13 +83,89 @@ fn init(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn enable(paths: &Paths) -> Result<()> {
+async fn serve(paths: &Paths) -> Result<()> {
     let settings = Settings::load(&paths.settings)?;
-    secrets::load(&paths.credentials)?;
-    config_manager(paths)?.enable(&format!("http://{}/v1", settings.listen))?;
-    println!("enabled ModelMux in {}", codex_config_path()?.display());
-    println!("catalog: http://{}/v1/models", settings.listen);
-    println!("proxy: http://{}/v1", settings.listen);
+    let credentials = secrets::load(&paths.credentials)?;
+    let listener = tokio::net::TcpListener::bind(settings.listen)
+        .await
+        .with_context(|| format!("failed to bind {}", settings.listen))?;
+    let state = AppState::new(settings.clone(), credentials, paths.catalog.clone())?;
+    let shutdown = shutdown_signal()?;
+    let manager = config_manager(paths)?;
+    let lease = manager.enable(&format!("http://{}/v1", settings.listen))?;
+    tracing::info!(config = %codex_config_path()?.display(), "Codex configuration enabled");
+
+    let result = {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let proxy = server::serve(listener, state, async move {
+            let _ = stopped.await;
+        });
+        tokio::pin!(proxy);
+        tokio::select! {
+            result = &mut proxy => result,
+            _ = shutdown => {
+                let _ = stop.send(());
+                match tokio::time::timeout(std::time::Duration::from_secs(30), &mut proxy).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!("graceful shutdown timed out after 30 seconds");
+                        Ok(())
+                    }
+                }
+            }
+        }
+    };
+    let restore = lease.restore();
+    match (result, restore) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error).context("failed to restore Codex configuration"),
+        (Err(serve_error), Err(restore_error)) => Err(serve_error).context(format!(
+            "proxy stopped and Codex configuration could not be restored: {restore_error:#}"
+        )),
+    }
+}
+
+fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static> {
+    #[cfg(unix)]
+    {
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .context("failed to install SIGINT handler")?;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("failed to install SIGTERM handler")?;
+        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("failed to install SIGHUP handler")?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+                _ = hangup.recv() => {},
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl-C handler");
+        })
+    }
+}
+
+fn uninstall(paths: &Paths) -> Result<()> {
+    match launch_agent::uninstall()? {
+        Some(path) => println!("removed {}", path.display()),
+        None => println!("LaunchAgent is not installed"),
+    }
+    let manager = config_manager(paths)?;
+    let was_managed = paths.state.exists();
+    manager.disable()?;
+    if was_managed {
+        println!("restored Codex configuration");
+    }
     Ok(())
 }
 

@@ -1,4 +1,4 @@
-use std::{fmt, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{fmt, future::Future, io, path::PathBuf, sync::Arc, time::Duration};
 
 use async_stream::stream;
 use axum::{
@@ -76,11 +76,19 @@ impl AppState {
     }
 }
 
-pub async fn serve(state: AppState) -> anyhow::Result<()> {
-    let address = state.settings.listen;
-    let listener = tokio::net::TcpListener::bind(address).await?;
+pub async fn serve<F>(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let address = listener.local_addr()?;
     tracing::info!(%address, "ModelMux listening");
-    axum::serve(listener, router(state)).await?;
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
@@ -545,17 +553,18 @@ fn streaming_response(
             match chunk {
                 Ok(chunk) => {
                     capture_bytes = capture_bytes.saturating_add(chunk.len());
-                    if !recorded && capture_bytes <= MAX_CAPTURE_BYTES {
-                        if let Some(response) = capture.push(&chunk) {
-                            record_response(
-                                &continuity,
-                                &response,
-                                parent.as_deref(),
-                                &route_id,
-                                turn_input.clone(),
-                            );
-                            recorded = true;
-                        }
+                    if !recorded
+                        && capture_bytes <= MAX_CAPTURE_BYTES
+                        && let Some(response) = capture.push(&chunk)
+                    {
+                        record_response(
+                            &continuity,
+                            &response,
+                            parent.as_deref(),
+                            &route_id,
+                            turn_input.clone(),
+                        );
+                        recorded = true;
                     }
                     yield Ok::<Bytes, io::Error>(chunk);
                 }

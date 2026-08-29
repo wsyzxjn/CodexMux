@@ -10,7 +10,7 @@ use crate::{config::Paths, fsutil::atomic_write};
 
 const LABEL: &str = "dev.modelmux.proxy";
 
-pub fn install(paths: &Paths, executable: &Path) -> Result<PathBuf> {
+pub fn install(paths: &Paths, executable: &Path, codex_config: &Path) -> Result<PathBuf> {
     paths.ensure()?;
     let plist = plist_path()?;
     let logs = paths.root.join("logs");
@@ -18,38 +18,63 @@ pub fn install(paths: &Paths, executable: &Path) -> Result<PathBuf> {
     let document = render(
         executable,
         &paths.root,
+        codex_config,
         &logs.join("stdout.log"),
         &logs.join("stderr.log"),
     );
-    atomic_write(&plist, document.as_bytes())?;
-    let domain = launch_domain()?;
-    let _ = Command::new("launchctl")
-        .args(["bootout", &domain, plist.to_string_lossy().as_ref()])
-        .status();
-    let status = Command::new("launchctl")
-        .args(["bootstrap", &domain, plist.to_string_lossy().as_ref()])
-        .status()
-        .context("failed to run launchctl bootstrap")?;
-    if !status.success() {
-        bail!("launchctl bootstrap failed with {status}");
+    let previous = match fs::read(&plist) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("failed to read the existing LaunchAgent"),
+    };
+    let was_loaded = is_loaded()?;
+    anyhow::ensure!(
+        !(was_loaded && previous.is_none()),
+        "LaunchAgent is loaded but its plist is missing; run modelmux uninstall first"
+    );
+    stop_if_loaded()?;
+    if let Err(error) = atomic_write(&plist, document.as_bytes()) {
+        if was_loaded {
+            bootstrap(&plist).context("failed to restart the previous LaunchAgent")?;
+        }
+        return Err(error);
+    }
+    if let Err(error) = bootstrap(&plist) {
+        rollback(&plist, previous.as_deref(), was_loaded, &error)?;
+        return Err(error);
     }
     Ok(plist)
 }
 
+fn rollback(
+    plist: &Path,
+    previous: Option<&[u8]>,
+    was_loaded: bool,
+    install_error: &anyhow::Error,
+) -> Result<()> {
+    match previous {
+        Some(previous) => atomic_write(plist, previous)?,
+        None if plist.exists() => fs::remove_file(plist)?,
+        None => {}
+    }
+    if was_loaded && let Err(rollback) = bootstrap(plist) {
+        bail!(
+            "failed to start new LaunchAgent ({install_error:#}); failed to restore previous LaunchAgent ({rollback:#})"
+        );
+    }
+    Ok(())
+}
+
 pub fn uninstall() -> Result<Option<PathBuf>> {
     let plist = plist_path()?;
-    if !plist.exists() {
+    let installed = plist.exists() || is_loaded()?;
+    if !installed {
         return Ok(None);
     }
-    let domain = launch_domain()?;
-    let status = Command::new("launchctl")
-        .args(["bootout", &domain, plist.to_string_lossy().as_ref()])
-        .status()
-        .context("failed to run launchctl bootout")?;
-    if !status.success() {
-        tracing::warn!(%status, "launchctl bootout did not report success");
+    stop_if_loaded()?;
+    if plist.exists() {
+        fs::remove_file(&plist)?;
     }
-    fs::remove_file(&plist)?;
     Ok(Some(plist))
 }
 
@@ -57,6 +82,51 @@ pub fn plist_path() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("cannot locate home directory")?
         .join(format!("Library/LaunchAgents/{LABEL}.plist")))
+}
+
+fn bootstrap(plist: &Path) -> Result<()> {
+    let domain = launch_domain()?;
+    let status = Command::new("launchctl")
+        .args(["bootstrap", &domain, plist.to_string_lossy().as_ref()])
+        .status()
+        .context("failed to run launchctl bootstrap")?;
+    if !status.success() {
+        bail!("launchctl bootstrap failed with {status}");
+    }
+    Ok(())
+}
+
+fn stop_if_loaded() -> Result<()> {
+    if !is_loaded()? {
+        return Ok(());
+    }
+    let target = service_target()?;
+    let status = Command::new("launchctl")
+        .args(["bootout", &target])
+        .status()
+        .context("failed to run launchctl bootout")?;
+    if !status.success() {
+        bail!("launchctl bootout failed with {status}");
+    }
+    if is_loaded()? {
+        bail!("LaunchAgent is still loaded after launchctl bootout");
+    }
+    Ok(())
+}
+
+fn is_loaded() -> Result<bool> {
+    let target = service_target()?;
+    let status = Command::new("launchctl")
+        .args(["print", &target])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("failed to inspect LaunchAgent")?;
+    Ok(status.success())
+}
+
+fn service_target() -> Result<String> {
+    Ok(format!("{}/{LABEL}", launch_domain()?))
 }
 
 fn launch_domain() -> Result<String> {
@@ -68,7 +138,13 @@ fn launch_domain() -> Result<String> {
     Ok(format!("gui/{}", String::from_utf8(output.stdout)?.trim()))
 }
 
-fn render(executable: &Path, root: &Path, stdout: &Path, stderr: &Path) -> String {
+fn render(
+    executable: &Path,
+    root: &Path,
+    codex_config: &Path,
+    stdout: &Path,
+    stderr: &Path,
+) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -78,7 +154,10 @@ fn render(executable: &Path, root: &Path, stdout: &Path, stderr: &Path) -> Strin
   <key>ProgramArguments</key>
   <array><string>{}</string><string>serve</string></array>
   <key>EnvironmentVariables</key>
-  <dict><key>MODELMUX_HOME</key><string>{}</string></dict>
+  <dict>
+    <key>MODELMUX_HOME</key><string>{}</string>
+    <key>CODEX_CONFIG</key><string>{}</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
@@ -89,6 +168,7 @@ fn render(executable: &Path, root: &Path, stdout: &Path, stderr: &Path) -> Strin
 "#,
         xml(executable),
         xml(root),
+        xml(codex_config),
         xml(stdout),
         xml(stderr),
     )
@@ -112,10 +192,12 @@ mod tests {
         let plist = render(
             Path::new("/tmp/a&b/modelmux"),
             Path::new("/tmp/root"),
+            Path::new("/tmp/codex&config.toml"),
             Path::new("/tmp/out"),
             Path::new("/tmp/err"),
         );
         assert!(plist.contains("/tmp/a&amp;b/modelmux"));
+        assert!(plist.contains("/tmp/codex&amp;config.toml"));
         assert!(plist.contains("<string>serve</string>"));
     }
 }

@@ -1,8 +1,19 @@
 use anyhow::{Context, Result};
 use http::{HeaderMap, HeaderName, HeaderValue, header};
 
+const OFFICIAL_PASSTHROUGH_HEADERS: &[&str] = &[
+    "accept",
+    "user-agent",
+    "originator",
+    "session_id",
+    "conversation_id",
+    "openai-beta",
+    "x-codex-turn-metadata",
+];
+const CPA_PASSTHROUGH_HEADERS: &[&str] = &["accept", "user-agent"];
+
 pub fn official_headers(incoming: &HeaderMap) -> Result<HeaderMap> {
-    let mut output = sanitized_headers(incoming);
+    let mut output = selected_headers(incoming, OFFICIAL_PASSTHROUGH_HEADERS);
     let authorization = incoming
         .get(header::AUTHORIZATION)
         .context("official route requires the incoming Codex OAuth Authorization header")?
@@ -21,18 +32,18 @@ pub fn official_headers(incoming: &HeaderMap) -> Result<HeaderMap> {
 }
 
 pub fn cpa_headers(incoming: &HeaderMap, cpa_token: &str) -> Result<HeaderMap> {
-    let mut output = sanitized_headers(incoming);
+    let mut output = selected_headers(incoming, CPA_PASSTHROUGH_HEADERS);
     let mut value = HeaderValue::from_str(&format!("Bearer {cpa_token}"))?;
     value.set_sensitive(true);
     output.insert(header::AUTHORIZATION, value);
     Ok(output)
 }
 
-fn sanitized_headers(incoming: &HeaderMap) -> HeaderMap {
+fn selected_headers(incoming: &HeaderMap, names: &'static [&'static str]) -> HeaderMap {
     let mut output = HeaderMap::new();
-    for (name, value) in incoming {
-        if !is_sensitive_request_header(name.as_str()) {
-            output.append(name.clone(), value.clone());
+    for &name in names {
+        for value in incoming.get_all(name) {
+            output.append(HeaderName::from_static(name), value.clone());
         }
     }
     output.insert(
@@ -42,42 +53,12 @@ fn sanitized_headers(incoming: &HeaderMap) -> HeaderMap {
     output
 }
 
-fn is_sensitive_request_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "authorization"
-            | "cookie"
-            | "host"
-            | "content-length"
-            | "connection"
-            | "proxy-connection"
-            | "transfer-encoding"
-            | "upgrade"
-            | "x-modelmux-token"
-            | "chatgpt-account-id"
-            | "openai-organization"
-            | "openai-project"
-            | "x-api-key"
-            | "api-key"
-            | "proxy-authorization"
-            | "accept-encoding"
-            | "if-match"
-            | "if-none-match"
-            | "if-modified-since"
-            | "if-unmodified-since"
-            | "if-range"
-            | "range"
-            | "x-goog-api-key"
-            | "x-groq-api-key"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn cpa_headers_drop_oauth_and_inject_only_the_cpa_token() {
+    fn cpa_headers_allow_only_protocol_headers_and_the_cpa_token() {
         let incoming = HeaderMap::from_iter([
             (
                 header::AUTHORIZATION,
@@ -89,24 +70,46 @@ mod tests {
                 HeaderValue::from_static("provider-secret"),
             ),
             (
+                HeaderName::from_static("x-amz-security-token"),
+                HeaderValue::from_static("unknown-secret"),
+            ),
+            (
                 HeaderName::from_static("chatgpt-account-id"),
                 HeaderValue::from_static("account"),
+            ),
+            (
+                header::ACCEPT,
+                HeaderValue::from_static("text/event-stream"),
             ),
         ]);
         let output = cpa_headers(&incoming, "cpa-secret").unwrap();
         assert_eq!(output[header::AUTHORIZATION], "Bearer cpa-secret");
+        assert_eq!(output[header::ACCEPT], "text/event-stream");
         assert!(!output.contains_key(header::COOKIE));
         assert!(!output.contains_key("x-api-key"));
+        assert!(!output.contains_key("x-amz-security-token"));
         assert!(!output.contains_key("chatgpt-account-id"));
     }
 
     #[test]
     fn official_headers_never_receive_the_cpa_token() {
-        let incoming = HeaderMap::from_iter([(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer oauth"),
-        )]);
+        let incoming = HeaderMap::from_iter([
+            (
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer oauth"),
+            ),
+            (
+                HeaderName::from_static("originator"),
+                HeaderValue::from_static("codex_cli_rs"),
+            ),
+            (
+                HeaderName::from_static("x-provider-token"),
+                HeaderValue::from_static("private"),
+            ),
+        ]);
         let output = official_headers(&incoming).unwrap();
         assert_eq!(output[header::AUTHORIZATION], "Bearer oauth");
+        assert_eq!(output["originator"], "codex_cli_rs");
+        assert!(!output.contains_key("x-provider-token"));
     }
 }

@@ -154,9 +154,13 @@ launchctl setenv MODELMUX_PROXY_TOKEN '把 credentials.json 中的 proxy_token �
 modelmux install
 ```
 
-该命令会立即启动一个当前用户的 LaunchAgent，并在登录后自动运行。安装时
-会记录当前 `modelmux` 可执行文件的绝对路径，因此应先把二进制文件放到稳定
-位置，再执行 `install`。
+该命令会立即注册并启动当前用户的 LaunchAgent，并在登录后自动运行。后台
+代理启动成功后会自动备份并接管 Codex 配置；执行 `modelmux uninstall` 时会
+停止代理、注销 LaunchAgent 并恢复原配置。
+
+安装时会记录当前 `modelmux` 可执行文件和 Codex 配置文件的绝对路径，因此应
+先把二进制文件放到稳定位置，并确定 `CODEX_CONFIG` 或 `CODEX_HOME`，再执行
+`install`。
 
 #### 调试：在前台运行
 
@@ -164,7 +168,13 @@ modelmux install
 modelmux serve
 ```
 
-终端关闭后服务也会停止。需要调试日志或首次排查配置时可使用这种方式。
+`serve` 会在成功绑定本地端口后自动备份并接管 Codex 配置。按 `Ctrl-C` 或
+收到正常终止信号时，代理会停止接收新请求，最多等待现有请求 30 秒，再恢复
+原配置。终端被强制关闭、进程崩溃或系统断电时可能来不及恢复；下一次启动会
+根据持久化的操作阶段完成接管或恢复。需要调试日志或首次排查配置时可使用
+这种方式。
+
+启动或停止 ModelMux 后都应完全退出并重新打开 Codex，使其重新读取配置。
 
 ### 6. 检查运行状态
 
@@ -187,19 +197,16 @@ credentials: ok
 `catalog snapshot: not fetched yet` 是正常现象。`doctor` 会报告代理和 CPA
 是否可访问，但这两项不可访问时只打印状态；请根据输出修复后再继续。
 
-### 7. 启用 Codex 配置
+### 7. 重新启动 Codex
 
-```bash
-modelmux enable
-```
-
-该命令会在 Codex 的 `config.toml` 中加入一个由 ModelMux 管理的 provider
-配置，并保留原文件备份。默认配置文件是 `~/.codex/config.toml`。
+`serve` 或 LaunchAgent 启动后，ModelMux 已经自动在 Codex 的 `config.toml`
+中加入托管 provider 配置，并保留原文件备份。默认配置文件是
+`~/.codex/config.toml`。
 
 ModelMux 不会写入静态 `model_catalog_json`。Codex 会从 ModelMux 的
 `/v1/models` 动态获取模型目录。
 
-启用后，完全退出并重新启动 Codex。模型选择器中应同时看到：
+完全退出并重新启动 Codex。模型选择器中应同时看到：
 
 - 原名称的官方模型，例如 `gpt-5.6`；
 - 带 ` · CPA` 显示后缀的 CPA 模型，例如模型名称为 `cpa/gpt-5.6`。
@@ -213,11 +220,9 @@ ModelMux 不会写入静态 `model_catalog_json`。Codex 会从 ModelMux 的
 | --- | --- |
 | `modelmux status` | 显示数据路径、Codex 配置路径和启用状态 |
 | `modelmux doctor` | 检查配置、凭据、环境变量、服务连通性和目录快照 |
-| `modelmux serve` | 在前台运行代理 |
-| `modelmux install` | 安装或重新安装并启动 macOS LaunchAgent |
-| `modelmux uninstall` | 停止并删除 LaunchAgent，不修改 Codex 配置 |
-| `modelmux enable` | 启用 Codex 的 ModelMux provider 配置 |
-| `modelmux disable` | 删除托管配置并恢复原 Codex 配置 |
+| `modelmux serve` | 在前台运行代理，启动时接管、退出时恢复 Codex 配置 |
+| `modelmux install` | 注册或重新注册并启动 macOS LaunchAgent |
+| `modelmux uninstall` | 停止并注销 LaunchAgent，同时恢复 Codex 配置 |
 
 `status` 显示的是配置管理状态，不代表后台进程一定可访问；检查服务连通性应
 使用 `doctor`。
@@ -250,12 +255,13 @@ modelmux doctor
 
 ## 停用和卸载
 
-恢复 Codex 配置并停止后台服务：
+停止后台服务、注销 LaunchAgent 并恢复 Codex 配置：
 
 ```bash
-modelmux disable
 modelmux uninstall
 ```
+
+如果是前台运行，先按 `Ctrl-C`，ModelMux 会在退出前恢复 Codex 配置。
 
 如果为 Codex Desktop 设置过环境变量，再清除它：
 
@@ -272,7 +278,7 @@ launchctl unsetenv MODELMUX_PROXY_TOKEN
 rm -rf "$HOME/Library/Application Support/ModelMux"
 ```
 
-应先执行 `disable` 和 `uninstall`，再删除数据目录，否则会丢失恢复 Codex
+应先退出前台代理或执行 `uninstall`，再删除数据目录，否则会丢失恢复 Codex
 原配置所需的状态和备份。
 
 ## 故障排查
@@ -322,15 +328,15 @@ CPA 目录中满足以下任一条件的模型不会显示：
 ### `Codex config already defines ...; refusing to overwrite it`
 
 现有 Codex 配置已经定义了 `model_catalog_json`、`model_provider` 或
-`model_providers`。ModelMux 为避免覆盖用户配置会拒绝启用。
+`model_providers`。ModelMux 为避免覆盖用户配置会拒绝接管。
 
-先备份 `~/.codex/config.toml`，确认不再需要冲突项后手动移除，再运行
-`modelmux enable`。不要在不理解现有配置用途时直接删除。
+先备份 `~/.codex/config.toml`，确认不再需要冲突项后手动移除，再重新运行
+`modelmux serve` 或 `modelmux install`。不要在不理解现有配置用途时直接删除。
 
 ### `Codex config changed inside the managed ModelMux block`
 
-ModelMux 启用后，其托管标记之间的内容被手动修改。为避免误删用户配置，
-`enable` 和 `disable` 会停止操作。恢复托管块原状后重试，或根据
+ModelMux 接管后，其托管标记之间的内容被手动修改。为避免误删用户配置，
+自动接管和恢复会停止操作。恢复托管块原状后重试，或根据
 `state/codex-config.json` 与 `backups/` 中的记录手动核对。
 
 ### 修改了 `credentials.json` 后服务无法启动
@@ -351,8 +357,10 @@ ModelMux 按以下优先级寻找 Codex 配置：
 2. `$CODEX_HOME/config.toml`；
 3. `~/.codex/config.toml`。
 
-运行 `enable`、`disable`、`status` 和 `doctor` 时必须使用一致的环境变量，
-否则 ModelMux 会拒绝操作由另一路径记录的托管状态。
+运行 `serve`、`install`、`uninstall`、`status` 和 `doctor` 时必须使用一致的环境
+变量，否则 ModelMux 会拒绝操作由另一路径记录的托管状态。相对形式的
+`CODEX_CONFIG` 会在执行命令时转换为绝对路径。Codex 配置不能是符号链接，
+以免原子替换破坏由 dotfiles 工具维护的链接；请直接指定链接目标文件。
 
 ## 模型目录与请求路由
 
@@ -391,12 +399,12 @@ Responses 请求保持不变。
 - ModelMux 的所有接口都要求 `x-modelmux-token`；
 - 官方请求只使用 Codex 传入的 ChatGPT OAuth，并固定发送到官方 Codex
   endpoint；
-- CPA 请求会移除传入的 Authorization、Cookie、账号、组织、项目和 API Key
-  等敏感请求头，再注入独立的 CPA 令牌；
+- CPA 请求只转发 `Accept` 和 `User-Agent`，再注入独立的 CPA 令牌；其他
+  Codex 请求头不会进入 CPA；
 - CPA 令牌不会发送给官方，ChatGPT OAuth 也不会发送给 CPA；
 - 凭据不会写入模型目录、Codex 配置或 API 响应；
-- `enable` 会保存原 Codex 配置，`disable` 只恢复原文件或移除未被修改的托管
-  内容。
+- 代理启动时会保存原 Codex 配置，正常退出时只恢复原文件或移除未被修改的
+  托管内容。
 
 ## 开发检查
 
