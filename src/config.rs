@@ -110,8 +110,8 @@ impl Cpa {
         if !matches!(url.scheme(), "http" | "https") {
             bail!("CPA base_url must use HTTP or HTTPS");
         }
-        if !is_loopback_host(url.host_str()) {
-            bail!("CPA base_url must use a loopback host");
+        if url.scheme() == "http" && !is_loopback_host(url.host_str()) {
+            bail!("remote CPA base_url must use HTTPS");
         }
         if !url.username().is_empty() || url.password().is_some() {
             bail!("CPA base_url must not contain credentials");
@@ -164,9 +164,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cpa_must_be_loopback_without_url_state() {
+    fn cpa_allows_remote_https_and_local_http_without_url_state() {
         let mut settings = Settings::default();
-        settings.cpa.base_url = "https://example.com/v1".into();
+        settings.cpa.base_url = "https://cpa.example.com/v1".into();
+        assert!(settings.validate().is_ok());
+        settings.cpa.base_url = "http://cpa.example.com/v1".into();
         assert!(settings.validate().is_err());
         settings.cpa.base_url = "http://127.0.0.1:8317/v1?tenant=x".into();
         assert!(settings.validate().is_err());

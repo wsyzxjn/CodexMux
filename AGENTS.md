@@ -25,7 +25,7 @@ value.
 ## Security boundaries
 
 - Bind loopback only and require the configured proxy token on every request.
-- Require the configured CPA endpoint to use a loopback host.
+- The ModelMux listener must be loopback-only; remote CPA endpoints must use HTTPS.
 - Official ChatGPT OAuth may pass only to the fixed official Responses and model
   catalog endpoints.
 - Catalog state changes only after both upstream catalogs validate; persist the

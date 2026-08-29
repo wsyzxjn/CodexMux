@@ -22,8 +22,9 @@ ModelMux 只处理模型目录合并、请求分流、凭据隔离和切换模�
 - 已安装 Rust 工具链；
 - 已安装并配置 CPA。
 
-CPA 必须监听本机回环地址。本文使用其默认地址
-`http://127.0.0.1:8317`。
+CPA 可以运行在本机或远端。本文默认使用本机地址
+`http://127.0.0.1:8317`；远端 CPA 必须使用 HTTPS。ModelMux 自身提供给
+Codex 的监听地址始终只能是本机回环地址。
 
 ## 快速开始
 
@@ -104,7 +105,7 @@ chmod 600 "$HOME/Library/Application Support/ModelMux/credentials.json"
 供应商 API Key、OAuth 凭据和模型别名只配置在 CPA 中，不要写入
 ModelMux。
 
-ModelMux 默认配置如下，通常无需修改：
+ModelMux 默认连接本机 CPA：
 
 ```toml
 listen = "127.0.0.1:48682"
@@ -112,6 +113,18 @@ listen = "127.0.0.1:48682"
 [cpa]
 base_url = "http://127.0.0.1:8317/v1"
 ```
+
+如果 CPA 在远端，将 `cpa.base_url` 改成其 HTTPS API 根地址：
+
+```toml
+listen = "127.0.0.1:48682"
+
+[cpa]
+base_url = "https://cpa.example.com/v1"
+```
+
+远端地址不允许使用明文 HTTP，也不要把 token 写入 URL；认证信息只存放在
+`credentials.json` 的 `cpa_token` 中。
 
 ### 4. 把 `proxy_token` 提供给 Codex
 
@@ -306,10 +319,11 @@ modelmux serve
 
 确认：
 
-1. CPA 已启动并监听 `127.0.0.1:8317`；
-2. `config.toml` 中的 `cpa.base_url` 与 CPA 地址一致；
+1. 本机 CPA 已启动，或远端 CPA 的 HTTPS 地址可以访问；
+2. `config.toml` 中的 `cpa.base_url` 与 CPA API 根地址一致并包含 `/v1`；
 3. ModelMux 的 `cpa_token` 存在于 CPA 顶层 `api-keys`；
-4. 修改 CPA 配置后已经重启 CPA。
+4. 网络、防火墙和 TLS 证书允许当前 Mac 访问远端 CPA；
+5. 修改 CPA 配置后已经重启 CPA。
 
 ### 模型列表为空或没有 CPA 模型
 
@@ -395,7 +409,8 @@ Responses 请求保持不变。
 
 ## 安全边界
 
-- ModelMux 和 CPA 地址都必须是本机回环地址；
+- ModelMux 提供给 Codex 的监听地址必须是本机回环地址；
+- 本机 CPA 可以使用回环 HTTP，远端 CPA 必须使用 HTTPS；
 - ModelMux 的所有接口都要求 `x-modelmux-token`；
 - 官方请求只使用 Codex 传入的 ChatGPT OAuth，并固定发送到官方 Codex
   endpoint；
