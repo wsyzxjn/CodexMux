@@ -341,11 +341,13 @@ CPA 目录中满足以下任一条件的模型不会显示：
 
 ### `Codex config already defines ...; refusing to overwrite it`
 
-现有 Codex 配置已经定义了 `model_catalog_json`、`model_provider` 或
-`model_providers`。ModelMux 为避免覆盖用户配置会拒绝接管。
+ModelMux 会保留已有的 `model_providers` 服务商，并追加自己的
+`model_providers.modelmux`。只有现有配置已经占用 ModelMux 自己的 provider 名称，
+或定义了 ModelMux 需要临时托管的顶层 `model_provider`、`model_catalog_json` 时才会
+拒绝接管。
 
-先备份 `~/.codex/config.toml`，确认不再需要冲突项后手动移除，再重新运行
-`modelmux serve` 或 `modelmux install`。不要在不理解现有配置用途时直接删除。
+先备份 `~/.codex/config.toml`，核对报错指出的具体冲突项后再处理。不要删除其他
+`model_providers` 服务商配置；它们不会阻止 ModelMux 启动。
 
 ### `Codex config changed inside the managed ModelMux block`
 

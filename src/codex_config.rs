@@ -407,9 +407,17 @@ fn validate_existing(text: &str) -> Result<()> {
     let document = text
         .parse::<DocumentMut>()
         .context("existing Codex config is invalid TOML")?;
-    for key in ["model_catalog_json", "model_provider", "model_providers"] {
+    for key in ["model_catalog_json", "model_provider"] {
         if document.get(key).is_some() {
             bail!("Codex config already defines {key}; refusing to overwrite it");
+        }
+    }
+    if let Some(providers) = document.get("model_providers") {
+        let providers = providers
+            .as_table_like()
+            .context("existing model_providers must be a TOML table")?;
+        if providers.contains_key("modelmux") {
+            bail!("Codex config already defines model_providers.modelmux");
         }
     }
     Ok(())
@@ -442,6 +450,38 @@ mod tests {
         assert!(enabled.contains(PROXY_TOKEN_ENV));
         lease.restore().unwrap();
         assert_eq!(fs::read(&config).unwrap(), b"model = \"gpt\"\n");
+    }
+
+    #[test]
+    fn existing_model_providers_are_preserved() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        let original = b"[model_providers.deepseek]\nname = \"DeepSeek\"\nbase_url = \"https://example.com/v1\"\n";
+        fs::write(&config, original).unwrap();
+
+        let lease = manager(root.path(), config.clone())
+            .enable(LOOPBACK_BASE_URL)
+            .unwrap();
+        let enabled = fs::read_to_string(&config).unwrap();
+        let document = enabled.parse::<DocumentMut>().unwrap();
+        let providers = document["model_providers"].as_table_like().unwrap();
+        assert!(providers.contains_key("modelmux"));
+        assert!(providers.contains_key("deepseek"));
+
+        lease.restore().unwrap();
+        assert_eq!(fs::read(&config).unwrap(), original);
+    }
+
+    #[test]
+    fn existing_modelmux_provider_is_rejected() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        fs::write(&config, b"[model_providers.modelmux]\nname = \"custom\"\n").unwrap();
+
+        let error = manager(root.path(), config)
+            .enable(LOOPBACK_BASE_URL)
+            .unwrap_err();
+        assert!(error.to_string().contains("model_providers.modelmux"));
     }
 
     #[test]
