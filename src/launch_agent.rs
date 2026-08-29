@@ -105,13 +105,16 @@ fn stop_if_loaded() -> Result<()> {
         .args(["bootout", &target])
         .status()
         .context("failed to run launchctl bootout")?;
-    if !status.success() {
+    if !status.success() && is_loaded()? {
         bail!("launchctl bootout failed with {status}");
     }
-    if is_loaded()? {
-        bail!("LaunchAgent is still loaded after launchctl bootout");
+    for _ in 0..100 {
+        if !is_loaded()? {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    Ok(())
+    bail!("LaunchAgent is still loaded after launchctl bootout")
 }
 
 fn is_loaded() -> Result<bool> {
