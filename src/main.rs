@@ -198,13 +198,9 @@ async fn doctor(paths: &Paths) -> Result<()> {
         Ok(response) if response.status().is_success() => println!("proxy: reachable"),
         _ => println!("proxy: not running"),
     }
-    let cpa_base = settings.cpa.base_url.trim_end_matches('/');
-    let cpa_health = format!(
-        "{}/health",
-        cpa_base.strip_suffix("/v1").unwrap_or(cpa_base)
-    );
+    let cpa_models = format!("{}/models", settings.cpa.base_url.trim_end_matches('/'));
     match reqwest::Client::new()
-        .get(cpa_health)
+        .get(cpa_models)
         .header(
             reqwest::header::AUTHORIZATION,
             format!("Bearer {}", credentials.cpa_token),
