@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod codex_config;
 pub mod config;
 pub mod continuity;
+pub mod cpa;
 pub mod dialect;
 pub mod fsutil;
 pub mod launch_agent;

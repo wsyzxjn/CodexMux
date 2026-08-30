@@ -3,7 +3,7 @@ use std::{convert::Infallible, sync::Arc};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, Response, StatusCode, header},
     routing::post,
 };
@@ -55,7 +55,8 @@ async fn spawn_modelmux(
             proxy_token: "proxy-token".into(),
             cpa_token: "cpa-token".into(),
         },
-        path,
+        root.join("model-catalog.json"),
+        root.join("cpa-profiles.toml"),
     )
     .unwrap();
     spawn(server::router(state)).await
@@ -112,6 +113,57 @@ async fn cpa_json_rewrites_only_the_model_and_preserves_response_bytes() {
     assert_eq!(forwarded["input"], "你好 CPA");
     assert_eq!(forwarded["metadata"], json!({"unknown_field": true}));
     assert_eq!(forwarded["stream"], false);
+    drop(captured);
+    proxy_handle.abort();
+    cpa_handle.abort();
+}
+
+#[tokio::test]
+async fn responses_accept_bodies_larger_than_axums_two_megabyte_default() {
+    async fn upstream(State(capture): State<RawCapture>, body: Bytes) -> Response<Body> {
+        capture.0.lock().await.push((HeaderMap::new(), body));
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                include_bytes!("fixtures/native_responses/passthrough_response.json").as_slice(),
+            ))
+            .unwrap()
+    }
+
+    let capture = RawCapture::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(upstream))
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        .with_state(capture.clone());
+    let (cpa_address, cpa_handle) = spawn(upstream).await;
+    let (proxy_address, proxy_handle) =
+        spawn_modelmux(format!("http://{cpa_address}/v1"), &[], &["large-model"]).await;
+    let request = serde_json::to_vec(&json!({
+        "model": "cpa/large-model",
+        "input": "x".repeat(2 * 1024 * 1024 + 1024),
+        "stream": false
+    }))
+    .unwrap();
+    assert!(request.len() > 2 * 1024 * 1024);
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_address}/v1/responses"))
+        .header("x-modelmux-token", "proxy-token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(request.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let captured = capture.0.lock().await;
+    let forwarded: Value = serde_json::from_slice(&captured[0].1).unwrap();
+    assert_eq!(forwarded["model"], "large-model");
+    assert_eq!(
+        forwarded["input"].as_str().unwrap().len(),
+        2 * 1024 * 1024 + 1024
+    );
     drop(captured);
     proxy_handle.abort();
     cpa_handle.abort();

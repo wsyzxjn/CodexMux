@@ -234,11 +234,59 @@ ModelMux 不会写入静态 `model_catalog_json`。Codex 会从 ModelMux 的
 | `modelmux status` | 显示数据路径、Codex 配置路径和启用状态 |
 | `modelmux doctor` | 检查配置、凭据、环境变量、服务连通性和目录快照 |
 | `modelmux serve` | 在前台运行代理，启动时接管、退出时恢复 Codex 配置 |
-| `modelmux install` | 注册或重新注册并启动 macOS LaunchAgent |
+| `modelmux serve --no-codex-config` | 在前台运行代理但不管理 Codex 配置 |
+| `modelmux install` | 启用 Codex 托管配置，然后注册并启动 LaunchAgent |
 | `modelmux uninstall` | 停止并注销 LaunchAgent，同时恢复 Codex 配置 |
 
 `status` 显示的是配置管理状态，不代表后台进程一定可访问；检查服务连通性应
 使用 `doctor`。
+
+LaunchAgent 中的代理以 `serve --no-codex-config` 运行：macOS 的 TCC 可能
+拒绝后台进程访问 Codex 配置所在的宗卷，并且 `open()` 会无限阻塞而不是立刻
+报错。Codex 配置的启用与恢复由 `modelmux install` / `modelmux uninstall`
+在终端中完成。
+
+### 管理本地 CPA
+
+ModelMux 可以直接下载并托管一个本地 CLIProxyAPI（CPA），不再要求用户自行
+安装：
+
+| 命令 | 作用 |
+| --- | --- |
+| `modelmux cpa install` | 下载固定版本的 CLIProxyAPI 发布包（校验 sha256 后解压）、写入托管配置并启动 |
+| `modelmux cpa start` / `modelmux cpa stop` | 启动或停止本地 CPA 服务 |
+| `modelmux cpa status` | 显示已安装版本和运行状态 |
+| `modelmux cpa provider-import <file>` | 从 TOML 文件导入 `[[openai-compatibility]]` / `[[codex-api-key]]` 提供商并重启服务 |
+| `modelmux cpa uninstall` | 移除 CPA LaunchAgent（保留二进制、配置和登录凭据） |
+
+安装位置和数据：
+
+- 二进制：`$MODELMUX_HOME/cpa/cli-proxy-api`
+- 配置：`$MODELMUX_HOME/cpa/config.yaml`（ModelMux 托管；手动改过的配置不会被覆盖）
+- 日志：`$MODELMUX_HOME/logs/cpa-*.log`
+- 登录凭据：`~/.cli-proxy-api`（与 CPA 自身约定一致）
+
+本地 CPA 只监听 `127.0.0.1`，对 Codex 侧的接入方式与远端 CPA 完全一致：
+ModelMux 按 `cpa/` 前缀路由到 `config.toml` 中配置的 CPA 地址。
+
+### 菜单栏应用（ModelMuxBar）
+
+仓库内的 `menubar/` 是一个独立的 Swift 菜单栏应用，提供：
+
+- ModelMux 与本地 CPA 的运行状态显示；
+- 重启 / 停止 ModelMux；
+- 启动 / 停止 CPA；
+- 打开日志目录。
+
+构建并运行：
+
+```bash
+cd menubar
+swift build -c release
+.build/release/ModelMuxBar
+```
+
+菜单栏应用不提供模型切换——模型选择由 Codex 客户端完成。
 
 ### 查看后台日志
 

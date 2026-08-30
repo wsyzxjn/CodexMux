@@ -86,6 +86,11 @@ pub fn plist_path() -> Result<PathBuf> {
 
 fn bootstrap(plist: &Path) -> Result<()> {
     let domain = launch_domain()?;
+    // A previously disabled override (from an earlier bootout) makes
+    // bootstrap fail with I/O error 5; clear it first.
+    let _ = Command::new("launchctl")
+        .args(["enable", &service_target()?])
+        .status();
     let status = Command::new("launchctl")
         .args(["bootstrap", &domain, plist.to_string_lossy().as_ref()])
         .status()
@@ -155,7 +160,7 @@ fn render(
 <dict>
   <key>Label</key><string>{LABEL}</string>
   <key>ProgramArguments</key>
-  <array><string>{}</string><string>serve</string></array>
+  <array><string>{}</string><string>serve</string><string>--no-codex-config</string></array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>MODELMUX_HOME</key><string>{}</string>
@@ -202,5 +207,6 @@ mod tests {
         assert!(plist.contains("/tmp/a&amp;b/modelmux"));
         assert!(plist.contains("/tmp/codex&amp;config.toml"));
         assert!(plist.contains("<string>serve</string>"));
+        assert!(plist.contains("<string>--no-codex-config</string>"));
     }
 }

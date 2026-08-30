@@ -22,6 +22,7 @@ pub struct Paths {
     pub catalog: PathBuf,
     pub state: PathBuf,
     pub backups: PathBuf,
+    pub cpa_profiles: PathBuf,
 }
 
 impl Paths {
@@ -43,6 +44,7 @@ impl Paths {
             catalog: root.join("model-catalog.json"),
             state: root.join("state/codex-config.json"),
             backups: root.join("backups"),
+            cpa_profiles: root.join("cpa-profiles.toml"),
             root,
         }
     }
@@ -105,7 +107,7 @@ impl Default for Cpa {
 }
 
 impl Cpa {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         let url = reqwest::Url::parse(&self.base_url).context("CPA has an invalid base_url")?;
         if !matches!(url.scheme(), "http" | "https") {
             bail!("CPA base_url must use HTTP or HTTPS");

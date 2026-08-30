@@ -3,7 +3,7 @@ use std::{future::Future, path::PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use modelmux::{
-    codex_config::{ConfigManager, PROXY_TOKEN_ENV},
+    codex_config::{ConfigLease, ConfigManager, PROXY_TOKEN_ENV},
     config::{Credentials, Paths, Settings},
     launch_agent, secrets,
     server::{self, AppState},
@@ -20,8 +20,14 @@ struct Cli {
 enum Command {
     /// Create the private data directory and starter configuration.
     Init,
-    /// Run the proxy in the foreground and manage Codex configuration.
-    Serve,
+    /// Run the proxy in the foreground; `--no-codex-config` skips Codex
+    /// configuration management (used by the LaunchAgent so the proxy never
+    /// touches paths that macOS TCC may gate for background processes).
+    Serve {
+        /// Do not enable or restore the managed Codex configuration.
+        #[arg(long)]
+        no_codex_config: bool,
+    },
     /// Show paths and managed configuration state.
     Status,
     /// Validate config, credentials, snapshot, and the managed Codex block.
@@ -29,6 +35,77 @@ enum Command {
     /// Install and start the per-user macOS LaunchAgent.
     Install,
     /// Stop the LaunchAgent and restore Codex configuration.
+    Uninstall,
+    /// Manage the local CLIProxyAPI instance that serves CPA models.
+    Cpa {
+        #[command(subcommand)]
+        command: CpaCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CpaCommand {
+    /// Download, verify, and install the pinned CLIProxyAPI release, then start it.
+    Install {
+        /// Install from a local release archive instead of downloading it.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+    },
+    /// Start the CPA LaunchAgent (installs the managed config).
+    Start,
+    /// Stop the CPA LaunchAgent.
+    Stop,
+    /// Show the installed version and service state.
+    Status,
+    /// Import provider definitions from a TOML file and restart CPA.
+    ProviderImport {
+        /// TOML file with [[openai-compatibility]] / [[codex-api-key]] tables.
+        file: PathBuf,
+    },
+    /// List saved CPA endpoint profiles and the active one.
+    ProfileList,
+    /// Save or update a CPA endpoint profile.
+    ProfileSave {
+        /// Profile name.
+        name: String,
+        /// CPA base URL, for example http://127.0.0.1:8317/v1.
+        #[arg(long)]
+        base_url: String,
+        /// Client token for this endpoint (stored in the mode-0600 profile file).
+        #[arg(long)]
+        token: String,
+    },
+    /// Remove a saved profile.
+    ProfileRemove {
+        /// Profile name.
+        name: String,
+    },
+    /// Show the review model override (None = official first, CPA fallback).
+    ReviewGet,
+    /// Route `cpa/<slug>` requests directly to an upstream, bypassing CPA.
+    DirectSet {
+        /// Comma-separated cpa/ model slugs (without the cpa/ prefix).
+        models: String,
+        /// Upstream Responses API base URL.
+        #[arg(long)]
+        base_url: String,
+        /// Bearer token for the upstream.
+        #[arg(long)]
+        token: String,
+    },
+    /// Remove all direct routes (everything goes through CPA again).
+    DirectClear,
+    /// Route `codex-auto-review` straight to a CPA model (empty to clear).
+    ReviewSet {
+        /// Upstream CPA model slug; empty string clears the override.
+        slug: String,
+    },
+    /// Validate a saved endpoint and switch to it; rolls back on failure.
+    ProfileSwitch {
+        /// Profile name.
+        name: String,
+    },
+    /// Remove the CPA LaunchAgent (keeps the binary, config, and auth files).
     Uninstall,
 }
 
@@ -43,16 +120,36 @@ async fn main() -> Result<()> {
     let paths = Paths::discover()?;
     match Cli::parse().command {
         Command::Init => init(&paths),
-        Command::Serve => serve(&paths).await,
+        Command::Serve { no_codex_config } => serve(&paths, no_codex_config).await,
         Command::Status => status(&paths),
         Command::Doctor => doctor(&paths).await,
         Command::Install => {
+            let settings = Settings::load(&paths.settings)?;
+            // Enable the Codex configuration from the caller's context: the
+            // LaunchAgent runs serve --no-codex-config because background
+            // processes may be denied access to the Codex config's volume by
+            // macOS TCC, which blocks open() indefinitely.
+            let manager = config_manager(&paths)?;
+            let lease = manager.enable(&format!("http://{}/v1", settings.listen))?;
             let executable = std::env::current_exe()?.canonicalize()?;
-            let plist = launch_agent::install(&paths, &executable, &codex_config_path()?)?;
-            println!("installed {}", plist.display());
-            Ok(())
+            let install_result = launch_agent::install(&paths, &executable, &codex_config_path()?)
+                .map(|plist| {
+                    println!("installed {}", plist.display());
+                });
+            // Keep the configuration enabled only when the agent was installed.
+            match install_result {
+                Ok(()) => {
+                    std::mem::forget(lease);
+                    Ok(())
+                }
+                Err(error) => {
+                    lease.restore().ok();
+                    Err(error)
+                }
+            }
         }
         Command::Uninstall => uninstall(&paths),
+        Command::Cpa { command } => cpa(&paths, command),
     }
 }
 
@@ -83,17 +180,28 @@ fn init(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-async fn serve(paths: &Paths) -> Result<()> {
+async fn serve(paths: &Paths, no_codex_config: bool) -> Result<()> {
     let settings = Settings::load(&paths.settings)?;
     let credentials = secrets::load(&paths.credentials)?;
     let listener = tokio::net::TcpListener::bind(settings.listen)
         .await
         .with_context(|| format!("failed to bind {}", settings.listen))?;
-    let state = AppState::new(settings.clone(), credentials, paths.catalog.clone())?;
+    let state = AppState::new(
+        settings.clone(),
+        credentials,
+        paths.catalog.clone(),
+        paths.cpa_profiles.clone(),
+    )?;
     let shutdown = shutdown_signal()?;
-    let manager = config_manager(paths)?;
-    let lease = manager.enable(&format!("http://{}/v1", settings.listen))?;
-    tracing::info!(config = %codex_config_path()?.display(), "Codex configuration enabled");
+    let lease = if no_codex_config {
+        None
+    } else {
+        let manager = config_manager(paths)?;
+        Some(manager.enable(&format!("http://{}/v1", settings.listen))?)
+    };
+    if lease.is_some() {
+        tracing::info!(config = %codex_config_path()?.display(), "Codex configuration enabled");
+    }
 
     let result = {
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -115,10 +223,10 @@ async fn serve(paths: &Paths) -> Result<()> {
             }
         }
     };
-    let restore = lease.restore();
+    let restore = lease.map(ConfigLease::restore).transpose();
     match (result, restore) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) => Err(error),
         (Ok(()), Err(error)) => Err(error).context("failed to restore Codex configuration"),
         (Err(serve_error), Err(restore_error)) => Err(serve_error).context(format!(
             "proxy stopped and Codex configuration could not be restored: {restore_error:#}"
@@ -238,6 +346,173 @@ fn config_manager(paths: &Paths) -> Result<ConfigManager> {
         paths.state.clone(),
         paths.backups.clone(),
     ))
+}
+
+fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
+    let settings = Settings::load(&paths.settings)?;
+    match command {
+        CpaCommand::Install { archive } => {
+            let credentials = secrets::load(&paths.credentials)?;
+            match archive {
+                Some(archive) => modelmux::cpa::install_from_archive(
+                    paths,
+                    &settings.cpa,
+                    &archive,
+                    modelmux::cpa::CPA_VERSION,
+                    modelmux::cpa::CPA_DARWIN_AARCH64_SHA256,
+                    &credentials.cpa_token,
+                )?,
+                None => modelmux::cpa::install(paths, &settings.cpa, &credentials.cpa_token)?,
+            }
+            println!(
+                "CLIProxyAPI {} installed at {}",
+                modelmux::cpa::CPA_VERSION,
+                modelmux::cpa::binary_path(paths).display()
+            );
+            println!("config: {}", modelmux::cpa::config_path(paths).display());
+            println!(
+                "service: started ({}); logs: {}/logs/cpa-*.log",
+                modelmux::cpa::agent_label(),
+                paths.root.display()
+            );
+        }
+        CpaCommand::Start => {
+            let credentials = secrets::load(&paths.credentials)?;
+            modelmux::cpa::start(paths, &settings.cpa, &credentials.cpa_token)?;
+            println!("CPA service started");
+        }
+        CpaCommand::Stop => {
+            modelmux::cpa::stop()?;
+            println!("CPA service stopped");
+        }
+        CpaCommand::Status => {
+            match modelmux::cpa::installed_version(paths) {
+                Some(version) => {
+                    println!("version: {} (sha256 {})", version.version, version.sha256);
+                }
+                None => println!("version: not installed"),
+            }
+            println!(
+                "binary: {}",
+                if modelmux::cpa::binary_path(paths).is_file() {
+                    "installed"
+                } else {
+                    "missing"
+                }
+            );
+            println!(
+                "service: {}",
+                if modelmux::cpa::is_loaded()? {
+                    "running"
+                } else {
+                    "stopped"
+                }
+            );
+            println!("config: {}", modelmux::cpa::config_path(paths).display());
+        }
+        CpaCommand::ProviderImport { file } => {
+            let credentials = secrets::load(&paths.credentials)?;
+            let providers = std::fs::read_to_string(&file)
+                .with_context(|| format!("failed to read {}", file.display()))?;
+            modelmux::cpa::import_providers(paths, &providers)?;
+            modelmux::cpa::restart(paths, &settings.cpa, &credentials.cpa_token)?;
+            println!("imported providers from {}", file.display());
+            println!(
+                "CPA service restarted with the new providers; config: {}",
+                modelmux::cpa::config_path(paths).display()
+            );
+        }
+        CpaCommand::Uninstall => {
+            match modelmux::cpa::uninstall()? {
+                Some(plist) => println!("removed {}", plist.display()),
+                None => println!("CPA service is not installed"),
+            }
+            println!(
+                "kept binary and config under {}",
+                paths.root.join("cpa").display()
+            );
+        }
+        CpaCommand::ProfileList => {
+            let (active, profiles) = modelmux::cpa::profiles(paths);
+            match active {
+                Some(active) => println!("active: {active}"),
+                None => println!("active: (none; using config.toml settings)"),
+            }
+            if profiles.is_empty() {
+                println!("no saved profiles; add one with `modelmux cpa profile-save`");
+            }
+            for profile in profiles {
+                println!("  {} — {}", profile.name, profile.base_url);
+            }
+        }
+        CpaCommand::ProfileSave {
+            name,
+            base_url,
+            token,
+        } => {
+            modelmux::cpa::save_profile(
+                paths,
+                modelmux::cpa::CpaProfile {
+                    name,
+                    base_url,
+                    token,
+                },
+            )?;
+            println!("profile saved to {}", paths.cpa_profiles.display());
+        }
+        CpaCommand::ProfileRemove { name } => {
+            modelmux::cpa::remove_profile(paths, &name)?;
+            println!("profile {name} removed");
+        }
+        CpaCommand::ProfileSwitch { name } => {
+            modelmux::cpa::switch_profile(paths, &name)?;
+            println!("switched to profile {name}");
+        }
+        CpaCommand::ReviewGet => match modelmux::cpa::review_override(&paths.cpa_profiles) {
+            Some(slug) => println!("review override: {slug}"),
+            None => println!("review override: (none; official first, CPA fallback)"),
+        },
+        CpaCommand::DirectSet {
+            models,
+            base_url,
+            token,
+        } => {
+            let slugs: Vec<String> = models
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            anyhow::ensure!(!slugs.is_empty(), "no model slugs given");
+            for slug in &slugs {
+                modelmux::cpa::direct_route_for(&paths.cpa_profiles, slug);
+            }
+            modelmux::cpa::set_direct_routes(
+                paths,
+                vec![modelmux::cpa::DirectRoute {
+                    base_url,
+                    token,
+                    models: slugs,
+                }],
+            )?;
+            println!("direct route configured; see modelmux cpa direct-list");
+        }
+        CpaCommand::DirectClear => {
+            modelmux::cpa::set_direct_routes(paths, Vec::new())?;
+            println!("direct routes cleared");
+        }
+        CpaCommand::ReviewSet { slug } => {
+            let slug = slug.trim().to_owned();
+            if slug.is_empty() {
+                modelmux::cpa::set_review_override(&paths.cpa_profiles, None)?;
+                println!("review override cleared");
+            } else {
+                modelmux::cpa::set_review_override(&paths.cpa_profiles, Some(slug.clone()))?;
+                println!("codex-auto-review now routes directly to {slug}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn codex_config_path() -> Result<PathBuf> {

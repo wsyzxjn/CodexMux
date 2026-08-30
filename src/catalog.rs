@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::{config::CPA_MODEL_PREFIX, fsutil::atomic_write};
 
 pub const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+pub const AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 
 type RouteTable = HashMap<String, CatalogRoute>;
 
@@ -30,6 +31,7 @@ pub struct CatalogStore {
 pub enum CatalogRoute {
     Official,
     Cpa { upstream_model: String },
+    AutoReview { cpa_upstream_model: Option<String> },
 }
 
 impl CatalogStore {
@@ -40,8 +42,9 @@ impl CatalogStore {
             if bytes.len() > MAX_CATALOG_BYTES {
                 bail!("catalog snapshot exceeds 16 MiB");
             }
-            let catalog: Value = serde_json::from_slice(&bytes)
+            let mut catalog: Value = serde_json::from_slice(&bytes)
                 .with_context(|| format!("invalid catalog snapshot {}", path.display()))?;
+            hide_auto_review_models(&mut catalog)?;
             Some(Snapshot {
                 routes: route_table_from_merged(&catalog)?,
                 catalog,
@@ -124,6 +127,15 @@ pub fn merge(official: &Value, cpa: &Value) -> Result<Value> {
     {
         bail!("official model catalog reserves CPA namespace slug {reserved}");
     }
+    if let Some(official_auto_review) = output_models
+        .iter_mut()
+        .find(|model| model_slug(model) == Some(AUTO_REVIEW_MODEL))
+    {
+        official_auto_review
+            .as_object_mut()
+            .context("official auto-review model is not an object")?
+            .insert("visibility".into(), json!("hide"));
+    }
     let max_priority = output_models
         .iter()
         .filter_map(|model| model.get("priority").and_then(Value::as_i64))
@@ -132,15 +144,16 @@ pub fn merge(official: &Value, cpa: &Value) -> Result<Value> {
 
     let mut seen_upstream = HashSet::new();
     for (index, source) in models(cpa)?.iter().enumerate() {
-        if source.get("visibility").and_then(Value::as_str) == Some("hide")
-            || source.get("supported_in_api").and_then(Value::as_bool) == Some(false)
-        {
-            continue;
-        }
         let upstream = model_slug(source)
             .context("CPA model catalog contains a model without a nonempty slug")?;
         if !seen_upstream.insert(upstream.to_owned()) {
             bail!("CPA model catalog contains duplicate slug {upstream}");
+        }
+        let is_auto_review = is_cpa_auto_review_model(upstream);
+        if source.get("supported_in_api").and_then(Value::as_bool) == Some(false)
+            || (!is_auto_review && source.get("visibility").and_then(Value::as_str) == Some("hide"))
+        {
+            continue;
         }
         let local = format!("{CPA_MODEL_PREFIX}{upstream}");
         let mut model = source.clone();
@@ -165,16 +178,52 @@ pub fn merge(official: &Value, cpa: &Value) -> Result<Value> {
                     .saturating_add(index as i64)
             ),
         );
+        if is_auto_review {
+            object.insert("visibility".into(), json!("hide"));
+        }
         output_models.push(model);
     }
     Ok(output)
 }
 
+fn is_cpa_auto_review_model(model: &str) -> bool {
+    matches!(model, AUTO_REVIEW_MODEL)
+}
+
+fn hide_auto_review_models(catalog: &mut Value) -> Result<()> {
+    for model in models_mut(catalog)? {
+        let slug =
+            model_slug(model).context("merged catalog contains a model without a nonempty slug")?;
+        let is_auto_review = slug == AUTO_REVIEW_MODEL
+            || slug
+                .strip_prefix(CPA_MODEL_PREFIX)
+                .is_some_and(is_cpa_auto_review_model);
+        if is_auto_review {
+            model
+                .as_object_mut()
+                .context("auto-review model is not an object")?
+                .insert("visibility".into(), json!("hide"));
+        }
+    }
+    Ok(())
+}
+
 fn route_table_from_merged(catalog: &Value) -> Result<RouteTable> {
+    let catalog_models = models(catalog)?;
+    let cpa_auto_review_model = catalog_models.iter().find_map(|model| {
+        let slug = model_slug(model)?
+            .strip_prefix(CPA_MODEL_PREFIX)?
+            .to_owned();
+        (slug == AUTO_REVIEW_MODEL).then_some(slug)
+    });
     let mut routes = RouteTable::new();
-    for model in models(catalog)? {
+    for model in catalog_models {
         let slug = model_slug(model).context("merged catalog contains a model without a slug")?;
-        let route = if let Some(upstream) = slug.strip_prefix(CPA_MODEL_PREFIX) {
+        let route = if slug == AUTO_REVIEW_MODEL {
+            CatalogRoute::AutoReview {
+                cpa_upstream_model: cpa_auto_review_model.clone(),
+            }
+        } else if let Some(upstream) = slug.strip_prefix(CPA_MODEL_PREFIX) {
             if upstream.is_empty() {
                 bail!("merged catalog contains an invalid CPA slug {slug}");
             }
@@ -187,6 +236,14 @@ fn route_table_from_merged(catalog: &Value) -> Result<RouteTable> {
         if routes.insert(slug.to_owned(), route).is_some() {
             bail!("merged catalog contains duplicate slug {slug}");
         }
+    }
+    if !routes.contains_key(AUTO_REVIEW_MODEL) {
+        routes.insert(
+            AUTO_REVIEW_MODEL.into(),
+            CatalogRoute::AutoReview {
+                cpa_upstream_model: cpa_auto_review_model,
+            },
+        );
     }
     Ok(routes)
 }
@@ -253,6 +310,37 @@ mod tests {
         assert_eq!(merged["models"][1]["display_name"], "5.6 · CPA");
         assert_eq!(merged["models"][1]["context_window"], 1_000_000);
         assert_eq!(merged["models"][1]["unknown_future_field"]["kept"], true);
+    }
+
+    #[test]
+    fn auto_review_models_are_hidden_and_use_the_cpa_fallback_route() {
+        let root = tempdir().unwrap();
+        let store = CatalogStore::load(root.path().join("catalog.json")).unwrap();
+        let merged = store
+            .replace(
+                &json!({"models":[{
+                    "slug":AUTO_REVIEW_MODEL, "visibility":"list"
+                }]}),
+                &json!({"models":[{
+                    "slug":AUTO_REVIEW_MODEL, "visibility":"hide"
+                }]}),
+            )
+            .unwrap();
+
+        let models = merged["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().all(|model| model["visibility"] == "hide"));
+        assert_eq!(models[0]["slug"], AUTO_REVIEW_MODEL);
+        assert_eq!(
+            models[1]["slug"],
+            format!("{CPA_MODEL_PREFIX}{AUTO_REVIEW_MODEL}")
+        );
+        assert_eq!(
+            store.resolve(AUTO_REVIEW_MODEL).unwrap(),
+            CatalogRoute::AutoReview {
+                cpa_upstream_model: Some(AUTO_REVIEW_MODEL.into())
+            }
+        );
     }
 
     #[test]

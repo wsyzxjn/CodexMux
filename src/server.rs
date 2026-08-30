@@ -4,7 +4,7 @@ use async_stream::stream;
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{OriginalUri, Query, Request, State},
+    extract::{DefaultBodyLimit, OriginalUri, Query, Request, State},
     http::{HeaderMap, HeaderValue, Response, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Json},
@@ -25,34 +25,45 @@ use crate::{
     router,
 };
 
+const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Route {
     Official,
     Cpa,
+    /// ModelMux proxies straight to this upstream, bypassing CPA.
+    Direct {
+        base_url: String,
+        token: String,
+    },
 }
 
 impl Route {
-    fn identity(self, model: &str) -> String {
+    fn identity(&self, model: &str) -> String {
         match self {
             Self::Official => format!("official:{model}"),
             Self::Cpa => format!("cpa:{model}"),
+            Self::Direct { .. } => format!("direct:{model}"),
         }
     }
 
-    fn always_replays_history(self) -> bool {
-        self == Self::Cpa
+    fn always_replays_history(&self) -> bool {
+        matches!(self, Self::Cpa | Self::Direct { .. })
     }
 }
 
 #[derive(Clone)]
 pub struct AppState {
     client: reqwest::Client,
+    official_base_url: String,
     settings: Arc<Settings>,
     credentials: Arc<Credentials>,
     catalog: Arc<CatalogStore>,
     continuity: Arc<ContinuityStore>,
+    /// Profile store path; read per-request for the review model override so
+    /// menu-bar changes apply without a proxy restart.
+    cpa_profiles_path: PathBuf,
 }
 
 impl AppState {
@@ -60,6 +71,7 @@ impl AppState {
         settings: Settings,
         credentials: Credentials,
         catalog_path: PathBuf,
+        cpa_profiles_path: PathBuf,
     ) -> anyhow::Result<Self> {
         settings.validate()?;
         credentials.validate()?;
@@ -68,10 +80,12 @@ impl AppState {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .build()?,
+            official_base_url: OFFICIAL_BASE_URL.into(),
             settings: Arc::new(settings),
             credentials: Arc::new(credentials),
             catalog: Arc::new(catalog),
             continuity: Arc::new(ContinuityStore::new()),
+            cpa_profiles_path,
         })
     }
 }
@@ -98,6 +112,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(handle_models))
         .route("/v1/responses", post(handle_responses))
         .route("/v1/responses/compact", post(handle_responses))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_proxy_token,
@@ -267,6 +282,14 @@ impl<'de> Deserialize<'de> for UniqueObject {
     }
 }
 
+struct ResponseRequest {
+    body: Bytes,
+    value: Value,
+    model: String,
+    parent: Option<String>,
+    turn_input: Vec<Value>,
+}
+
 async fn handle_responses(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -280,21 +303,12 @@ async fn handle_responses(
     };
     let UniqueObject(object) = serde_json::from_slice(&body)
         .map_err(|error| ProxyError::bad_request("invalid_json", error.to_string()))?;
-    let mut request = Value::Object(object);
+    let request = Value::Object(object);
     let model = request
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| ProxyError::bad_request("missing_model", "request has no string model"))?;
-    let catalog_route = state
-        .catalog
-        .resolve(&model)
-        .map_err(|error| ProxyError::bad_request("route", error.to_string()))?;
-    let (route, cpa_upstream_model) = match catalog_route {
-        CatalogRoute::Official => (Route::Official, None),
-        CatalogRoute::Cpa { upstream_model } => (Route::Cpa, Some(upstream_model)),
-    };
-
     let parent = match request.get("previous_response_id") {
         Some(Value::String(parent)) if !parent.is_empty() => Some(parent.clone()),
         None | Some(Value::Null) => None,
@@ -306,47 +320,260 @@ async fn handle_responses(
         }
     };
     let turn_input = portable_input_items(request.get("input"));
-    let route_id = route.identity(&model);
+    let request = ResponseRequest {
+        body,
+        value: request,
+        model,
+        parent,
+        turn_input,
+    };
+
+    // Direct routes bypass both the catalog and CPA entirely.
+    if let Some(stripped) = request.model.strip_prefix(crate::config::CPA_MODEL_PREFIX)
+        && let Some(direct) = crate::cpa::direct_route_for(&state.cpa_profiles_path, stripped)
+    {
+        return forward_response(
+            &state,
+            &headers,
+            endpoint,
+            &request,
+            &Route::Direct {
+                base_url: direct.base_url,
+                token: direct.token,
+            },
+            Some(stripped),
+        )
+        .await;
+    }
+    let catalog_route = state
+        .catalog
+        .resolve(&request.model)
+        .map_err(|error| ProxyError::bad_request("route", error.to_string()))?;
+
+    match catalog_route {
+        CatalogRoute::Official => {
+            forward_response(&state, &headers, endpoint, &request, &Route::Official, None).await
+        }
+        CatalogRoute::Cpa { upstream_model } => {
+            forward_response(
+                &state,
+                &headers,
+                endpoint,
+                &request,
+                &Route::Cpa,
+                Some(&upstream_model),
+            )
+            .await
+        }
+        CatalogRoute::AutoReview { cpa_upstream_model } => {
+            // A review override sends codex-auto-review straight to the chosen
+            // CPA model; otherwise official runs first with CPA as fallback.
+            let override_model = crate::cpa::review_override(&state.cpa_profiles_path);
+            if let Some(slug) = override_model {
+                forward_response(
+                    &state,
+                    &headers,
+                    endpoint,
+                    &request,
+                    &Route::Cpa,
+                    Some(&slug),
+                )
+                .await
+            } else {
+                forward_auto_review(
+                    &state,
+                    &headers,
+                    endpoint,
+                    &request,
+                    cpa_upstream_model.as_deref(),
+                )
+                .await
+            }
+        }
+    }
+}
+
+async fn forward_auto_review(
+    state: &AppState,
+    headers: &HeaderMap,
+    endpoint: &str,
+    request: &ResponseRequest,
+    cpa_upstream_model: Option<&str>,
+) -> Result<Response<Body>, ProxyError> {
+    let (official_body, official_route_id) = prepare_request(
+        &request.body,
+        &request.value,
+        &request.model,
+        request.parent.as_deref(),
+        &request.turn_input,
+        &Route::Official,
+        None,
+        &state.continuity,
+    )?;
+    let official = send_upstream(state, headers, endpoint, &Route::Official, official_body).await;
+    match official {
+        Ok(upstream) if upstream.status().is_success() => {
+            return finish_response(
+                upstream,
+                request.parent.clone(),
+                request.turn_input.clone(),
+                official_route_id,
+                state.continuity.clone(),
+            )
+            .await;
+        }
+        Ok(upstream) if cpa_upstream_model.is_none() => {
+            return Ok(passthrough_response(upstream));
+        }
+        Err(error) if cpa_upstream_model.is_none() => return Err(error),
+        Ok(upstream) => {
+            tracing::warn!(status = %upstream.status(), "official auto-review failed; falling back to CPA");
+        }
+        Err(error) => {
+            tracing::warn!(message = %error.message, "official auto-review failed; falling back to CPA");
+        }
+    }
+
+    let cpa_upstream_model = cpa_upstream_model.expect("CPA fallback was checked above");
+    let (cpa_body, cpa_route_id) = prepare_request(
+        &request.body,
+        &request.value,
+        &request.model,
+        request.parent.as_deref(),
+        &request.turn_input,
+        &Route::Cpa,
+        Some(cpa_upstream_model),
+        &state.continuity,
+    )?;
+    let upstream = send_upstream(state, headers, endpoint, &Route::Cpa, cpa_body).await?;
+    finish_response(
+        upstream,
+        request.parent.clone(),
+        request.turn_input.clone(),
+        cpa_route_id,
+        state.continuity.clone(),
+    )
+    .await
+}
+
+async fn forward_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    endpoint: &str,
+    request: &ResponseRequest,
+    route: &Route,
+    cpa_upstream_model: Option<&str>,
+) -> Result<Response<Body>, ProxyError> {
+    let (outgoing, route_id) = prepare_request(
+        &request.body,
+        &request.value,
+        &request.model,
+        request.parent.as_deref(),
+        &request.turn_input,
+        route,
+        cpa_upstream_model,
+        &state.continuity,
+    )?;
+    let upstream = send_upstream(state, headers, endpoint, route, outgoing).await?;
+    finish_response(
+        upstream,
+        request.parent.clone(),
+        request.turn_input.clone(),
+        route_id,
+        state.continuity.clone(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_request(
+    body: &Bytes,
+    request: &Value,
+    model: &str,
+    parent: Option<&str>,
+    turn_input: &[Value],
+    route: &Route,
+    cpa_upstream_model: Option<&str>,
+    continuity: &ContinuityStore,
+) -> Result<(Bytes, String), ProxyError> {
+    let mut request = request.clone();
+    let route_id = route.identity(model);
     let continuity_rewritten = rewrite_for_continuity(
         &mut request,
-        parent.as_deref(),
-        &turn_input,
+        parent,
+        turn_input,
         route,
         &route_id,
-        &state.continuity,
+        continuity,
     )?;
     let model_rewritten = if let Some(upstream_model) = cpa_upstream_model {
         request
             .as_object_mut()
             .expect("top-level request was parsed as an object")
-            .insert("model".into(), Value::String(upstream_model));
+            .insert("model".into(), Value::String(upstream_model.to_owned()));
         true
     } else {
         false
     };
-
     let outgoing = if continuity_rewritten || model_rewritten {
         Bytes::from(
             serde_json::to_vec(&request)
                 .map_err(|error| ProxyError::bad_request("json", error.to_string()))?,
         )
     } else {
-        body
+        body.clone()
     };
+    Ok((outgoing, route_id))
+}
+
+async fn send_upstream(
+    state: &AppState,
+    headers: &HeaderMap,
+    endpoint: &str,
+    route: &Route,
+    body: Bytes,
+) -> Result<reqwest::Response, ProxyError> {
     let upstream_headers = match route {
-        Route::Official => router::official_headers(&headers),
-        Route::Cpa => router::cpa_headers(&headers, &state.credentials.cpa_token),
-    }
-    .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?;
-    let target = target_url(&state.settings, route, endpoint);
-    let upstream = state
+        Route::Official => router::official_headers(headers)
+            .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?,
+        Route::Cpa => router::cpa_headers(headers, &state.credentials.cpa_token)
+            .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?,
+        Route::Direct { token, .. } => {
+            let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?;
+            value.set_sensitive(true);
+            let mut direct = HeaderMap::new();
+            direct.insert(header::AUTHORIZATION, value);
+            for name in ["accept", "user-agent"] {
+                for v in headers.get_all(name) {
+                    direct.append(header::HeaderName::from_static(name), v.clone());
+                }
+            }
+            direct.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            direct
+        }
+    };
+    let target = target_url(&state.settings, &state.official_base_url, route, endpoint);
+    state
         .client
         .post(target)
         .headers(upstream_headers)
-        .body(outgoing)
+        .body(body)
         .send()
         .await
-        .map_err(|error| ProxyError::bad_gateway("upstream", error.to_string()))?;
+        .map_err(|error| ProxyError::bad_gateway("upstream", error.to_string()))
+}
+
+async fn finish_response(
+    upstream: reqwest::Response,
+    parent: Option<String>,
+    turn_input: Vec<Value>,
+    route_id: String,
+    continuity: Arc<ContinuityStore>,
+) -> Result<Response<Body>, ProxyError> {
     let status = upstream.status();
     let is_sse = upstream
         .headers()
@@ -364,14 +591,10 @@ async fn handle_responses(
 
     if is_sse {
         Ok(streaming_response(
-            upstream,
-            parent,
-            turn_input,
-            route_id,
-            state.continuity,
+            upstream, parent, turn_input, route_id, continuity,
         ))
     } else {
-        non_streaming_response(upstream, parent, turn_input, route_id, &state.continuity).await
+        non_streaming_response(upstream, parent, turn_input, route_id, &continuity).await
     }
 }
 
@@ -379,7 +602,7 @@ fn rewrite_for_continuity(
     request: &mut Value,
     parent: Option<&str>,
     turn_input: &[Value],
-    route: Route,
+    route: &Route,
     route_id: &str,
     continuity: &ContinuityStore,
 ) -> Result<bool, ProxyError> {
@@ -430,10 +653,16 @@ fn authenticate(headers: &HeaderMap, expected: &str) -> Result<(), ProxyError> {
     Ok(())
 }
 
-fn target_url(settings: &Settings, route: Route, endpoint: &str) -> String {
+fn target_url(
+    settings: &Settings,
+    official_base_url: &str,
+    route: &Route,
+    endpoint: &str,
+) -> String {
     let base_url = match route {
-        Route::Official => OFFICIAL_BASE_URL,
+        Route::Official => official_base_url,
         Route::Cpa => &settings.cpa.base_url,
+        Route::Direct { base_url, .. } => base_url,
     };
     format!(
         "{}/{}",
@@ -671,6 +900,290 @@ mod tests {
         (address, handle)
     }
 
+    #[derive(Clone, Default)]
+    struct TestCapture(Arc<tokio::sync::Mutex<Vec<(HeaderMap, Value)>>>);
+
+    fn auto_review_state(
+        root: &std::path::Path,
+        official_address: std::net::SocketAddr,
+        cpa_address: std::net::SocketAddr,
+    ) -> AppState {
+        let catalog_path = root.join("catalog.json");
+        let store = CatalogStore::load(catalog_path.clone()).unwrap();
+        store
+            .replace(
+                &json!({"models":[{
+                    "slug":catalog::AUTO_REVIEW_MODEL, "visibility":"hide"
+                }]}),
+                &json!({"models":[{
+                    "slug":"codex-auto-review", "visibility":"hide"
+                }]}),
+            )
+            .unwrap();
+        drop(store);
+        let mut state = AppState::new(
+            Settings {
+                cpa: crate::config::Cpa {
+                    base_url: format!("http://{cpa_address}/v1"),
+                },
+                ..Settings::default()
+            },
+            Credentials {
+                proxy_token: "proxy".into(),
+                cpa_token: "cpa-secret".into(),
+            },
+            catalog_path,
+            root.join("cpa-profiles.toml"),
+        )
+        .unwrap();
+        state.official_base_url = format!("http://{official_address}/v1");
+        state
+    }
+
+    #[tokio::test]
+    async fn auto_review_uses_official_route_without_touching_cpa_when_it_succeeds() {
+        async fn official(
+            State(capture): State<TestCapture>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            capture.0.lock().await.push((headers, body));
+            Json(json!({
+                "id":"resp_official_review", "status":"completed", "output":[]
+            }))
+        }
+        async fn cpa(State(capture): State<TestCapture>) -> StatusCode {
+            capture.0.lock().await.push((HeaderMap::new(), Value::Null));
+            StatusCode::OK
+        }
+
+        let official_capture = TestCapture::default();
+        let cpa_capture = TestCapture::default();
+        let (official_address, official_handle) = spawn_test_app(
+            Router::new()
+                .route("/v1/responses", post(official))
+                .with_state(official_capture.clone()),
+        )
+        .await;
+        let (cpa_address, cpa_handle) = spawn_test_app(
+            Router::new()
+                .route("/v1/responses", post(cpa))
+                .with_state(cpa_capture.clone()),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let state = auto_review_state(root.path(), official_address, cpa_address);
+        let (proxy_address, proxy_handle) = spawn_test_app(router(state)).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .header("x-modelmux-token", "proxy")
+            .header(header::AUTHORIZATION, "Bearer oauth")
+            .header("chatgpt-account-id", "account")
+            .json(&json!({
+                "model":catalog::AUTO_REVIEW_MODEL, "input":"review", "stream":false
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(official_capture.0.lock().await.len(), 1);
+        assert!(cpa_capture.0.lock().await.is_empty());
+        let captured = official_capture.0.lock().await;
+        assert_eq!(captured[0].0[header::AUTHORIZATION], "Bearer oauth");
+        assert_eq!(captured[0].0["chatgpt-account-id"], "account");
+        assert_eq!(captured[0].1["model"], catalog::AUTO_REVIEW_MODEL);
+
+        proxy_handle.abort();
+        official_handle.abort();
+        cpa_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn auto_review_falls_back_to_cpa_after_official_failure_with_isolated_credentials() {
+        async fn official(
+            State(capture): State<TestCapture>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Response<Body> {
+            capture.0.lock().await.push((headers, body));
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"official quota exhausted"}"#))
+                .unwrap()
+        }
+        async fn cpa(
+            State(capture): State<TestCapture>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Response<Body> {
+            capture.0.lock().await.push((headers, body));
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cpa_review\",\"status\":\"completed\",\"output\":[]}}\n\n",
+                ))
+                .unwrap()
+        }
+
+        let official_capture = TestCapture::default();
+        let cpa_capture = TestCapture::default();
+        let (official_address, official_handle) = spawn_test_app(
+            Router::new()
+                .route("/v1/responses", post(official))
+                .with_state(official_capture.clone()),
+        )
+        .await;
+        let (cpa_address, cpa_handle) = spawn_test_app(
+            Router::new()
+                .route("/v1/responses", post(cpa))
+                .with_state(cpa_capture.clone()),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let state = auto_review_state(root.path(), official_address, cpa_address);
+        let (proxy_address, proxy_handle) = spawn_test_app(router(state)).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .header("x-modelmux-token", "proxy")
+            .header(header::AUTHORIZATION, "Bearer oauth")
+            .header("chatgpt-account-id", "account")
+            .header("x-api-key", "incoming-secret")
+            .json(&json!({
+                "model":catalog::AUTO_REVIEW_MODEL, "input":"review", "stream":true
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        assert_eq!(
+            response.text().await.unwrap(),
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cpa_review\",\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        let official = official_capture.0.lock().await;
+        assert_eq!(official.len(), 1);
+        assert_eq!(official[0].0[header::AUTHORIZATION], "Bearer oauth");
+        assert_eq!(official[0].0["chatgpt-account-id"], "account");
+        assert_ne!(official[0].0[header::AUTHORIZATION], "Bearer cpa-secret");
+        assert_eq!(official[0].1["model"], catalog::AUTO_REVIEW_MODEL);
+        drop(official);
+        let cpa = cpa_capture.0.lock().await;
+        assert_eq!(cpa.len(), 1);
+        assert_eq!(cpa[0].0[header::AUTHORIZATION], "Bearer cpa-secret");
+        assert!(!cpa[0].0.contains_key("chatgpt-account-id"));
+        assert!(!cpa[0].0.contains_key("x-api-key"));
+        assert_eq!(cpa[0].1["model"], "codex-auto-review");
+
+        proxy_handle.abort();
+        official_handle.abort();
+        cpa_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn review_override_routes_straight_to_the_chosen_cpa_model() {
+        async fn official(
+            State(capture): State<TestCapture>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Response<Body> {
+            capture.0.lock().await.push((headers, body));
+            // The official route MUST NOT be contacted when the override is set.
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        async fn cpa(
+            State(capture): State<TestCapture>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            capture.0.lock().await.push((headers, body.clone()));
+            Json(json!({
+                "id": "resp_override", "object": "response", "status": "completed",
+                "model": body["model"],
+                "output": [{"type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":"overridden"}]}]
+            }))
+        }
+
+        let official_capture = TestCapture::default();
+        let cpa_capture = TestCapture::default();
+        let (official_address, official_handle) = spawn_test_app(
+            Router::new()
+                .route("/v1/responses", post(official))
+                .with_state(official_capture.clone()),
+        )
+        .await;
+        let (cpa_address, cpa_handle) = spawn_test_app(
+            Router::new()
+                .route("/v1/responses", post(cpa))
+                .with_state(cpa_capture.clone()),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let state = auto_review_state(root.path(), official_address, cpa_address);
+
+        // Set the override to glm-5.3-flash (a different CPA model).
+        crate::cpa::set_review_override(
+            root.path().join("cpa-profiles.toml").as_path(),
+            Some("glm-5.3-flash".into()),
+        )
+        .unwrap();
+
+        let (proxy_address, proxy_handle) = spawn_test_app(router(state)).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .header("x-modelmux-token", "proxy")
+            .header(header::AUTHORIZATION, "Bearer oauth")
+            .json(&json!({
+                "model":catalog::AUTO_REVIEW_MODEL, "input":"review", "stream":false
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["model"], "glm-5.3-flash");
+        assert!(official_capture.0.lock().await.is_empty());
+        let cpa = cpa_capture.0.lock().await;
+        assert_eq!(cpa.len(), 1);
+        assert_eq!(cpa[0].0[header::AUTHORIZATION], "Bearer cpa-secret");
+        assert_eq!(cpa[0].1["model"], "glm-5.3-flash");
+        drop(cpa);
+
+        // Clearing the override restores official-first behavior (official gets contacted).
+        let profiles_path = root.path().join("cpa-profiles.toml");
+        crate::cpa::set_review_override(&profiles_path, None).unwrap();
+        let state2 = auto_review_state(root.path(), official_address, cpa_address);
+        let (proxy_address2, proxy_handle2) = spawn_test_app(router(state2)).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy_address2}/v1/responses"))
+            .header("x-modelmux-token", "proxy")
+            .header(header::AUTHORIZATION, "Bearer oauth")
+            .json(&json!({
+                "model":catalog::AUTO_REVIEW_MODEL, "input":"review", "stream":false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(official_capture.0.lock().await.len(), 1);
+
+        proxy_handle.abort();
+        official_handle.abort();
+        cpa_handle.abort();
+        proxy_handle2.abort();
+    }
+
     #[tokio::test]
     async fn models_endpoint_merges_catalogs_with_isolated_credentials() {
         async fn official(Query(query): Query<ModelsQuery>, headers: HeaderMap) -> Json<Value> {
@@ -713,6 +1226,7 @@ mod tests {
                 cpa_token: "cpa-secret".into(),
             },
             root.path().join("catalog.json"),
+            root.path().join("cpa-profiles.toml"),
         )
         .unwrap();
         let incoming = HeaderMap::from_iter([
@@ -773,6 +1287,7 @@ mod tests {
                 cpa_token: "cpa".into(),
             },
             path,
+            root.path().join("cpa-profiles.toml"),
         )
         .unwrap();
 
@@ -820,9 +1335,9 @@ mod tests {
         let turn = portable_input_items(Some(&json!("second")));
 
         for (parent, route, model) in [
-            ("resp_official", Route::Cpa, "claude"),
-            ("resp_cpa", Route::Official, "gpt"),
-            ("resp_cpa", Route::Cpa, "claude"),
+            ("resp_official", &Route::Cpa, "claude"),
+            ("resp_cpa", &Route::Official, "gpt"),
+            ("resp_cpa", &Route::Cpa, "claude"),
         ] {
             let mut request = json!({
                 "model":model, "previous_response_id":parent, "input":"second"
@@ -862,7 +1377,7 @@ mod tests {
                 &mut same,
                 Some("resp_official"),
                 &turn,
-                Route::Official,
+                &Route::Official,
                 &Route::Official.identity("gpt-a"),
                 &store,
             )
@@ -878,7 +1393,7 @@ mod tests {
                 &mut switched,
                 Some("resp_official"),
                 &turn,
-                Route::Official,
+                &Route::Official,
                 &Route::Official.identity("gpt-b"),
                 &store,
             )
