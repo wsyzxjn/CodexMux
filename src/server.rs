@@ -23,6 +23,7 @@ use crate::{
     continuity::{ContinuityStore, portable_input_items, portable_output_items},
     dialect::sse,
     router,
+    telemetry::{TelemetrySession, TelemetrySnapshot, TelemetryStore},
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -61,6 +62,7 @@ pub struct AppState {
     credentials: Arc<Credentials>,
     catalog: Arc<CatalogStore>,
     continuity: Arc<ContinuityStore>,
+    telemetry: Arc<TelemetryStore>,
     /// Profile store path; read per-request for the review model override so
     /// menu-bar changes apply without a proxy restart.
     cpa_profiles_path: PathBuf,
@@ -85,6 +87,7 @@ impl AppState {
             credentials: Arc::new(credentials),
             catalog: Arc::new(catalog),
             continuity: Arc::new(ContinuityStore::new()),
+            telemetry: Arc::new(TelemetryStore::new()),
             cpa_profiles_path,
         })
     }
@@ -109,6 +112,7 @@ where
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/telemetry", get(handle_telemetry))
         .route("/v1/models", get(handle_models))
         .route("/v1/responses", post(handle_responses))
         .route("/v1/responses/compact", post(handle_responses))
@@ -131,6 +135,10 @@ async fn require_proxy_token(
 
 async fn health() -> Json<Value> {
     Json(json!({"ok": true, "service": "modelmux"}))
+}
+
+async fn handle_telemetry(State(state): State<AppState>) -> Json<TelemetrySnapshot> {
+    Json(state.telemetry.snapshot())
 }
 
 #[derive(Deserialize)]
@@ -410,6 +418,7 @@ async fn forward_auto_review(
         None,
         &state.continuity,
     )?;
+    let official_telemetry = state.telemetry.begin(&official_route_id);
     let official = send_upstream(state, headers, endpoint, &Route::Official, official_body).await;
     match official {
         Ok(upstream) if upstream.status().is_success() => {
@@ -419,6 +428,7 @@ async fn forward_auto_review(
                 request.turn_input.clone(),
                 official_route_id,
                 state.continuity.clone(),
+                official_telemetry,
             )
             .await;
         }
@@ -433,6 +443,7 @@ async fn forward_auto_review(
             tracing::warn!(message = %error.message, "official auto-review failed; falling back to CPA");
         }
     }
+    drop(official_telemetry);
 
     let cpa_upstream_model = cpa_upstream_model.expect("CPA fallback was checked above");
     let (cpa_body, cpa_route_id) = prepare_request(
@@ -445,6 +456,7 @@ async fn forward_auto_review(
         Some(cpa_upstream_model),
         &state.continuity,
     )?;
+    let cpa_telemetry = state.telemetry.begin(&cpa_route_id);
     let upstream = send_upstream(state, headers, endpoint, &Route::Cpa, cpa_body).await?;
     finish_response(
         upstream,
@@ -452,6 +464,7 @@ async fn forward_auto_review(
         request.turn_input.clone(),
         cpa_route_id,
         state.continuity.clone(),
+        cpa_telemetry,
     )
     .await
 }
@@ -474,6 +487,7 @@ async fn forward_response(
         cpa_upstream_model,
         &state.continuity,
     )?;
+    let telemetry = state.telemetry.begin(&route_id);
     let upstream = send_upstream(state, headers, endpoint, route, outgoing).await?;
     finish_response(
         upstream,
@@ -481,6 +495,7 @@ async fn forward_response(
         request.turn_input.clone(),
         route_id,
         state.continuity.clone(),
+        telemetry,
     )
     .await
 }
@@ -573,6 +588,7 @@ async fn finish_response(
     turn_input: Vec<Value>,
     route_id: String,
     continuity: Arc<ContinuityStore>,
+    telemetry: TelemetrySession,
 ) -> Result<Response<Body>, ProxyError> {
     let status = upstream.status();
     let is_sse = upstream
@@ -591,10 +607,18 @@ async fn finish_response(
 
     if is_sse {
         Ok(streaming_response(
-            upstream, parent, turn_input, route_id, continuity,
+            upstream, parent, turn_input, route_id, continuity, telemetry,
         ))
     } else {
-        non_streaming_response(upstream, parent, turn_input, route_id, &continuity).await
+        non_streaming_response(
+            upstream,
+            parent,
+            turn_input,
+            route_id,
+            &continuity,
+            telemetry,
+        )
+        .await
     }
 }
 
@@ -693,6 +717,7 @@ async fn non_streaming_response(
     turn_input: Vec<Value>,
     route_id: String,
     continuity: &ContinuityStore,
+    mut telemetry: TelemetrySession,
 ) -> Result<Response<Body>, ProxyError> {
     let status = upstream.status();
     let content_type = upstream
@@ -706,6 +731,7 @@ async fn non_streaming_response(
         .await
         .map_err(|error| ProxyError::bad_gateway("upstream_body", error.to_string()))?;
     if let Ok(response) = serde_json::from_slice::<Value>(&bytes) {
+        telemetry.complete(&response);
         record_response(
             continuity,
             &response,
@@ -733,36 +759,56 @@ struct ResponseCapture {
     buffer: Vec<u8>,
 }
 
+#[derive(Default)]
+struct CaptureUpdate {
+    deltas: Vec<String>,
+    completed: Option<Value>,
+}
+
 impl ResponseCapture {
     fn new() -> Self {
         Self { buffer: Vec::new() }
     }
 
-    fn push(&mut self, bytes: &[u8]) -> Option<Value> {
-        let mut completed = None;
+    fn push(&mut self, bytes: &[u8]) -> CaptureUpdate {
+        let mut update = CaptureUpdate::default();
         for frame in sse::frames(&mut self.buffer, bytes) {
-            if let Some(response) = completed_response(&frame) {
-                completed = Some(response);
-            }
+            update_frame(&frame, &mut update);
         }
-        completed
+        update
     }
 
-    fn finish(&mut self) -> Option<Value> {
+    fn finish(&mut self) -> CaptureUpdate {
         if self.buffer.is_empty() {
-            return None;
+            return CaptureUpdate::default();
         }
         let frame = std::mem::take(&mut self.buffer);
-        completed_response(&frame)
+        let mut update = CaptureUpdate::default();
+        update_frame(&frame, &mut update);
+        update
     }
 }
 
-fn completed_response(frame: &[u8]) -> Option<Value> {
-    let data = sse::data(frame)?;
-    let event = serde_json::from_str::<Value>(&data).ok()?;
-    (event.get("type").and_then(Value::as_str) == Some("response.completed"))
-        .then(|| event.get("response").cloned())
-        .flatten()
+fn update_frame(frame: &[u8], update: &mut CaptureUpdate) {
+    let Some(data) = sse::data(frame) else {
+        return;
+    };
+    let Ok(event) = serde_json::from_str::<Value>(&data) else {
+        return;
+    };
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if event_type == "response.completed" {
+        update.completed = event.get("response").cloned();
+    } else if event_type.starts_with("response.")
+        && event_type.ends_with(".delta")
+        && !event_type.contains("audio")
+        && let Some(delta) = event.get("delta").and_then(Value::as_str)
+    {
+        update.deltas.push(delta.to_owned());
+    }
 }
 
 fn streaming_response(
@@ -771,29 +817,35 @@ fn streaming_response(
     turn_input: Vec<Value>,
     route_id: String,
     continuity: Arc<ContinuityStore>,
+    telemetry: TelemetrySession,
 ) -> Response<Body> {
     let source = upstream.bytes_stream();
     let output = stream! {
         let mut source = Box::pin(source);
         let mut capture = ResponseCapture::new();
+        let mut telemetry = telemetry;
         let mut recorded = false;
         let mut capture_bytes = 0usize;
         while let Some(chunk) = source.next().await {
             match chunk {
                 Ok(chunk) => {
                     capture_bytes = capture_bytes.saturating_add(chunk.len());
-                    if !recorded
-                        && capture_bytes <= MAX_CAPTURE_BYTES
-                        && let Some(response) = capture.push(&chunk)
-                    {
-                        record_response(
-                            &continuity,
-                            &response,
-                            parent.as_deref(),
-                            &route_id,
-                            turn_input.clone(),
-                        );
-                        recorded = true;
+                    if !recorded && capture_bytes <= MAX_CAPTURE_BYTES {
+                        let update = capture.push(&chunk);
+                        for delta in update.deltas {
+                            telemetry.observe_delta(&delta);
+                        }
+                        if let Some(response) = update.completed {
+                            telemetry.complete(&response);
+                            record_response(
+                                &continuity,
+                                &response,
+                                parent.as_deref(),
+                                &route_id,
+                                turn_input.clone(),
+                            );
+                            recorded = true;
+                        }
                     }
                     yield Ok::<Bytes, io::Error>(chunk);
                 }
@@ -803,10 +855,15 @@ fn streaming_response(
                 }
             }
         }
-        if !recorded && capture_bytes <= MAX_CAPTURE_BYTES
-            && let Some(response) = capture.finish()
-        {
-            record_response(&continuity, &response, parent.as_deref(), &route_id, turn_input);
+        if !recorded && capture_bytes <= MAX_CAPTURE_BYTES {
+            let update = capture.finish();
+            for delta in update.deltas {
+                telemetry.observe_delta(&delta);
+            }
+            if let Some(response) = update.completed {
+                telemetry.complete(&response);
+                record_response(&continuity, &response, parent.as_deref(), &route_id, turn_input);
+            }
         }
     };
     Response::builder()

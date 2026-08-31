@@ -1,5 +1,4 @@
 import Cocoa
-import Combine
 
 /// User-facing strings for every language ModelMuxBar supports.
 struct L10n {
@@ -26,6 +25,7 @@ struct L10n {
     let startCPAFailed: String
     let stopCPAFailed: String
     let reviewSetFailed: String
+    let tokenSpeed: String
     let quitDialogTitle: String
     let quitDialogBody: String
     let quitDialogConfirm: String
@@ -56,6 +56,7 @@ struct L10n {
         startCPAFailed: "Failed to start the CPA service. See logs.",
         stopCPAFailed: "Failed to stop the CPA service. See logs.",
         reviewSetFailed: "Failed to set the review model. See logs.",
+        tokenSpeed: "Token Speed",
         quitDialogTitle: "Quit ModelMuxBar?",
         quitDialogBody: "This stops the ModelMux proxy and the CPA service, and restores the Codex configuration.",
         quitDialogConfirm: "Quit and Stop Services",
@@ -87,6 +88,7 @@ struct L10n {
         startCPAFailed: "启动 CPA 服务失败，请查看日志。",
         stopCPAFailed: "停止 CPA 服务失败，请查看日志。",
         reviewSetFailed: "设置审批模型失败，请查看日志。",
+        tokenSpeed: "Token 速度",
         quitDialogTitle: "退出 ModelMuxBar？",
         quitDialogBody: "将停止 ModelMux 代理与 CPA 服务，并还原 Codex 配置。",
         quitDialogConfirm: "退出并停止服务",
@@ -133,30 +135,62 @@ enum Language: String, CaseIterable {
     }
 }
 
+struct TelemetrySnapshot: Decodable {
+    let current: TurnTelemetry?
+    let lastCompleted: TurnTelemetry?
+
+    enum CodingKeys: String, CodingKey {
+        case current
+        case lastCompleted = "last_completed"
+    }
+}
+
+struct TurnTelemetry: Decodable {
+    let tokensPerSecond: Double?
+    let exact: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case tokensPerSecond = "tokens_per_second"
+        case exact
+    }
+}
+
 /// Menu bar controller for ModelMux: service status, start/stop, and log access.
 ///
 /// ModelMuxBar only manages ModelMux's own lifecycle (and its bundled CPA
 /// service). Model selection stays in the Codex client; this app deliberately
 /// never switches models.
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
     private var timer: Timer?
-    private var cancellables = Set<AnyCancellable>()
+    private var telemetryTimer: Timer?
+    private var telemetryRequestInFlight = false
+    private var telemetry: TelemetrySnapshot?
+    private var tokenSpeedMenu: NSMenu!
+    private var tokenSpeedValueItem: NSMenuItem!
 
     private let modelmuxURL = URL(fileURLWithPath: NSString(
         string: "~/.local/bin/modelmux"
     ).expandingTildeInPath)
-    private let modelmuxHome = NSString(
-        string: "~/Library/Application Support/ModelMux"
-    ).expandingTildeInPath
+    private let modelmuxHome: String = {
+        let configured = ProcessInfo.processInfo.environment["MODELMUX_HOME"]
+        let path = configured.flatMap { $0.isEmpty ? nil : $0 }
+            ?? "~/Library/Application Support/ModelMux"
+        return NSString(string: path).expandingTildeInPath
+    }()
     /// Codex config path; must match the LaunchAgent plist so install/uninstall
     /// and serve manage the same file.
     private let codexConfig = NSString(
         string: "/Volumes/AmatsukaM/.agent-data/codex/config.toml"
     ).expandingTildeInPath
     private let languageDefaultsKey = "language"
-    private let proxyPort = 48682
+    private let proxyPort: Int = {
+        guard let configured = ProcessInfo.processInfo.environment["MODELMUX_PROXY_PORT"],
+              let port = Int(configured), (1...65_535).contains(port)
+        else { return 48_682 }
+        return port
+    }()
     private var proxyReachable = false
     private var cpaRunning = false
     private var activeProfile: String?
@@ -181,15 +215,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu = NSMenu()
         menu.autoenablesItems = false
         statusItem.menu = menu
+        statusItem.button?.toolTip = "ModelMux"
         rebuildMenu()
         refreshStatus()
+        refreshTelemetry()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.refreshStatus()
         }
+        let telemetryTimer = Timer(timeInterval: 0.75, repeats: true) { [weak self] _ in
+            self?.refreshTelemetry()
+        }
+        self.telemetryTimer = telemetryTimer
+        RunLoop.main.add(telemetryTimer, forMode: .common)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
+        telemetryTimer?.invalidate()
     }
 
     // MARK: - Status
@@ -219,9 +261,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             group.leave()
         }
         group.notify(queue: .main) { [weak self] in
-            self?.updateIcon()
-            self?.rebuildMenu()
+            guard let self else { return }
+            self.updateIcon()
+            self.rebuildMenu()
         }
+    }
+
+    private func refreshTelemetry() {
+        guard !telemetryRequestInFlight else { return }
+        let token = credentialToken(named: "proxy_token")
+        guard !token.isEmpty else {
+            telemetry = nil
+            updateTokenSpeedMenu()
+            return
+        }
+        telemetryRequestInFlight = true
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(proxyPort)/telemetry")!)
+        request.timeoutInterval = 2
+        request.setValue(token, forHTTPHeaderField: "x-modelmux-token")
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            let snapshot: TelemetrySnapshot? = {
+                guard (response as? HTTPURLResponse)?.statusCode == 200,
+                      let data else { return nil }
+                return try? JSONDecoder().decode(TelemetrySnapshot.self, from: data)
+            }()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.telemetryRequestInFlight = false
+                if let snapshot {
+                    self.telemetry = snapshot
+                    self.proxyReachable = true
+                    self.updateIcon()
+                } else {
+                    self.telemetry = nil
+                }
+                self.updateTokenSpeedMenu()
+            }
+        }.resume()
     }
 
     /// Fetch CPA model slugs from the local CPA instance (background queue only).
@@ -248,10 +324,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Read the CPA client token from ModelMux credentials (never logged).
     private func cpaToken() -> String {
+        credentialToken(named: "cpa_token")
+    }
+
+    private func credentialToken(named key: String) -> String {
         let path = modelmuxHome + "/credentials.json"
         guard let data = FileManager.default.contents(atPath: path),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let token = object["cpa_token"] as? String
+              let token = object[key] as? String
         else { return "" }
         return token
     }
@@ -302,10 +382,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func checkProxy(_ completion: @escaping (Bool) -> Void) {
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(proxyPort)/health")!)
         request.timeoutInterval = 2
-        // /health requires the proxy token, which this app deliberately never
-        // reads; any HTTP response (including 403) proves ModelMux is alive.
+        let token = credentialToken(named: "proxy_token")
+        if !token.isEmpty {
+            request.setValue(token, forHTTPHeaderField: "x-modelmux-token")
+        }
         URLSession.shared.dataTask(with: request) { _, response, _ in
-            completion((response as? HTTPURLResponse) != nil)
+            completion((response as? HTTPURLResponse)?.statusCode == 200)
         }.resume()
     }
 
@@ -349,6 +431,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         cpaStatusItem.isEnabled = false
         menu.addItem(cpaStatusItem)
+
+        let tokenSpeedItem = NSMenuItem(title: l10n.tokenSpeed, action: nil, keyEquivalent: "")
+        tokenSpeedMenu = NSMenu()
+        tokenSpeedMenu.autoenablesItems = false
+        tokenSpeedMenu.delegate = self
+        tokenSpeedValueItem = NSMenuItem(title: "— tok/s", action: nil, keyEquivalent: "")
+        tokenSpeedValueItem.isEnabled = false
+        tokenSpeedMenu.addItem(tokenSpeedValueItem)
+        tokenSpeedItem.submenu = tokenSpeedMenu
+        menu.addItem(tokenSpeedItem)
+        updateTokenSpeedMenu()
 
         // Controls submenu: start/stop actions for both services.
         let controlsTitle = cpaRunning
@@ -463,6 +556,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Actions
+
+    private func updateTokenSpeedMenu() {
+        guard tokenSpeedValueItem != nil else { return }
+        let displayedTurn = telemetry?.current ?? telemetry?.lastCompleted
+
+        if let turn = displayedTurn, let speed = turn.tokensPerSecond {
+            let prefix = turn.exact ? "" : "≈ "
+            tokenSpeedValueItem.title = prefix + String(format: "%.1f tok/s", speed)
+        } else {
+            tokenSpeedValueItem.title = "— tok/s"
+        }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        if menu === tokenSpeedMenu {
+            refreshTelemetry()
+        }
+    }
 
     @objc private func selectLanguage(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
@@ -627,8 +738,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// Entry point: bootstrap NSApplication, install the delegate, and run the
-/// event loop so the status item actually renders.
+/// Bootstrap NSApplication, install the delegate, and run the event loop so
+/// the status item actually renders.
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

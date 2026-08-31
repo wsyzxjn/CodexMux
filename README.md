@@ -273,10 +273,19 @@ ModelMux 按 `cpa/` 前缀路由到 `config.toml` 中配置的 CPA 地址。
 
 仓库内的 `menubar/` 是一个独立的 Swift 菜单栏应用，提供：
 
+- 原生折叠菜单中的实时 token 速度；
 - ModelMux 与本地 CPA 的运行状态显示；
 - 重启 / 停止 ModelMux；
 - 启动 / 停止 CPA；
 - 打开日志目录。
+
+生成过程中，Token 速度子菜单从公开的 Responses SSE delta 估算输出 token，并以
+`≈ tok/s` 显示；收到 `response.completed` 后，如果上游返回
+`usage.output_tokens`，会用该值校准最终平均速度。估算与校准统计只保存在
+ModelMux 进程内存中，不记录 prompt、响应文本或 provider 私有字段。
+
+点击菜单栏图标打开原生菜单，再展开“Token 速度”即可查看。统计数据来自
+需要 `x-modelmux-token` 的本地 `/telemetry` 接口。
 
 构建并运行：
 

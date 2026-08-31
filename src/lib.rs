@@ -9,3 +9,4 @@ pub mod launch_agent;
 pub mod router;
 pub mod secrets;
 pub mod server;
+pub mod telemetry;

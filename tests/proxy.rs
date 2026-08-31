@@ -413,6 +413,92 @@ async fn cpa_sse_is_byte_for_byte_passthrough_and_records_completed_history() {
 }
 
 #[tokio::test]
+async fn telemetry_reports_live_estimate_then_calibrates_from_completed_usage() {
+    async fn upstream() -> Response<Body> {
+        let fixture = include_bytes!("fixtures/native_responses/telemetry_with_usage.sse");
+        let utf8_split = fixture
+            .windows("杭".len())
+            .position(|window| window == "杭".as_bytes())
+            .unwrap()
+            + 1;
+        let completed_start = fixture
+            .windows("event: response.completed".len())
+            .position(|window| window == b"event: response.completed")
+            .unwrap();
+        let first = Bytes::copy_from_slice(&fixture[..utf8_split]);
+        let second = Bytes::copy_from_slice(&fixture[utf8_split..completed_start]);
+        let completed = Bytes::copy_from_slice(&fixture[completed_start..]);
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, Infallible>(first);
+            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+            yield Ok::<Bytes, Infallible>(second);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            yield Ok::<Bytes, Infallible>(completed);
+        };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    }
+
+    let (cpa_address, cpa_handle) =
+        spawn(Router::new().route("/v1/responses", post(upstream))).await;
+    let (proxy_address, proxy_handle) =
+        spawn_modelmux(format!("http://{cpa_address}/v1"), &[], &["stream-model"]).await;
+    let client = reqwest::Client::new();
+    let mut response = client
+        .post(format!("http://{proxy_address}/v1/responses"))
+        .header("x-modelmux-token", "proxy-token")
+        .json(&json!({"model":"cpa/stream-model","input":"first","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    let first = response.chunk().await.unwrap().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let live: Value = client
+        .get(format!("http://{proxy_address}/telemetry"))
+        .header("x-modelmux-token", "proxy-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(live["active_requests"], 1);
+    assert_eq!(live["current"]["model"], "cpa/stream-model");
+    assert_eq!(live["current"]["route"], "cpa");
+    assert_eq!(live["current"]["exact"], false);
+    assert!(live["current"]["output_tokens"].as_u64().unwrap() > 0);
+    assert!(live["current"]["tokens_per_second"].as_f64().unwrap() > 0.0);
+
+    let rest = response.bytes().await.unwrap();
+    let mut received = first.to_vec();
+    received.extend_from_slice(&rest);
+    assert_eq!(
+        received,
+        include_bytes!("fixtures/native_responses/telemetry_with_usage.sse")
+    );
+
+    let completed: Value = client
+        .get(format!("http://{proxy_address}/telemetry"))
+        .header("x-modelmux-token", "proxy-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(completed["active_requests"], 0);
+    assert_eq!(completed["last_completed"]["output_tokens"], 24);
+    assert_eq!(completed["last_completed"]["exact"], true);
+
+    proxy_handle.abort();
+    cpa_handle.abort();
+}
+
+#[tokio::test]
 async fn completed_sse_is_recorded_before_upstream_eof() {
     async fn upstream(
         State(capture): State<Capture>,
@@ -605,6 +691,12 @@ async fn every_route_requires_the_proxy_token() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    let missing_telemetry = client
+        .get(format!("http://{proxy_address}/telemetry"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_telemetry.status(), StatusCode::FORBIDDEN);
     let missing_unknown = client
         .get(format!("http://{proxy_address}/unknown"))
         .send()
