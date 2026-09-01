@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "ModelMuxBar",
+    name: "CodexMux",
     platforms: [.macOS(.v13)],
     targets: [
         .executableTarget(
-            name: "ModelMuxBar",
-            path: "ModelMuxBar"
+            name: "CodexMux",
+            path: "CodexMux"
         )
     ]
 )

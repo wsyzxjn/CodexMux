@@ -1,8 +1,8 @@
 use std::{future::Future, path::PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use modelmux::{
+use codexmux::{
     codex_config::{ConfigLease, ConfigManager, PROXY_TOKEN_ENV},
     config::{Credentials, Paths, Settings},
     launch_agent, secrets,
@@ -27,6 +27,10 @@ enum Command {
         /// Do not enable or restore the managed Codex configuration.
         #[arg(long)]
         no_codex_config: bool,
+        /// Accept the listener socket supplied by launchd and exit after an
+        /// idle period. Used by the installed on-demand LaunchAgent.
+        #[arg(long)]
+        launchd_socket: bool,
     },
     /// Show paths and managed configuration state.
     Status,
@@ -53,10 +57,29 @@ enum CpaCommand {
     },
     /// Start the CPA LaunchAgent (installs the managed config).
     Start,
+    /// Bring the CPA service in line with the saved startup preference:
+    /// start it when enabled, stop it when disabled, leave it untouched
+    /// when no preference exists.
+    SyncStart,
     /// Stop the CPA LaunchAgent.
-    Stop,
+    Stop {
+        /// Stop without updating the startup preference (app shutdown).
+        #[arg(long)]
+        no_preference: bool,
+    },
     /// Show the installed version and service state.
     Status,
+    /// List model slugs from the configured CPA endpoint.
+    ModelList,
+    /// Print the CPA web management page URL.
+    ManagementUrl {
+        /// For loopback CPA, attach the current endpoint and management key
+        /// so the Web UI can auto-connect. Remote URLs stay unmodified.
+        #[arg(long)]
+        connect: bool,
+    },
+    /// Print the CPA web management key for explicit user handoff.
+    ManagementKey,
     /// Import provider definitions from a TOML file and restart CPA.
     ProviderImport {
         /// TOML file with [[openai-compatibility]] / [[codex-api-key]] tables.
@@ -71,16 +94,16 @@ enum CpaCommand {
         /// CPA base URL, for example http://127.0.0.1:8317/v1.
         #[arg(long)]
         base_url: String,
-        /// Client token for this endpoint (stored in the mode-0600 profile file).
-        #[arg(long)]
-        token: String,
+        /// Environment variable containing the endpoint token.
+        #[arg(long, default_value = "CODEXMUX_CPA_PROFILE_TOKEN")]
+        token_env: String,
     },
     /// Remove a saved profile.
     ProfileRemove {
         /// Profile name.
         name: String,
     },
-    /// Show the review model override (None = official first, CPA fallback).
+    /// Show the review model override (None = official route).
     ReviewGet,
     /// Route `cpa/<slug>` requests directly to an upstream, bypassing CPA.
     DirectSet {
@@ -89,12 +112,49 @@ enum CpaCommand {
         /// Upstream Responses API base URL.
         #[arg(long)]
         base_url: String,
-        /// Bearer token for the upstream.
+        /// Environment variable containing the direct upstream token.
+        #[arg(long, default_value = "CODEXMUX_DIRECT_TOKEN")]
+        token_env: String,
+        /// Native upstream model id when it differs from the local slug.
+        /// Requires exactly one local model.
         #[arg(long)]
-        token: String,
+        upstream_model: Option<String>,
     },
+    /// Add models to a direct upstream, merging with an existing route.
+    DirectAdd {
+        /// Comma-separated local model slugs (without the cpa/ prefix).
+        models: String,
+        /// Upstream Responses API base URL.
+        #[arg(long)]
+        base_url: String,
+        /// Environment variable containing the direct upstream token.
+        #[arg(long, default_value = "CODEXMUX_DIRECT_TOKEN")]
+        token_env: String,
+        /// Native upstream model id when it differs from the local slug.
+        /// Requires exactly one local model.
+        #[arg(long)]
+        upstream_model: Option<String>,
+    },
+    /// Remove models (or a whole route) from direct upstreams.
+    DirectRemove {
+        /// Upstream Responses API base URL of the route.
+        #[arg(long)]
+        base_url: String,
+        /// Comma-separated upstream model slugs to remove; empty removes the
+        /// whole route.
+        models: Option<String>,
+    },
+    /// List direct routes without printing their tokens.
+    DirectList,
     /// Remove all direct routes (everything goes through CPA again).
     DirectClear,
+    /// Show whether the CPA service should start with CodexMux.
+    AutostartGet,
+    /// Set whether the CPA service should start with CodexMux.
+    AutostartSet {
+        /// `true`/`false`: whether CPA starts together with CodexMux.
+        enabled: String,
+    },
     /// Route `codex-auto-review` straight to a CPA model (empty to clear).
     ReviewSet {
         /// Upstream CPA model slug; empty string clears the override.
@@ -114,13 +174,16 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "modelmux=info".into()),
+                .unwrap_or_else(|_| "codexmux=info".into()),
         )
         .init();
     let paths = Paths::discover()?;
     match Cli::parse().command {
         Command::Init => init(&paths),
-        Command::Serve { no_codex_config } => serve(&paths, no_codex_config).await,
+        Command::Serve {
+            no_codex_config,
+            launchd_socket,
+        } => serve(&paths, no_codex_config, launchd_socket).await,
         Command::Status => status(&paths),
         Command::Doctor => doctor(&paths).await,
         Command::Install => {
@@ -132,10 +195,11 @@ async fn main() -> Result<()> {
             let manager = config_manager(&paths)?;
             let lease = manager.enable(&format!("http://{}/v1", settings.listen))?;
             let executable = std::env::current_exe()?.canonicalize()?;
-            let install_result = launch_agent::install(&paths, &executable, &codex_config_path()?)
-                .map(|plist| {
-                    println!("installed {}", plist.display());
-                });
+            let install_result =
+                launch_agent::install(&paths, &executable, &codex_config_path()?, settings.listen)
+                    .map(|plist| {
+                        println!("installed {}", plist.display());
+                    });
             // Keep the configuration enabled only when the agent was installed.
             match install_result {
                 Ok(()) => {
@@ -164,6 +228,7 @@ fn init(paths: &Paths) -> Result<()> {
             &Credentials {
                 proxy_token: uuid::Uuid::new_v4().simple().to_string(),
                 cpa_token: uuid::Uuid::new_v4().simple().to_string(),
+                cpa_management_key: uuid::Uuid::new_v4().simple().to_string(),
             },
         )?;
     }
@@ -180,12 +245,29 @@ fn init(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-async fn serve(paths: &Paths, no_codex_config: bool) -> Result<()> {
+async fn serve(paths: &Paths, no_codex_config: bool, launchd_socket: bool) -> Result<()> {
     let settings = Settings::load(&paths.settings)?;
     let credentials = secrets::load(&paths.credentials)?;
-    let listener = tokio::net::TcpListener::bind(settings.listen)
-        .await
-        .with_context(|| format!("failed to bind {}", settings.listen))?;
+    let listener = if launchd_socket {
+        let listener = launch_agent::activated_listener()?;
+        anyhow::ensure!(
+            listener.local_addr()? == settings.listen,
+            "launchd listener {} does not match configured {}",
+            listener.local_addr()?,
+            settings.listen
+        );
+        tokio::net::TcpListener::from_std(listener)?
+    } else {
+        tokio::net::TcpListener::bind(settings.listen)
+            .await
+            .with_context(|| format!("failed to bind {}", settings.listen))?
+    };
+    let lifecycle_manages_cpa =
+        launchd_socket && codexmux::cpa::cpa_autostart(&paths.cpa_profiles) == Some(true);
+    if lifecycle_manages_cpa && !codexmux::cpa::is_loaded()? {
+        codexmux::cpa::start(paths, &settings.cpa, &credentials.cpa_token)?;
+        tracing::info!("CPA started for active Codex client");
+    }
     let state = AppState::new(
         settings.clone(),
         credentials,
@@ -205,13 +287,27 @@ async fn serve(paths: &Paths, no_codex_config: bool) -> Result<()> {
 
     let result = {
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        let idle_state = state.clone();
         let proxy = server::serve(listener, state, async move {
             let _ = stopped.await;
         });
+        let idle = async move {
+            if launchd_socket {
+                idle_state.wait_for_idle().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::pin!(proxy);
-        tokio::select! {
-            result = &mut proxy => result,
-            _ = shutdown => {
+        tokio::pin!(idle);
+        let finished = tokio::select! {
+            result = &mut proxy => Some(result),
+            _ = shutdown => None,
+            _ = &mut idle => None,
+        };
+        match finished {
+            Some(result) => result,
+            None => {
                 let _ = stop.send(());
                 match tokio::time::timeout(std::time::Duration::from_secs(30), &mut proxy).await {
                     Ok(result) => result,
@@ -223,6 +319,13 @@ async fn serve(paths: &Paths, no_codex_config: bool) -> Result<()> {
             }
         }
     };
+    if lifecycle_manages_cpa && codexmux::cpa::is_loaded()? {
+        if let Err(error) = codexmux::cpa::stop_service_only() {
+            tracing::warn!(%error, "failed to stop lifecycle-managed CPA");
+        } else {
+            tracing::info!("CPA stopped after Codex client became idle");
+        }
+    }
     let restore = lease.map(ConfigLease::restore).transpose();
     match (result, restore) {
         (Ok(()), Ok(_)) => Ok(()),
@@ -282,6 +385,14 @@ fn status(paths: &Paths) -> Result<()> {
     println!("settings: {}", paths.settings.display());
     println!("credentials: {}", paths.credentials.display());
     println!("catalog: {}", paths.catalog.display());
+    println!(
+        "proxy service: {}",
+        match launch_agent::runtime_state()? {
+            launch_agent::RuntimeState::Running => "running",
+            launch_agent::RuntimeState::Idle => "idle",
+            launch_agent::RuntimeState::NotInstalled => "not installed",
+        }
+    );
     let status = config_manager(paths)?.status()?;
     println!("enabled: {}", status.enabled);
     println!("codex config: {}", status.config_path.display());
@@ -299,7 +410,7 @@ async fn doctor(paths: &Paths) -> Result<()> {
     let status = config_manager(paths)?.status()?;
     match reqwest::Client::new()
         .get(format!("http://{}/health", settings.listen))
-        .header("x-modelmux-token", &credentials.proxy_token)
+        .header("x-codexmux-token", &credentials.proxy_token)
         .send()
         .await
     {
@@ -354,39 +465,63 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
         CpaCommand::Install { archive } => {
             let credentials = secrets::load(&paths.credentials)?;
             match archive {
-                Some(archive) => modelmux::cpa::install_from_archive(
+                Some(archive) => codexmux::cpa::install_from_archive(
                     paths,
                     &settings.cpa,
                     &archive,
-                    modelmux::cpa::CPA_VERSION,
-                    modelmux::cpa::CPA_DARWIN_AARCH64_SHA256,
+                    codexmux::cpa::CPA_VERSION,
+                    codexmux::cpa::CPA_DARWIN_AARCH64_SHA256,
                     &credentials.cpa_token,
                 )?,
-                None => modelmux::cpa::install(paths, &settings.cpa, &credentials.cpa_token)?,
+                None => codexmux::cpa::install(paths, &settings.cpa, &credentials.cpa_token)?,
             }
             println!(
                 "CLIProxyAPI {} installed at {}",
-                modelmux::cpa::CPA_VERSION,
-                modelmux::cpa::binary_path(paths).display()
+                codexmux::cpa::CPA_VERSION,
+                codexmux::cpa::binary_path(paths).display()
             );
-            println!("config: {}", modelmux::cpa::config_path(paths).display());
+            println!("config: {}", codexmux::cpa::config_path(paths).display());
             println!(
                 "service: started ({}); logs: {}/logs/cpa-*.log",
-                modelmux::cpa::agent_label(),
+                codexmux::cpa::agent_label(),
                 paths.root.display()
             );
         }
         CpaCommand::Start => {
             let credentials = secrets::load(&paths.credentials)?;
-            modelmux::cpa::start(paths, &settings.cpa, &credentials.cpa_token)?;
+            codexmux::cpa::start(paths, &settings.cpa, &credentials.cpa_token)?;
             println!("CPA service started");
         }
-        CpaCommand::Stop => {
-            modelmux::cpa::stop()?;
+        CpaCommand::SyncStart => match codexmux::cpa::cpa_autostart(&paths.cpa_profiles) {
+            Some(true) => {
+                if !codexmux::cpa::is_loaded()? {
+                    let credentials = secrets::load(&paths.credentials)?;
+                    codexmux::cpa::start(paths, &settings.cpa, &credentials.cpa_token)?;
+                    println!("CPA service started (startup preference: enabled)");
+                } else {
+                    println!("CPA service already running (startup preference: enabled)");
+                }
+            }
+            Some(false) => {
+                if codexmux::cpa::is_loaded()? {
+                    codexmux::cpa::stop_service_only()?;
+                    println!("CPA service stopped (startup preference: disabled)");
+                } else {
+                    println!("CPA service already stopped (startup preference: disabled)");
+                }
+            }
+            None => println!("CPA startup preference not set; service left as-is"),
+        },
+        CpaCommand::Stop { no_preference } => {
+            if no_preference {
+                codexmux::cpa::stop_service_only()?;
+            } else {
+                codexmux::cpa::stop(paths)?;
+            }
             println!("CPA service stopped");
         }
         CpaCommand::Status => {
-            match modelmux::cpa::installed_version(paths) {
+            match codexmux::cpa::installed_version(paths) {
                 Some(version) => {
                     println!("version: {} (sha256 {})", version.version, version.sha256);
                 }
@@ -394,7 +529,7 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             }
             println!(
                 "binary: {}",
-                if modelmux::cpa::binary_path(paths).is_file() {
+                if codexmux::cpa::binary_path(paths).is_file() {
                     "installed"
                 } else {
                     "missing"
@@ -402,28 +537,59 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             );
             println!(
                 "service: {}",
-                if modelmux::cpa::is_loaded()? {
+                if codexmux::cpa::is_loaded()? {
                     "running"
                 } else {
                     "stopped"
                 }
             );
-            println!("config: {}", modelmux::cpa::config_path(paths).display());
+            println!(
+                "autostart: {}",
+                match codexmux::cpa::cpa_autostart(&paths.cpa_profiles) {
+                    Some(true) => "enabled",
+                    Some(false) => "disabled",
+                    None => "not set",
+                }
+            );
+            println!("config: {}", codexmux::cpa::config_path(paths).display());
+        }
+        CpaCommand::ModelList => {
+            let credentials = secrets::load(&paths.credentials)?;
+            for slug in codexmux::cpa::model_slugs(&settings.cpa, &credentials.cpa_token)? {
+                println!("{slug}");
+            }
+        }
+        CpaCommand::ManagementUrl { connect } => {
+            if connect && settings.cpa.is_loopback() {
+                let management_key = secrets::load(&paths.credentials)?.cpa_management_key;
+                codexmux::cpa::sync_management_key(paths, &management_key)?;
+                codexmux::cpa::ensure_management_connect_bootstrap(paths)?;
+                println!("{}", settings.cpa.management_connect_url(&management_key)?);
+            } else {
+                println!("{}", settings.cpa.management_url()?);
+            }
+        }
+        CpaCommand::ManagementKey => {
+            let management_key = secrets::load(&paths.credentials)?.cpa_management_key;
+            if settings.cpa.is_loopback() {
+                codexmux::cpa::sync_management_key(paths, &management_key)?;
+            }
+            println!("management-key: {management_key}");
         }
         CpaCommand::ProviderImport { file } => {
             let credentials = secrets::load(&paths.credentials)?;
             let providers = std::fs::read_to_string(&file)
                 .with_context(|| format!("failed to read {}", file.display()))?;
-            modelmux::cpa::import_providers(paths, &providers)?;
-            modelmux::cpa::restart(paths, &settings.cpa, &credentials.cpa_token)?;
+            codexmux::cpa::import_providers(paths, &providers)?;
+            codexmux::cpa::restart(paths, &settings.cpa, &credentials.cpa_token)?;
             println!("imported providers from {}", file.display());
             println!(
                 "CPA service restarted with the new providers; config: {}",
-                modelmux::cpa::config_path(paths).display()
+                codexmux::cpa::config_path(paths).display()
             );
         }
         CpaCommand::Uninstall => {
-            match modelmux::cpa::uninstall()? {
+            match codexmux::cpa::uninstall()? {
                 Some(plist) => println!("removed {}", plist.display()),
                 None => println!("CPA service is not installed"),
             }
@@ -433,13 +599,13 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             );
         }
         CpaCommand::ProfileList => {
-            let (active, profiles) = modelmux::cpa::profiles(paths);
+            let (active, profiles) = codexmux::cpa::profiles(paths);
             match active {
                 Some(active) => println!("active: {active}"),
                 None => println!("active: (none; using config.toml settings)"),
             }
             if profiles.is_empty() {
-                println!("no saved profiles; add one with `modelmux cpa profile-save`");
+                println!("no saved profiles; add one with `codexmux cpa profile-save`");
             }
             for profile in profiles {
                 println!("  {} — {}", profile.name, profile.base_url);
@@ -448,11 +614,13 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
         CpaCommand::ProfileSave {
             name,
             base_url,
-            token,
+            token_env,
         } => {
-            modelmux::cpa::save_profile(
+            let token = std::env::var(&token_env)
+                .with_context(|| format!("{token_env} must contain the CPA profile token"))?;
+            codexmux::cpa::save_profile(
                 paths,
-                modelmux::cpa::CpaProfile {
+                codexmux::cpa::CpaProfile {
                     name,
                     base_url,
                     token,
@@ -461,22 +629,25 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             println!("profile saved to {}", paths.cpa_profiles.display());
         }
         CpaCommand::ProfileRemove { name } => {
-            modelmux::cpa::remove_profile(paths, &name)?;
+            codexmux::cpa::remove_profile(paths, &name)?;
             println!("profile {name} removed");
         }
         CpaCommand::ProfileSwitch { name } => {
-            modelmux::cpa::switch_profile(paths, &name)?;
+            codexmux::cpa::switch_profile(paths, &name)?;
             println!("switched to profile {name}");
         }
-        CpaCommand::ReviewGet => match modelmux::cpa::review_override(&paths.cpa_profiles) {
+        CpaCommand::ReviewGet => match codexmux::cpa::review_override(&paths.cpa_profiles) {
             Some(slug) => println!("review override: {slug}"),
-            None => println!("review override: (none; official first, CPA fallback)"),
+            None => println!("review override: (none; official route)"),
         },
         CpaCommand::DirectSet {
             models,
             base_url,
-            token,
+            token_env,
+            upstream_model,
         } => {
+            let token = std::env::var(&token_env)
+                .with_context(|| format!("{token_env} must contain the direct route token"))?;
             let slugs: Vec<String> = models
                 .split(',')
                 .map(str::trim)
@@ -484,30 +655,120 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
                 .map(str::to_owned)
                 .collect();
             anyhow::ensure!(!slugs.is_empty(), "no model slugs given");
-            for slug in &slugs {
-                modelmux::cpa::direct_route_for(&paths.cpa_profiles, slug);
-            }
-            modelmux::cpa::set_direct_routes(
+            let configured_models = slugs.join(", ");
+            let (models, model_aliases) = match upstream_model {
+                Some(upstream) => {
+                    anyhow::ensure!(
+                        slugs.len() == 1,
+                        "--upstream-model requires exactly one local model"
+                    );
+                    (
+                        Vec::new(),
+                        std::collections::BTreeMap::from([(slugs[0].clone(), upstream)]),
+                    )
+                }
+                None => (slugs, std::collections::BTreeMap::new()),
+            };
+            codexmux::cpa::set_direct_routes(
                 paths,
-                vec![modelmux::cpa::DirectRoute {
+                vec![codexmux::cpa::DirectRoute {
                     base_url,
                     token,
-                    models: slugs,
+                    models,
+                    model_aliases,
                 }],
             )?;
-            println!("direct route configured; see modelmux cpa direct-list");
+            println!("direct route configured for {configured_models}");
+        }
+        CpaCommand::DirectAdd {
+            models,
+            base_url,
+            token_env,
+            upstream_model,
+        } => {
+            let token = std::env::var(&token_env)
+                .with_context(|| format!("{token_env} must contain the direct route token"))?;
+            let slugs: Vec<String> = models
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            anyhow::ensure!(!slugs.is_empty(), "no model slugs given");
+            if let Some(upstream) = upstream_model {
+                anyhow::ensure!(
+                    slugs.len() == 1,
+                    "--upstream-model requires exactly one local model"
+                );
+                codexmux::cpa::add_direct_route_mapping(
+                    paths,
+                    base_url,
+                    token,
+                    slugs[0].clone(),
+                    upstream,
+                )?;
+            } else {
+                codexmux::cpa::add_direct_route(paths, base_url, token, slugs.clone())?;
+            }
+            println!("direct route updated for {}", slugs.join(", "));
+        }
+        CpaCommand::DirectRemove { base_url, models } => {
+            let slugs: Vec<String> = models
+                .map(|models| {
+                    models
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            codexmux::cpa::remove_direct_routes(paths, &base_url, &slugs)?;
+            if slugs.is_empty() {
+                println!("direct route removed for {base_url}");
+            } else {
+                println!("removed {} from {base_url}", slugs.join(", "));
+            }
+        }
+        CpaCommand::DirectList => {
+            for route in codexmux::cpa::direct_routes(paths) {
+                let models: Vec<&str> = route
+                    .models
+                    .iter()
+                    .map(String::as_str)
+                    .chain(route.model_aliases.keys().map(String::as_str))
+                    .collect();
+                println!("{} -> {}", models.join(", "), route.base_url);
+            }
         }
         CpaCommand::DirectClear => {
-            modelmux::cpa::set_direct_routes(paths, Vec::new())?;
+            codexmux::cpa::set_direct_routes(paths, Vec::new())?;
             println!("direct routes cleared");
+        }
+        CpaCommand::AutostartGet => match codexmux::cpa::cpa_autostart(&paths.cpa_profiles) {
+            Some(true) => println!("cpa autostart: enabled"),
+            Some(false) => println!("cpa autostart: disabled"),
+            None => println!("cpa autostart: (not set; CPA stays as-is)"),
+        },
+        CpaCommand::AutostartSet { enabled } => {
+            let enabled = match enabled.trim() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                other => bail!("enabled must be true or false, got {other:?}"),
+            };
+            codexmux::cpa::set_cpa_autostart(&paths.cpa_profiles, enabled)?;
+            println!(
+                "cpa autostart: {}",
+                if enabled { "enabled" } else { "disabled" }
+            );
         }
         CpaCommand::ReviewSet { slug } => {
             let slug = slug.trim().to_owned();
             if slug.is_empty() {
-                modelmux::cpa::set_review_override(&paths.cpa_profiles, None)?;
+                codexmux::cpa::set_review_override(&paths.cpa_profiles, None)?;
                 println!("review override cleared");
             } else {
-                modelmux::cpa::set_review_override(&paths.cpa_profiles, Some(slug.clone()))?;
+                codexmux::cpa::set_review_override(&paths.cpa_profiles, Some(slug.clone()))?;
                 println!("codex-auto-review now routes directly to {slug}");
             }
         }
@@ -516,5 +777,5 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
 }
 
 fn codex_config_path() -> Result<PathBuf> {
-    modelmux::codex_config::codex_config_path()
+    codexmux::codex_config::codex_config_path()
 }

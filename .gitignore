@@ -1,3 +1,4 @@
 /target/
 /menubar/.build/
+/.vscode/
 .DS_Store

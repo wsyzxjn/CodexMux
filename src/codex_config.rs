@@ -14,9 +14,9 @@ use crate::fsutil::{
     sha256_bytes,
 };
 
-const START_MARKER: &str = "# >>> ModelMux managed";
-const END_MARKER: &str = "# <<< ModelMux managed";
-pub const PROXY_TOKEN_ENV: &str = "MODELMUX_PROXY_TOKEN";
+const START_MARKER: &str = "# >>> CodexMux managed";
+const END_MARKER: &str = "# <<< CodexMux managed";
+pub const PROXY_TOKEN_ENV: &str = "CODEXMUX_PROXY_TOKEN";
 
 #[derive(Clone, Debug)]
 pub struct ConfigManager {
@@ -147,7 +147,10 @@ impl ConfigManager {
         ));
         atomic_write(&backup_path, &original)?;
         let mut state = ConfigState {
-            config_path: self.config_path.clone(),
+            config_path: self
+                .config_path
+                .canonicalize()
+                .unwrap_or_else(|_| self.config_path.clone()),
             backup_path,
             original_exists,
             original_sha256: sha256_bytes(&original),
@@ -171,7 +174,7 @@ impl ConfigManager {
         }
         anyhow::ensure!(
             current == original,
-            "Codex config changed while ModelMux activation was incomplete"
+            "Codex config changed while CodexMux activation was incomplete"
         );
         replace_if_unchanged(&self.config_path, &current, &output, state.original_exists)?;
         state.phase = Phase::Active;
@@ -182,7 +185,7 @@ impl ConfigManager {
         let current = fs::read(&self.config_path)?;
         anyhow::ensure!(
             contains_block(&current, &state.managed_block),
-            "Codex config changed inside the managed ModelMux block"
+            "Codex config changed inside the managed CodexMux block"
         );
         Ok(())
     }
@@ -236,7 +239,7 @@ impl ConfigManager {
         let restored = restored_config(&state, &current)?;
         anyhow::ensure!(
             sha256_bytes(&restored) == *restored_sha256,
-            "Codex config changed while ModelMux restoration was incomplete"
+            "Codex config changed while CodexMux restoration was incomplete"
         );
         replace_if_unchanged(&self.config_path, &current, &restored, true)?;
         self.remove_restored_config_if_absent(&state, &restored)?;
@@ -314,17 +317,29 @@ pub fn codex_config_path() -> Result<PathBuf> {
             .context("cannot locate home directory")?
             .join(".codex/config.toml")
     };
-    if path.is_absolute() {
-        Ok(path)
+    let path = if path.is_absolute() {
+        path
     } else {
-        Ok(std::env::current_dir()?.join(path))
+        std::env::current_dir()?.join(path)
+    };
+    Ok(path.canonicalize().unwrap_or(path))
+}
+
+fn same_config_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
 }
 
 fn ensure_same_path(recorded: &Path, current: &Path) -> Result<()> {
-    if recorded != current {
-        bail!("managed state points to a different Codex config file");
-    }
+    anyhow::ensure!(
+        same_config_file(recorded, current),
+        "managed state points to a different Codex config file"
+    );
     Ok(())
 }
 
@@ -332,8 +347,8 @@ fn managed_section(loopback_base_url: &str, trailing_blank_line: bool) -> String
     let base_url = toml_edit::Value::from(loopback_base_url).to_string();
     let block = format!(
         "{START_MARKER}\n\
-         model_provider = \"modelmux\"\n\
-         model_providers.modelmux = {{ name = \"ModelMux\", base_url = {base_url}, wire_api = \"responses\", requires_openai_auth = true, supports_websockets = false, env_http_headers = {{ x-modelmux-token = \"{PROXY_TOKEN_ENV}\" }} }}\n\
+         model_provider = \"codexmux\"\n\
+         model_providers.codexmux = {{ name = \"CodexMux\", base_url = {base_url}, wire_api = \"responses\", requires_openai_auth = true, supports_websockets = false, env_http_headers = {{ x-codexmux-token = \"{PROXY_TOKEN_ENV}\" }} }}\n\
          {END_MARKER}\n"
     );
     if trailing_blank_line {
@@ -356,13 +371,13 @@ fn restored_config(state: &ConfigState, current: &[u8]) -> Result<Vec<u8>> {
     let current = std::str::from_utf8(current).context("Codex config is not UTF-8")?;
     anyhow::ensure!(
         current.matches(&state.managed_block).count() == 1,
-        "Codex config changed inside the managed ModelMux block"
+        "Codex config changed inside the managed CodexMux block"
     );
     let restored = current.replacen(&state.managed_block, "", 1);
     if !restored.trim().is_empty() {
         restored
             .parse::<DocumentMut>()
-            .context("removing ModelMux would leave invalid TOML")?;
+            .context("removing CodexMux would leave invalid TOML")?;
     }
     Ok(restored.into_bytes())
 }
@@ -398,8 +413,11 @@ fn replace_if_unchanged(
 }
 
 fn validate_existing(text: &str) -> Result<()> {
-    if text.contains(START_MARKER) || text.contains(END_MARKER) {
-        bail!("Codex config already contains a ModelMux managed marker");
+    if [START_MARKER, END_MARKER]
+        .iter()
+        .any(|marker| text.contains(marker))
+    {
+        bail!("Codex config already contains a CodexMux managed marker");
     }
     if text.trim().is_empty() {
         return Ok(());
@@ -416,8 +434,8 @@ fn validate_existing(text: &str) -> Result<()> {
         let providers = providers
             .as_table_like()
             .context("existing model_providers must be a TOML table")?;
-        if providers.contains_key("modelmux") {
-            bail!("Codex config already defines model_providers.modelmux");
+        if providers.contains_key("codexmux") {
+            bail!("Codex config already defines model_providers.codexmux");
         }
     }
     Ok(())
@@ -452,6 +470,30 @@ mod tests {
         assert_eq!(fs::read(&config).unwrap(), b"model = \"gpt\"\n");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn directory_symlink_is_the_same_codex_config() {
+        let root = tempdir().unwrap();
+        let real_dir = root.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let config = real_dir.join("config.toml");
+        fs::write(&config, b"model = \"gpt\"\n").unwrap();
+        let link_dir = root.path().join("link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        let state = root.path().join("state.json");
+        let backups = root.path().join("backups");
+        let via_link =
+            ConfigManager::new(link_dir.join("config.toml"), state.clone(), backups.clone());
+        via_link.enable(LOOPBACK_BASE_URL).unwrap();
+
+        let via_real = ConfigManager::new(config.clone(), state, backups);
+        let status = via_real.status().unwrap();
+        assert!(status.enabled);
+        via_real.disable().unwrap();
+        assert_eq!(fs::read(&config).unwrap(), b"model = \"gpt\"\n");
+    }
+
     #[test]
     fn existing_model_providers_are_preserved() {
         let root = tempdir().unwrap();
@@ -465,7 +507,7 @@ mod tests {
         let enabled = fs::read_to_string(&config).unwrap();
         let document = enabled.parse::<DocumentMut>().unwrap();
         let providers = document["model_providers"].as_table_like().unwrap();
-        assert!(providers.contains_key("modelmux"));
+        assert!(providers.contains_key("codexmux"));
         assert!(providers.contains_key("deepseek"));
 
         lease.restore().unwrap();
@@ -473,15 +515,15 @@ mod tests {
     }
 
     #[test]
-    fn existing_modelmux_provider_is_rejected() {
+    fn existing_codexmux_provider_is_rejected() {
         let root = tempdir().unwrap();
         let config = root.path().join("config.toml");
-        fs::write(&config, b"[model_providers.modelmux]\nname = \"custom\"\n").unwrap();
+        fs::write(&config, b"[model_providers.codexmux]\nname = \"custom\"\n").unwrap();
 
         let error = manager(root.path(), config)
             .enable(LOOPBACK_BASE_URL)
             .unwrap_err();
-        assert!(error.to_string().contains("model_providers.modelmux"));
+        assert!(error.to_string().contains("model_providers.codexmux"));
     }
 
     #[test]

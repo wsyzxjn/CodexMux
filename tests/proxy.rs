@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, Response, StatusCode, header},
     routing::post,
 };
-use modelmux::{
+use codexmux::{
     config::{Cpa, Credentials, Settings},
     server::{self, AppState},
 };
@@ -28,18 +28,19 @@ async fn spawn(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()
     (address, handle)
 }
 
-async fn spawn_modelmux(
+async fn spawn_codexmux(
     cpa_base_url: String,
     official_models: &[&str],
     cpa_models: &[&str],
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let root = tempfile::tempdir().unwrap().keep();
     let path = root.join("model-catalog.json");
-    let store = modelmux::catalog::CatalogStore::load(path.clone()).unwrap();
+    let store = codexmux::catalog::CatalogStore::load(path.clone()).unwrap();
     store
         .replace(
             &json!({"models": official_models.iter().map(|slug| json!({"slug":slug})).collect::<Vec<_>>()}),
             &json!({"models": cpa_models.iter().map(|slug| json!({"slug":slug})).collect::<Vec<_>>()}),
+            &[],
         )
         .unwrap();
     drop(store);
@@ -54,6 +55,7 @@ async fn spawn_modelmux(
         Credentials {
             proxy_token: "proxy-token".into(),
             cpa_token: "cpa-token".into(),
+            cpa_management_key: "management-key".into(),
         },
         root.join("model-catalog.json"),
         root.join("cpa-profiles.toml"),
@@ -88,11 +90,11 @@ async fn cpa_json_rewrites_only_the_model_and_preserves_response_bytes() {
     )
     .await;
     let (proxy_address, proxy_handle) =
-        spawn_modelmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
+        spawn_codexmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
     let request = include_bytes!("fixtures/native_responses/passthrough_request.json");
     let response = reqwest::Client::new()
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .header(header::CONTENT_TYPE, "application/json")
         .body(request.as_slice())
         .send()
@@ -138,7 +140,7 @@ async fn responses_accept_bodies_larger_than_axums_two_megabyte_default() {
         .with_state(capture.clone());
     let (cpa_address, cpa_handle) = spawn(upstream).await;
     let (proxy_address, proxy_handle) =
-        spawn_modelmux(format!("http://{cpa_address}/v1"), &[], &["large-model"]).await;
+        spawn_codexmux(format!("http://{cpa_address}/v1"), &[], &["large-model"]).await;
     let request = serde_json::to_vec(&json!({
         "model": "cpa/large-model",
         "input": "x".repeat(2 * 1024 * 1024 + 1024),
@@ -149,7 +151,7 @@ async fn responses_accept_bodies_larger_than_axums_two_megabyte_default() {
 
     let response = reqwest::Client::new()
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .header(header::CONTENT_TYPE, "application/json")
         .body(request.clone())
         .send()
@@ -191,14 +193,14 @@ async fn cpa_route_is_responses_passthrough_with_isolated_credentials() {
     )
     .await;
     let (proxy_address, proxy_handle) =
-        spawn_modelmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
+        spawn_codexmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
     let request = json!({
         "model": "cpa/external-model", "input": "hi", "stream": false,
         "metadata": {"kept": true}
     });
     let response = reqwest::Client::new()
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .header(header::AUTHORIZATION, "Bearer official-oauth")
         .header("chatgpt-account-id", "official-account")
         .header("x-api-key", "incoming-provider-secret")
@@ -250,11 +252,11 @@ async fn same_cpa_model_replays_public_history_on_every_followup() {
     )
     .await;
     let (proxy_address, proxy_handle) =
-        spawn_modelmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
+        spawn_codexmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
     let client = reqwest::Client::new();
     let first = client
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({"model":"cpa/external-model","input":"first","stream":false}))
         .send()
         .await
@@ -262,7 +264,7 @@ async fn same_cpa_model_replays_public_history_on_every_followup() {
     assert_eq!(first.status(), StatusCode::OK);
     let second = client
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({
             "model":"cpa/external-model", "previous_response_id":"resp_cpa_1",
             "input":"second", "stream":false
@@ -312,7 +314,7 @@ async fn switching_between_cpa_models_replays_history_and_changes_model() {
             .with_state(capture.clone()),
     )
     .await;
-    let (proxy_address, proxy_handle) = spawn_modelmux(
+    let (proxy_address, proxy_handle) = spawn_codexmux(
         format!("http://{cpa_address}/v1"),
         &[],
         &["model-a", "model-b"],
@@ -321,14 +323,14 @@ async fn switching_between_cpa_models_replays_history_and_changes_model() {
     let client = reqwest::Client::new();
     client
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({"model":"cpa/model-a","input":"first"}))
         .send()
         .await
         .unwrap();
     let response = client
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({
             "model":"cpa/model-b", "previous_response_id":"resp_switch_1", "input":"second"
         }))
@@ -378,11 +380,11 @@ async fn cpa_sse_is_byte_for_byte_passthrough_and_records_completed_history() {
     )
     .await;
     let (proxy_address, proxy_handle) =
-        spawn_modelmux(format!("http://{cpa_address}/v1"), &[], &["stream-model"]).await;
+        spawn_codexmux(format!("http://{cpa_address}/v1"), &[], &["stream-model"]).await;
     let client = reqwest::Client::new();
     let response = client
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({"model":"cpa/stream-model","input":"first","stream":true}))
         .send()
         .await
@@ -395,7 +397,7 @@ async fn cpa_sse_is_byte_for_byte_passthrough_and_records_completed_history() {
 
     let followup = client
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({
             "model":"cpa/stream-model", "previous_response_id":"resp_stream",
             "input":"second", "stream":true
@@ -408,92 +410,6 @@ async fn cpa_sse_is_byte_for_byte_passthrough_and_records_completed_history() {
     assert!(captured[1].1.get("previous_response_id").is_none());
     assert_eq!(captured[1].1["input"].as_array().unwrap().len(), 3);
     drop(captured);
-    proxy_handle.abort();
-    cpa_handle.abort();
-}
-
-#[tokio::test]
-async fn telemetry_reports_live_estimate_then_calibrates_from_completed_usage() {
-    async fn upstream() -> Response<Body> {
-        let fixture = include_bytes!("fixtures/native_responses/telemetry_with_usage.sse");
-        let utf8_split = fixture
-            .windows("杭".len())
-            .position(|window| window == "杭".as_bytes())
-            .unwrap()
-            + 1;
-        let completed_start = fixture
-            .windows("event: response.completed".len())
-            .position(|window| window == b"event: response.completed")
-            .unwrap();
-        let first = Bytes::copy_from_slice(&fixture[..utf8_split]);
-        let second = Bytes::copy_from_slice(&fixture[utf8_split..completed_start]);
-        let completed = Bytes::copy_from_slice(&fixture[completed_start..]);
-        let stream = async_stream::stream! {
-            yield Ok::<Bytes, Infallible>(first);
-            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
-            yield Ok::<Bytes, Infallible>(second);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            yield Ok::<Bytes, Infallible>(completed);
-        };
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .body(Body::from_stream(stream))
-            .unwrap()
-    }
-
-    let (cpa_address, cpa_handle) =
-        spawn(Router::new().route("/v1/responses", post(upstream))).await;
-    let (proxy_address, proxy_handle) =
-        spawn_modelmux(format!("http://{cpa_address}/v1"), &[], &["stream-model"]).await;
-    let client = reqwest::Client::new();
-    let mut response = client
-        .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
-        .json(&json!({"model":"cpa/stream-model","input":"first","stream":true}))
-        .send()
-        .await
-        .unwrap();
-    let first = response.chunk().await.unwrap().unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    let live: Value = client
-        .get(format!("http://{proxy_address}/telemetry"))
-        .header("x-modelmux-token", "proxy-token")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(live["active_requests"], 1);
-    assert_eq!(live["current"]["model"], "cpa/stream-model");
-    assert_eq!(live["current"]["route"], "cpa");
-    assert_eq!(live["current"]["exact"], false);
-    assert!(live["current"]["output_tokens"].as_u64().unwrap() > 0);
-    assert!(live["current"]["tokens_per_second"].as_f64().unwrap() > 0.0);
-
-    let rest = response.bytes().await.unwrap();
-    let mut received = first.to_vec();
-    received.extend_from_slice(&rest);
-    assert_eq!(
-        received,
-        include_bytes!("fixtures/native_responses/telemetry_with_usage.sse")
-    );
-
-    let completed: Value = client
-        .get(format!("http://{proxy_address}/telemetry"))
-        .header("x-modelmux-token", "proxy-token")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(completed["active_requests"], 0);
-    assert_eq!(completed["last_completed"]["output_tokens"], 24);
-    assert_eq!(completed["last_completed"]["exact"], true);
-
     proxy_handle.abort();
     cpa_handle.abort();
 }
@@ -540,11 +456,11 @@ async fn completed_sse_is_recorded_before_upstream_eof() {
     )
     .await;
     let (proxy_address, proxy_handle) =
-        spawn_modelmux(format!("http://{cpa_address}/v1"), &[], &["stream-model"]).await;
+        spawn_codexmux(format!("http://{cpa_address}/v1"), &[], &["stream-model"]).await;
     let client = reqwest::Client::new();
     let mut first = client
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({"model":"cpa/stream-model","input":"first","stream":true}))
         .send()
         .await
@@ -553,7 +469,7 @@ async fn completed_sse_is_recorded_before_upstream_eof() {
 
     let followup = client
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({
             "model":"cpa/stream-model", "previous_response_id":"resp_open",
             "input":"second", "stream":true
@@ -577,10 +493,10 @@ async fn responses_compact_is_forwarded_to_cpa() {
     let (cpa_address, cpa_handle) =
         spawn(Router::new().route("/v1/responses/compact", post(compact))).await;
     let (proxy_address, proxy_handle) =
-        spawn_modelmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
+        spawn_codexmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
     let response = reqwest::Client::new()
         .post(format!("http://{proxy_address}/v1/responses/compact"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({"model":"cpa/external-model","input":"compact this"}))
         .send()
         .await
@@ -606,10 +522,10 @@ async fn cpa_error_status_content_type_and_body_are_passthrough() {
     let (cpa_address, cpa_handle) =
         spawn(Router::new().route("/v1/responses", post(upstream))).await;
     let (proxy_address, proxy_handle) =
-        spawn_modelmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
+        spawn_codexmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
     let response = reqwest::Client::new()
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({"model":"cpa/external-model","input":"hello"}))
         .send()
         .await
@@ -629,7 +545,7 @@ async fn cpa_error_status_content_type_and_body_are_passthrough() {
 
 #[tokio::test]
 async fn unknown_models_and_history_fail_closed() {
-    let (proxy_address, proxy_handle) = spawn_modelmux(
+    let (proxy_address, proxy_handle) = spawn_codexmux(
         "http://127.0.0.1:9/v1".into(),
         &["gpt-official"],
         &["external-model"],
@@ -638,7 +554,7 @@ async fn unknown_models_and_history_fail_closed() {
     let client = reqwest::Client::new();
     let unknown_model = client
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({"model":"gpt-typo","input":"hello"}))
         .send()
         .await
@@ -646,7 +562,7 @@ async fn unknown_models_and_history_fail_closed() {
     assert_eq!(unknown_model.status(), StatusCode::BAD_REQUEST);
     let unknown_history = client
         .post(format!("http://{proxy_address}/v1/responses"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .json(&json!({
             "model":"cpa/external-model", "previous_response_id":"resp_unknown", "input":"hello"
         }))
@@ -660,7 +576,7 @@ async fn unknown_models_and_history_fail_closed() {
 #[tokio::test]
 async fn ambiguous_routing_fields_fail_before_forwarding() {
     let (proxy_address, proxy_handle) =
-        spawn_modelmux("http://127.0.0.1:9/v1".into(), &[], &["external-model"]).await;
+        spawn_codexmux("http://127.0.0.1:9/v1".into(), &[], &["external-model"]).await;
     let client = reqwest::Client::new();
     for body in [
         r#"{"model":"cpa/external-model","model":"other","input":"hello"}"#,
@@ -669,7 +585,7 @@ async fn ambiguous_routing_fields_fail_before_forwarding() {
     ] {
         let response = client
             .post(format!("http://{proxy_address}/v1/responses"))
-            .header("x-modelmux-token", "proxy-token")
+            .header("x-codexmux-token", "proxy-token")
             .header(header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()
@@ -683,7 +599,7 @@ async fn ambiguous_routing_fields_fail_before_forwarding() {
 #[tokio::test]
 async fn every_route_requires_the_proxy_token() {
     let (proxy_address, proxy_handle) =
-        spawn_modelmux("http://127.0.0.1:9/v1".into(), &["gpt"], &[]).await;
+        spawn_codexmux("http://127.0.0.1:9/v1".into(), &["gpt"], &[]).await;
     let client = reqwest::Client::new();
     let missing = client
         .get(format!("http://{proxy_address}/health"))
@@ -691,12 +607,6 @@ async fn every_route_requires_the_proxy_token() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::FORBIDDEN);
-    let missing_telemetry = client
-        .get(format!("http://{proxy_address}/telemetry"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(missing_telemetry.status(), StatusCode::FORBIDDEN);
     let missing_unknown = client
         .get(format!("http://{proxy_address}/unknown"))
         .send()
@@ -705,14 +615,14 @@ async fn every_route_requires_the_proxy_token() {
     assert_eq!(missing_unknown.status(), StatusCode::FORBIDDEN);
     let accepted_unknown = client
         .get(format!("http://{proxy_address}/unknown"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .send()
         .await
         .unwrap();
     assert_eq!(accepted_unknown.status(), StatusCode::NOT_FOUND);
     let accepted = client
         .get(format!("http://{proxy_address}/health"))
-        .header("x-modelmux-token", "proxy-token")
+        .header("x-codexmux-token", "proxy-token")
         .send()
         .await
         .unwrap();

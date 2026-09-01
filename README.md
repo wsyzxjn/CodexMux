@@ -1,17 +1,21 @@
-# ModelMux
+# CodexMux
 
-ModelMux 是一个面向 macOS 的本地模型路由器，让 Codex Desktop 和 Codex CLI
+CodexMux 是一个面向 macOS 的本地模型路由器，让 Codex Desktop 和 Codex CLI
 可以在同一个模型选择器中使用：
 
 - 当前 ChatGPT 账号可用的官方 Codex 模型；
 - [CLIProxyAPI（CPA）](https://github.com/router-for-me/CLIProxyAPI) 提供的外部模型。
 
 官方模型名称保持不变，CPA 模型统一加上 `cpa/` 前缀。例如，官方的
-`gpt-5.6` 和 CPA 的 `cpa/gpt-5.6` 可以同时存在。ModelMux 按完整模型名称精确
+`gpt-5.6` 和 CPA 的 `cpa/gpt-5.6` 可以同时存在。CodexMux 按完整模型名称精确
 路由，不认识的名称会直接拒绝。
 
-ModelMux 只处理模型目录合并、请求分流、凭据隔离和切换模型时的对话衔接。
-外部服务的协议转换、模型别名和供应商凭据均由 CPA 管理。
+CodexMux 只处理模型目录合并、请求分流、凭据隔离和切换模型时的对话衔接。
+外部服务的协议转换、模型别名和供应商凭据通常由 CPA 管理；用户也可以把模型
+显式直连到原生 Responses 上游。直连路由声明自己的模型列表，无论 CPA 是否
+安装或运行都可用；它是按模型配置的明确覆盖，不是自动故障转移。CPA 不可达
+时，CodexMux 会用官方目录加上直连模型提供降级目录（仅内存，不落盘），因此
+不装 CPA 也能通过直连端点使用第三方模型。
 
 ## 使用前准备
 
@@ -19,12 +23,12 @@ ModelMux 只处理模型目录合并、请求分流、凭据隔离和切换模�
 
 - macOS；
 - 已登录 ChatGPT 的 Codex Desktop 或 Codex CLI；
-- 已安装 Rust 工具链；
-- 已安装并配置 CPA。
+- 已安装 Rust 工具链。
 
-CPA 可以运行在本机或远端。本文默认使用本机地址
-`http://127.0.0.1:8317`；远端 CPA 必须使用 HTTPS。ModelMux 自身提供给
-Codex 的监听地址始终只能是本机回环地址。
+本地 CPA 由 CodexMux 托管，不必事先单独安装 CLIProxyAPI。也可以接入已经
+在运行的本机或远端 CPA。本文默认使用本机地址 `http://127.0.0.1:8317`；
+远端 CPA 必须使用 HTTPS。CodexMux 提供给 Codex 的监听地址始终只能是本机
+回环地址。
 
 ## 快速开始
 
@@ -33,7 +37,7 @@ Codex 的监听地址始终只能是本机回环地址。
 ```bash
 cargo build --release
 mkdir -p "$HOME/.local/bin"
-install -m 755 target/release/modelmux "$HOME/.local/bin/modelmux"
+install -m 755 target/release/codexmux "$HOME/.local/bin/codexmux"
 ```
 
 确保 `~/.local/bin` 在 `PATH` 中。当前终端可以执行：
@@ -44,47 +48,60 @@ export PATH="$HOME/.local/bin:$PATH"
 
 如需永久生效，将这一行加入 `~/.zshrc`，再打开一个新终端。
 
-后续示例都假设可以直接运行 `modelmux`。
+后续示例都假设可以直接运行 `codexmux`。
 
-### 2. 初始化 ModelMux
+### 2. 初始化 CodexMux
 
 ```bash
-modelmux init
+codexmux init
 ```
 
 默认数据目录为：
 
 ```text
-~/Library/Application Support/ModelMux/
+~/Library/Application Support/CodexMux/
 ```
 
 其中主要文件是：
 
 | 文件 | 用途 |
 | --- | --- |
-| `config.toml` | ModelMux 和 CPA 的本地监听地址 |
-| `credentials.json` | ModelMux 与 CPA 的本地访问令牌，权限必须为 `0600` |
+| `config.toml` | CodexMux 和 CPA 的本地监听地址 |
+| `credentials.json` | CodexMux 与 CPA 的本地访问令牌，权限必须为 `0600` |
+| `cpa-profiles.toml` | CPA 端点配置、直连路由和审批模型覆盖，权限 `0600` |
 | `model-catalog.json` | 最近一次成功获取的完整模型目录 |
+| `model-catalog.retention.json` | CPA 模型首次缺失时间，用于目录移除宽限期 |
+| `cpa/` | 托管的 CLIProxyAPI 二进制和 `config.yaml` |
 | `logs/` | 后台服务的标准输出和错误日志 |
 
-如需使用其他数据目录，应在运行所有 `modelmux` 命令前设置
-`MODELMUX_HOME`。
+如需使用其他数据目录，应在运行所有 `codexmux` 命令前设置
+`CODEXMUX_HOME`。
 
-### 3. 让 ModelMux 和 CPA 使用同一个 CPA 令牌
+### 3. 让 CodexMux 和 CPA 使用同一个 CPA 令牌
 
-`modelmux init` 会在 `credentials.json` 中生成两个不同的随机令牌：
+`codexmux init` 会在 `credentials.json` 中生成三个互不相同的随机凭据：
 
 ```json
 {
   "proxy_token": "generated-proxy-token",
-  "cpa_token": "generated-cpa-token"
+  "cpa_token": "generated-cpa-token",
+  "cpa_management_key": "generated-management-key"
 }
 ```
 
-- `proxy_token`：Codex 访问 ModelMux 时使用；
-- `cpa_token`：ModelMux 访问 CPA 时使用。
+- `proxy_token`：Codex 访问 CodexMux 时使用；
+- `cpa_token`：CodexMux 访问 CPA 时使用；
+- `cpa_management_key`：登录 CPA Web 管理页时使用。
 
-把 `cpa_token` 的值加入 CPA 顶层的 `api-keys`：
+缺少 `cpa_management_key` 的凭据文件会在首次读取时原子补上，权限保持
+`0600`。管理密钥不会写入模型目录、日志或 Codex 配置。菜单栏“打开 CPA Web
+管理”在本机 CPA 上会带上当前端点和管理密钥并自动登录，随后从地址栏清除查询
+参数。也可以用“复制 CPA 管理密钥”手动复制。远端 CPA 的管理密钥由远端管理员
+决定；使用远端地址时应把 `cpa_management_key` 改成远端已有的密钥，CodexMux
+不会改写远端配置。
+
+使用 `codexmux cpa install` 托管本地 CPA 时，会自动把 `cpa_token` 写入 CPA
+的 `api-keys`。若 CPA 由你自己运行，把 `cpa_token` 的值加入其顶层 `api-keys`：
 
 ```yaml
 host: 127.0.0.1
@@ -93,19 +110,19 @@ api-keys:
   - generated-cpa-token
 ```
 
-也可以反过来，把 CPA 现有的一个 `api-keys` 值写入 ModelMux 的
+也可以反过来，把 CPA 现有的一个 `api-keys` 值写入 CodexMux 的
 `cpa_token`。两边必须完全一致。`proxy_token` 与 `cpa_token` 必须不同。
 
 手动修改凭据文件后，重新确认权限：
 
 ```bash
-chmod 600 "$HOME/Library/Application Support/ModelMux/credentials.json"
+chmod 600 "$HOME/Library/Application Support/CodexMux/credentials.json"
 ```
 
-供应商 API Key、OAuth 凭据和模型别名只配置在 CPA 中，不要写入
-ModelMux。
+供应商 API Key、OAuth 凭据和模型别名只配置在 CPA 中。显式直连的上游令牌
+写在 `cpa-profiles.toml`，不要写进 `config.toml` 或模型目录。
 
-ModelMux 默认连接本机 CPA：
+CodexMux 默认连接本机 CPA：
 
 ```toml
 listen = "127.0.0.1:48682"
@@ -128,15 +145,15 @@ base_url = "https://cpa.example.com/v1"
 
 ### 4. 把 `proxy_token` 提供给 Codex
 
-Codex 配置会从环境变量 `MODELMUX_PROXY_TOKEN` 读取 `proxy_token`。该变量
-必须进入 **Codex 进程的环境**，不是只提供给 ModelMux 服务。
+Codex 配置会从环境变量 `CODEXMUX_PROXY_TOKEN` 读取 `proxy_token`。该变量
+必须进入 **Codex 进程的环境**，不是只提供给 CodexMux 服务。
 
 #### Codex CLI
 
 在启动 Codex CLI 的同一个终端中执行：
 
 ```bash
-export MODELMUX_PROXY_TOKEN='把 credentials.json 中的 proxy_token 填在这里'
+export CODEXMUX_PROXY_TOKEN='把 credentials.json 中的 proxy_token 填在这里'
 codex
 ```
 
@@ -148,7 +165,7 @@ codex
 让从 macOS 图形界面启动的应用取得变量：
 
 ```bash
-launchctl setenv MODELMUX_PROXY_TOKEN '把 credentials.json 中的 proxy_token 填在这里'
+launchctl setenv CODEXMUX_PROXY_TOKEN '把 credentials.json 中的 proxy_token 填在这里'
 ```
 
 设置后需要**完全退出 Codex Desktop，再重新打开**。仅关闭窗口通常不会
@@ -156,45 +173,57 @@ launchctl setenv MODELMUX_PROXY_TOKEN '把 credentials.json 中的 proxy_token �
 
 同时使用 Codex CLI 和 Desktop 时，两种方式都应配置。
 
-### 5. 启动 CPA 和 ModelMux
+### 5. 启动 CPA 和 CodexMux
 
-先确认 CPA 正在运行，然后选择以下一种方式启动 ModelMux。不要同时运行
-前台服务和后台服务，否则两者会争用 `127.0.0.1:48682`。
+不要同时运行前台代理和后台代理，否则会争用 `127.0.0.1:48682`。
 
-#### 推荐：安装为 macOS 后台服务
+#### 推荐：菜单栏应用
+
+菜单栏应用是控制器：打开它会启动代理和本地 CPA，并从当前图形界面上下文
+备份并接管 Codex 配置；退出时停止整栈并还原 Codex 配置。
 
 ```bash
-modelmux install
+codexmux cpa install
+cd menubar
+./package-app.sh
+ditto .build/release/CodexMux.app /Applications/CodexMux.app
+open /Applications/CodexMux.app
 ```
 
-该命令会立即注册并启动当前用户的 LaunchAgent，并在登录后自动运行。后台
-代理启动成功后会自动备份并接管 Codex 配置；执行 `modelmux uninstall` 时会
-停止代理、注销 LaunchAgent 并恢复原配置。
+打开菜单栏或执行 `codexmux install` 时，会记录当前 `codexmux` 可执行文件和
+Codex 配置的绝对路径，因此应先把 CLI 放到 `~/.local/bin/codexmux`。`~/.codex`
+若是指向真实 Codex 数据目录的符号链接，默认路径即可；否则先设置
+`CODEX_CONFIG` 或 `CODEX_HOME`。
 
-安装时会记录当前 `modelmux` 可执行文件和 Codex 配置文件的绝对路径，因此应
-先把二进制文件放到稳定位置，并确定 `CODEX_CONFIG` 或 `CODEX_HOME`，再执行
-`install`。
+也可以在终端执行同样的接管：
+
+```bash
+codexmux install
+```
+
+该命令会启用 Codex 托管配置，再注册并启动当前用户的 LaunchAgent。登录后
+代理会自动运行，但 LaunchAgent 里的进程不再改写 Codex 配置（见下方 TCC
+说明）。`codexmux uninstall` 会停止代理、注销 LaunchAgent 并恢复原配置。
 
 #### 调试：在前台运行
 
 ```bash
-modelmux serve
+codexmux serve
 ```
 
-`serve` 会在成功绑定本地端口后自动备份并接管 Codex 配置。按 `Ctrl-C` 或
-收到正常终止信号时，代理会停止接收新请求，最多等待现有请求 30 秒，再恢复
-原配置。终端被强制关闭、进程崩溃或系统断电时可能来不及恢复；下一次启动会
-根据持久化的操作阶段完成接管或恢复。需要调试日志或首次排查配置时可使用
-这种方式。
+`serve` 会在成功绑定本地端口后备份并接管 Codex 配置。按 `Ctrl-C` 或收到
+正常终止信号时，代理会停止接收新请求，最多等待现有请求 30 秒，再恢复原
+配置。终端被强制关闭、进程崩溃或系统断电时可能来不及恢复；下一次启动会
+根据持久化的操作阶段完成接管或恢复。
 
-启动或停止 ModelMux 后都应完全退出并重新打开 Codex，使其重新读取配置。
+启动或停止 CodexMux 后都应完全退出并重新打开 Codex，使其重新读取配置。
 
 ### 6. 检查运行状态
 
-在已正确设置 `MODELMUX_PROXY_TOKEN` 的终端中运行：
+在已正确设置 `CODEXMUX_PROXY_TOKEN` 的终端中运行：
 
 ```bash
-modelmux doctor
+codexmux doctor
 ```
 
 正常情况下应看到：
@@ -204,6 +233,8 @@ proxy: reachable
 CPA: reachable
 settings: ok
 credentials: ok
+catalog snapshot: available
+managed config: enabled
 ```
 
 首次启动且 Codex 尚未请求模型目录时，出现
@@ -212,11 +243,11 @@ credentials: ok
 
 ### 7. 重新启动 Codex
 
-`serve` 或 LaunchAgent 启动后，ModelMux 已经自动在 Codex 的 `config.toml`
-中加入托管 provider 配置，并保留原文件备份。默认配置文件是
-`~/.codex/config.toml`。
+打开菜单栏、执行 `codexmux install` 或前台 `serve` 后，CodexMux 已经在
+Codex 的 `config.toml` 中加入托管 provider 配置，并保留原文件备份。默认
+配置文件是 `~/.codex/config.toml`。
 
-ModelMux 不会写入静态 `model_catalog_json`。Codex 会从 ModelMux 的
+CodexMux 不会写入静态 `model_catalog_json`。Codex 会从 CodexMux 的
 `/v1/models` 动态获取模型目录。
 
 完全退出并重新启动 Codex。模型选择器中应同时看到：
@@ -224,128 +255,220 @@ ModelMux 不会写入静态 `model_catalog_json`。Codex 会从 ModelMux 的
 - 原名称的官方模型，例如 `gpt-5.6`；
 - 带 ` · CPA` 显示后缀的 CPA 模型，例如模型名称为 `cpa/gpt-5.6`。
 
-如果 CPA 中新增、删除或修改模型，重新打开模型选择器或重启 Codex，使其
-再次请求模型目录即可，无需手动编辑 ModelMux 配置。
+如果 CPA 中新增、删除或修改模型，重新打开模型选择器或新开对话，使其再次
+请求模型目录即可，无需手动编辑 CodexMux 配置。Codex 的模型列表是事件驱动
+的，不会在空闲时轮询。CPA 因冷却等原因暂时从上游目录消失的模型，会按上次
+成功快照继续列在选择器中；请求在上游恢复前仍可能失败。
+连续缺失满 24 小时后，模型才会从下一份完整快照中移除；期间重新出现会重置
+缺失计时。
 
 ## 日常命令
 
 | 命令 | 作用 |
 | --- | --- |
-| `modelmux status` | 显示数据路径、Codex 配置路径和启用状态 |
-| `modelmux doctor` | 检查配置、凭据、环境变量、服务连通性和目录快照 |
-| `modelmux serve` | 在前台运行代理，启动时接管、退出时恢复 Codex 配置 |
-| `modelmux serve --no-codex-config` | 在前台运行代理但不管理 Codex 配置 |
-| `modelmux install` | 启用 Codex 托管配置，然后注册并启动 LaunchAgent |
-| `modelmux uninstall` | 停止并注销 LaunchAgent，同时恢复 Codex 配置 |
+| `codexmux status` | 显示数据路径、Codex 配置路径和启用状态 |
+| `codexmux doctor` | 检查配置、凭据、环境变量、服务连通性和目录快照 |
+| `codexmux serve` | 在前台运行代理，启动时接管、退出时恢复 Codex 配置 |
+| `codexmux serve --no-codex-config` | 在前台运行代理但不管理 Codex 配置 |
+| `codexmux install` | 启用 Codex 托管配置，然后注册并启动 LaunchAgent |
+| `codexmux uninstall` | 停止并注销 LaunchAgent，同时恢复 Codex 配置 |
 
 `status` 显示的是配置管理状态，不代表后台进程一定可访问；检查服务连通性应
 使用 `doctor`。
 
 LaunchAgent 中的代理以 `serve --no-codex-config` 运行：macOS 的 TCC 可能
-拒绝后台进程访问 Codex 配置所在的宗卷，并且 `open()` 会无限阻塞而不是立刻
-报错。Codex 配置的启用与恢复由 `modelmux install` / `modelmux uninstall`
-在终端中完成。
+拒绝后台进程访问 Codex 配置所在的卷，并且 `open()` 会无限阻塞而不是立刻
+报错。Codex 配置的启用与恢复由菜单栏应用，或终端里的 `codexmux install` /
+`codexmux uninstall` 完成。
 
 ### 管理本地 CPA
 
-ModelMux 可以直接下载并托管一个本地 CLIProxyAPI（CPA），不再要求用户自行
-安装：
+CodexMux 会下载并托管一个固定版本的本地 CLIProxyAPI（当前为 7.2.146）：
 
 | 命令 | 作用 |
 | --- | --- |
-| `modelmux cpa install` | 下载固定版本的 CLIProxyAPI 发布包（校验 sha256 后解压）、写入托管配置并启动 |
-| `modelmux cpa start` / `modelmux cpa stop` | 启动或停止本地 CPA 服务 |
-| `modelmux cpa status` | 显示已安装版本和运行状态 |
-| `modelmux cpa provider-import <file>` | 从 TOML 文件导入 `[[openai-compatibility]]` / `[[codex-api-key]]` 提供商并重启服务 |
-| `modelmux cpa uninstall` | 移除 CPA LaunchAgent（保留二进制、配置和登录凭据） |
+| `codexmux cpa install` | 下载固定版本的 CLIProxyAPI 发布包（校验 sha256 后解压）、写入托管配置并启动 |
+| `codexmux cpa start` / `codexmux cpa stop` | 启动或停止本地 CPA 服务，并记录为启动偏好 |
+| `codexmux cpa sync-start` | 按保存的启动偏好对齐 CPA 运行状态（菜单栏启动时调用） |
+| `codexmux cpa autostart-set <bool>` | 设置 CodexMux 启动时是否一并启动 CPA |
+| `codexmux cpa status` | 显示已安装版本、运行状态和启动偏好 |
+| `codexmux cpa model-list` | 列出当前 CPA 端点提供的模型 slug |
+| `codexmux cpa management-url` | 输出 CPA Web 管理页地址；`--connect` 会为本地 CPA 附带当前端点和管理密钥，供 Web UI 自动登录 |
+| `codexmux cpa management-key` | 显式输出 CPA Web 管理密钥（请勿记录或分享） |
+| `codexmux cpa provider-import <file>` | 从 TOML 文件导入 `[[openai-compatibility]]` / `[[codex-api-key]]` 提供商并重启服务 |
+| `codexmux cpa profile-list` | 列出已保存的 CPA 端点配置与当前配置 |
+| `codexmux cpa profile-save <name> --base-url <url>` | 从 `CODEXMUX_CPA_PROFILE_TOKEN` 读取令牌并保存或更新 CPA 端点配置 |
+| `codexmux cpa profile-switch <name>` | 验证端点后切换；启动失败会恢复原配置 |
+| `codexmux cpa profile-remove <name>` | 删除已保存的 CPA 端点配置 |
+| `codexmux cpa uninstall` | 移除 CPA LaunchAgent（保留二进制、配置和登录凭据） |
+
+保存端点前先把令牌放入当前 shell 的环境，避免凭据进入命令历史：
+
+```bash
+export CODEXMUX_CPA_PROFILE_TOKEN='CPA 端点令牌'
+codexmux cpa profile-save remote \
+  --base-url https://cpa.example.com/v1
+```
 
 安装位置和数据：
 
-- 二进制：`$MODELMUX_HOME/cpa/cli-proxy-api`
-- 配置：`$MODELMUX_HOME/cpa/config.yaml`（ModelMux 托管；手动改过的配置不会被覆盖）
-- 日志：`$MODELMUX_HOME/logs/cpa-*.log`
+- 二进制：`$CODEXMUX_HOME/cpa/cli-proxy-api`
+- 配置：`$CODEXMUX_HOME/cpa/config.yaml`（CodexMux 托管；手动改过的配置不会被覆盖）
+- 日志：`$CODEXMUX_HOME/logs/cpa-*.log`
 - 登录凭据：`~/.cli-proxy-api`（与 CPA 自身约定一致）
 
 本地 CPA 只监听 `127.0.0.1`，对 Codex 侧的接入方式与远端 CPA 完全一致：
-ModelMux 按 `cpa/` 前缀路由到 `config.toml` 中配置的 CPA 地址。
+CodexMux 按 `cpa/` 前缀路由到 `config.toml` 中配置的 CPA 地址。
 
-### 菜单栏应用（ModelMuxBar）
+### 显式直连与审批模型覆盖
 
-仓库内的 `menubar/` 是一个独立的 Swift 菜单栏应用，提供：
+如果某个上游原生支持 Responses API，可以把模型 slug 显式直连过去，绕过 CPA
+的协议执行层。直连路由声明自己的模型列表，模型不必存在于 CPA 目录中，因此
+不装 CPA 也可以用（例如接入第三方 Responses 端点）。令牌从环境变量读取，
+避免出现在命令行参数和 shell history：
 
-- 原生折叠菜单中的实时 token 速度；
-- ModelMux 与本地 CPA 的运行状态显示；
-- 重启 / 停止 ModelMux；
-- 启动 / 停止 CPA；
-- 打开日志目录。
+```bash
+export CODEXMUX_DIRECT_TOKEN='直连上游令牌'
+codexmux cpa direct-add gpt-5.6-sol,gpt-5.6-terra \
+  --base-url https://responses.example.com/v1
+# 本地 slug 与原生 Responses model id 不同时，显式声明映射：
+codexmux cpa direct-add glm-5.3-uni \
+  --upstream-model zai-org/GLM-5.3 \
+  --base-url https://responses.example.com/v1
+codexmux cpa direct-list
+```
 
-生成过程中，Token 速度子菜单从公开的 Responses SSE delta 估算输出 token，并以
-`≈ tok/s` 显示；收到 `response.completed` 后，如果上游返回
-`usage.output_tokens`，会用该值校准最终平均速度。估算与校准统计只保存在
-ModelMux 进程内存中，不记录 prompt、响应文本或 provider 私有字段。
+直连配置保存在权限为 `0600` 的 `cpa-profiles.toml` 中。已存在于目录快照的
+`cpa/<slug>` 按 CPA（或其直连覆盖）路由；快照没有的声明模型会在解析时回退到
+声明的直连路由；两者都没有的未知模型仍然拒绝。CPA 不可达时，`/v1/models`
+返回官方目录加直连模型的降级视图（仅内存，不落盘）。远端直连地址必须使用
+HTTPS，本机回环地址可以使用 HTTP。直连令牌必须与 CodexMux proxy token、CPA
+token 和 CPA 管理密钥全部不同。删除部分模型或整个直连路由：
 
-点击菜单栏图标打开原生菜单，再展开“Token 速度”即可查看。统计数据来自
-需要 `x-modelmux-token` 的本地 `/telemetry` 接口。
+```bash
+codexmux cpa direct-remove gpt-5.6-sol --base-url https://responses.example.com/v1
+codexmux cpa direct-remove --base-url https://responses.example.com/v1   # 整条路由
+codexmux cpa direct-clear
+```
 
-构建并运行：
+菜单栏“直接端点”子菜单提供添加与移除；令牌通过进程环境传给 CLI，不会出现在
+参数或日志里。
+
+隐藏模型 `codex-auto-review` 默认始终走官方路由，官方请求失败时不会自动切换到
+CPA。若确实需要覆盖，可以显式指定一个当前 CPA 目录中的模型：
+
+```bash
+codexmux cpa review-set glm-5.3-uni
+codexmux cpa review-get
+codexmux cpa review-set ''
+```
+
+最后一条命令清除覆盖并恢复官方路由。菜单栏应用的“审批模型”子菜单提供相同
+操作。
+
+### 菜单栏应用
+
+仓库内的 `menubar/` 会打成 `/Applications/CodexMux.app`。它是整栈的控制器，
+不是附加开关：
+
+- 打开应用会启动代理，并按保存的启动偏好对齐本地 CPA（未安装 CPA 时状态栏
+  会显示“CPA：未安装”，并提供“安装 CPA…”入口）；
+- 退出应用会停止代理与 CPA，并还原 Codex 配置；启动偏好保持不变，下次打开
+  按该偏好决定是否启动 CPA；
+- 显示 CodexMux 与本地 CPA 的运行状态；
+- 重启 / 停止 CodexMux，启动 / 停止 CPA，安装 CPA；
+- “随 CodexMux 启动 CPA”开关（即启动偏好）；
+- 管理直接端点（添加 / 移除），不依赖 CPA 是否安装；
+- 切换已保存的 CPA 端点配置；
+- 显式选择 `codex-auto-review` 使用的 CPA 模型；
+- 打开日志目录；
+- 打开 CPA Web 管理页（本机 CPA 会自动带上当前连接信息并登录）；
+- 将 CPA Web 管理密钥复制到剪贴板；
+- 中文 / 英文 / 跟随系统语言。
+
+构建并安装：
 
 ```bash
 cd menubar
-swift build -c release
-.build/release/ModelMuxBar
+./package-app.sh
+ditto .build/release/CodexMux.app /Applications/CodexMux.app
+open /Applications/CodexMux.app
 ```
 
-菜单栏应用不提供模型切换——模型选择由 Codex 客户端完成。
+`package-app.sh` 会生成带应用图标并经过本地临时签名的 `.app`；第二个可选参数可
+指定 Swift 架构，例如 `./package-app.sh release arm64`。应用图标的可编辑矢量源
+位于 `menubar/Resources/CodexMux.svg`。
+
+菜单栏应用不替代 Codex 的普通模型选择；它只提供 CPA 端点切换和隐藏审批模型的
+显式路由覆盖。
+
+## 持续集成与发版
+
+`.github/workflows/ci.yml` 会在 push、Pull Request 和手动触发时，于 macOS 上执行
+Rust 格式检查、Clippy、全量测试、Release 构建，并实际打包和验证菜单栏应用。
+
+推送 `v*` 标签会触发 `.github/workflows/release.yml`。标签版本必须同时匹配
+`Cargo.toml` 与菜单栏 App 的 `CFBundleShortVersionString`；验证通过后会创建 GitHub
+Release，并上传：
+
+- `codexmux-<version>-macos-arm64.tar.gz`：Apple Silicon CLI、README 与 LICENSE；
+- `CodexMux-<version>-macos-arm64.zip`：临时签名的菜单栏 App；
+- `SHA256SUMS`：上述两个归档的 SHA-256。
+
+例如发布 `0.1.0` 时，在版本文件已经同步并提交后推送 `v0.1.0` 标签即可。工作流
+只对标签引用自动发版，不会从普通分支构建覆盖已有 Release。
 
 ### 查看后台日志
 
 默认数据目录下执行：
 
 ```bash
-tail -f "$HOME/Library/Application Support/ModelMux/logs/stderr.log"
+tail -f "$HOME/Library/Application Support/CodexMux/logs/stderr.log"
 ```
 
-标准输出位于同目录的 `stdout.log`。如果设置了 `MODELMUX_HOME`，日志位于
-`$MODELMUX_HOME/logs/`。
+标准输出位于同目录的 `stdout.log`。如果设置了 `CODEXMUX_HOME`，日志位于
+`$CODEXMUX_HOME/logs/`。
 
-### 更新 ModelMux
+### 更新 CodexMux
 
 在仓库中重新编译并替换稳定路径下的二进制文件，然后重新安装 LaunchAgent
 以重启服务：
 
 ```bash
 cargo build --release
-install -m 755 target/release/modelmux "$HOME/.local/bin/modelmux"
-modelmux install
-modelmux doctor
+install -m 755 target/release/codexmux "$HOME/.local/bin/codexmux"
+./menubar/package-app.sh
+ditto menubar/.build/release/CodexMux.app /Applications/CodexMux.app
+codexmux install
+codexmux doctor
 ```
 
-更新二进制文件本身不会让已经运行的进程自动加载新版本，必须重新执行
-`modelmux install`。
+更新二进制文件本身不会让已经运行的进程自动加载新版本。CLI 需要重新
+`codexmux install`；菜单栏需要替换 `.app` 后再打开一次。
 
 ## 停用和卸载
 
 停止后台服务、注销 LaunchAgent 并恢复 Codex 配置：
 
 ```bash
-modelmux uninstall
+codexmux uninstall
 ```
 
-如果是前台运行，先按 `Ctrl-C`，ModelMux 会在退出前恢复 Codex 配置。
+如果是前台运行，先按 `Ctrl-C`，CodexMux 会在退出前恢复 Codex 配置。
 
 如果为 Codex Desktop 设置过环境变量，再清除它：
 
 ```bash
-launchctl unsetenv MODELMUX_PROXY_TOKEN
+launchctl unsetenv CODEXMUX_PROXY_TOKEN
 ```
 
-同时从 `~/.zshrc` 删除为 Codex CLI 添加的 `MODELMUX_PROXY_TOKEN`，并打开
+同时从 `~/.zshrc` 删除为 Codex CLI 添加的 `CODEXMUX_PROXY_TOKEN`，并打开
 新终端。
 
-上述操作会保留 ModelMux 数据、目录快照和日志。确认不再需要后可以删除：
+上述操作会保留 CodexMux 数据、目录快照和日志。确认不再需要后可以删除：
 
 ```bash
-rm -rf "$HOME/Library/Application Support/ModelMux"
+rm -rf "$HOME/Library/Application Support/CodexMux"
 ```
 
 应先退出前台代理或执行 `uninstall`，再删除数据目录，否则会丢失恢复 Codex
@@ -353,21 +476,21 @@ rm -rf "$HOME/Library/Application Support/ModelMux"
 
 ## 故障排查
 
-### `MODELMUX_PROXY_TOKEN is missing or does not match credentials.json`
+### `CODEXMUX_PROXY_TOKEN is missing or does not match credentials.json`
 
-当前终端中的 `MODELMUX_PROXY_TOKEN` 没有设置，或与 `credentials.json` 的
-`proxy_token` 不一致。重新设置变量后，在同一个终端运行 `modelmux doctor`
+当前终端中的 `CODEXMUX_PROXY_TOKEN` 没有设置，或与 `credentials.json` 的
+`proxy_token` 不一致。重新设置变量后，在同一个终端运行 `codexmux doctor`
 或启动 Codex CLI。Codex Desktop 需要使用 `launchctl setenv` 并完全退出后
 重开。
 
 ### `proxy: not running`
 
-ModelMux 未启动，或监听地址已被其他进程占用。使用以下一种方式启动：
+CodexMux 未启动，或监听地址已被其他进程占用。使用以下一种方式启动：
 
 ```bash
-modelmux install
+codexmux install
 # 或者用于前台调试：
-modelmux serve
+codexmux serve
 ```
 
 如果刚执行过 `install`，查看 `logs/stderr.log`。
@@ -378,62 +501,63 @@ modelmux serve
 
 1. 本机 CPA 已启动，或远端 CPA 的 HTTPS 地址可以访问；
 2. `config.toml` 中的 `cpa.base_url` 与 CPA API 根地址一致并包含 `/v1`；
-3. ModelMux 的 `cpa_token` 存在于 CPA 顶层 `api-keys`；
+3. CodexMux 的 `cpa_token` 存在于 CPA 顶层 `api-keys`；
 4. 网络、防火墙和 TLS 证书允许当前 Mac 访问远端 CPA；
 5. 修改 CPA 配置后已经重启 CPA。
 
 ### 模型列表为空或没有 CPA 模型
 
-先运行 `modelmux doctor`，确认 ModelMux 和 CPA 均可访问。然后完全重启
+先运行 `codexmux doctor`，确认 CodexMux 和 CPA 均可访问。然后完全重启
 Codex，使其重新请求模型目录。
 
-ModelMux 只有在官方目录和 CPA 目录都成功返回有效数据后才会保存新的完整
+CodexMux 只有在官方目录和 CPA 目录都成功返回有效数据后才会保存新的完整
 快照。如果本次刷新失败，它会继续提供上一次成功的快照；首次刷新之前没有
 可用快照，请检查后台日志。
 
-CPA 目录中满足以下任一条件的模型不会显示：
+除 Codex 内部使用的隐藏 `codex-auto-review` 条目外，CPA 目录中满足以下任一条件的
+模型不会显示：
 
 - `visibility = "hide"`；
 - `supported_in_api = false`。
 
 ### `Codex config already defines ...; refusing to overwrite it`
 
-ModelMux 会保留已有的 `model_providers` 服务商，并追加自己的
-`model_providers.modelmux`。只有现有配置已经占用 ModelMux 自己的 provider 名称，
-或定义了 ModelMux 需要临时托管的顶层 `model_provider`、`model_catalog_json` 时才会
+CodexMux 会保留已有的 `model_providers` 服务商，并追加自己的
+`model_providers.codexmux`。只有现有配置已经占用 CodexMux 自己的 provider 名称，
+或定义了 CodexMux 需要临时托管的顶层 `model_provider`、`model_catalog_json` 时才会
 拒绝接管。
 
 先备份 `~/.codex/config.toml`，核对报错指出的具体冲突项后再处理。不要删除其他
-`model_providers` 服务商配置；它们不会阻止 ModelMux 启动。
+`model_providers` 服务商配置；它们不会阻止 CodexMux 启动。
 
-### `Codex config changed inside the managed ModelMux block`
+### `Codex config changed inside the managed CodexMux block`
 
-ModelMux 接管后，其托管标记之间的内容被手动修改。为避免误删用户配置，
+CodexMux 接管后，其托管标记之间的内容被手动修改。为避免误删用户配置，
 自动接管和恢复会停止操作。恢复托管块原状后重试，或根据
 `state/codex-config.json` 与 `backups/` 中的记录手动核对。
 
 ### 修改了 `credentials.json` 后服务无法启动
 
-确认文件是普通文件、JSON 格式正确、两个令牌非空且彼此不同，并恢复严格
-权限：
+确认文件是普通文件、JSON 格式正确，`proxy_token`、`cpa_token` 和
+`cpa_management_key` 均非空且互不相同，并恢复严格权限：
 
 ```bash
-chmod 600 "$HOME/Library/Application Support/ModelMux/credentials.json"
-modelmux install
+chmod 600 "$HOME/Library/Application Support/CodexMux/credentials.json"
+codexmux install
 ```
 
 ### 使用自定义 Codex 配置路径
 
-ModelMux 按以下优先级寻找 Codex 配置：
+CodexMux 按以下优先级寻找 Codex 配置：
 
 1. `CODEX_CONFIG` 指定的完整文件路径；
 2. `$CODEX_HOME/config.toml`；
 3. `~/.codex/config.toml`。
 
-运行 `serve`、`install`、`uninstall`、`status` 和 `doctor` 时必须使用一致的环境
-变量，否则 ModelMux 会拒绝操作由另一路径记录的托管状态。相对形式的
-`CODEX_CONFIG` 会在执行命令时转换为绝对路径。Codex 配置不能是符号链接，
-以免原子替换破坏由 dotfiles 工具维护的链接；请直接指定链接目标文件。
+`~/.codex` 作为目录符号链接（例如指向另一块磁盘上的真实 Codex 数据目录）
+是支持的：CodexMux 会解析到真实文件后再比较托管状态。配置文件本身不能是
+符号链接，以免原子替换破坏由 dotfiles 工具维护的链接；请直接指定链接目标
+文件。相对形式的 `CODEX_CONFIG` 会在执行命令时转换为绝对路径。
 
 ## 模型目录与请求路由
 
@@ -443,7 +567,7 @@ Codex 请求：
 GET http://127.0.0.1:48682/v1/models?client_version=<Codex version>
 ```
 
-ModelMux 会并行请求官方 ChatGPT Codex 目录和 CPA 原生 Codex 目录，再合并
+CodexMux 会并行请求官方 ChatGPT Codex 目录和 CPA 原生 Codex 目录，再合并
 结果：
 
 - 官方模型 slug 保持不变；
@@ -451,26 +575,29 @@ ModelMux 会并行请求官方 ChatGPT Codex 目录和 CPA 原生 Codex 目录�
 - CPA 模型 `display_name` 追加 ` · CPA`；
 - CPA 返回的其他模型字段原样保留，包括未来新增的未知字段。
 
-合并后的完整目录会原子写入 `model-catalog.json`，同时作为精确路由表。CPA
-请求转发前只把顶层模型名从 `cpa/<model>` 还原为 `<model>`；其余原生
-Responses 请求保持不变。
+合并后的完整目录会原子写入 `model-catalog.json`，同时作为精确路由表。若
+新的 CPA 目录暂时少了某个上次见过的模型（例如上游冷却），该条目仍会留在
+快照里供选择器显示。首次缺失时间原子写入 `model-catalog.retention.json`；连续
+缺失满 24 小时才移除，重新出现则清除计时。CPA 请求转发前只把顶层模型名从
+`cpa/<model>` 还原为 `<model>`；显式直连映射可进一步换成声明的原生 model id，
+其余原生 Responses 请求保持不变。
 
 ## 在同一对话中切换模型
 
 响应 ID 只属于生成它的具体后端和模型，不能直接交给另一个路由。切换官方
-模型、切换 CPA 模型，或在官方与 CPA 之间切换时，ModelMux 会移除
+模型、切换 CPA 模型，或在官方与 CPA 之间切换时，CodexMux 会移除
 `previous_response_id`，改为回放本地记录的公开对话历史。
 
 回放内容仅包括允许的文本消息、工具调用与结果，以及公开压缩内容。推理、
 签名、加密内容、供应商私有状态和未知项目不会跨路由传递；图片也不会在切换
-时回放。历史保存在内存中，重启 ModelMux 后会清空。历史链不完整、已淘汰或
+时回放。历史保存在内存中，重启 CodexMux 后会清空。历史链不完整、已淘汰或
 无法确认安全时，请求会被明确拒绝，而不是把响应 ID 发给错误的供应商。
 
 ## 安全边界
 
-- ModelMux 提供给 Codex 的监听地址必须是本机回环地址；
+- CodexMux 提供给 Codex 的监听地址必须是本机回环地址；
 - 本机 CPA 可以使用回环 HTTP，远端 CPA 必须使用 HTTPS；
-- ModelMux 的所有接口都要求 `x-modelmux-token`；
+- CodexMux 的所有接口都要求 `x-codexmux-token`；
 - 官方请求只使用 Codex 传入的 ChatGPT OAuth，并固定发送到官方 Codex
   endpoint；
 - CPA 请求只转发 `Accept` 和 `User-Agent`，再注入独立的 CPA 令牌；其他
@@ -491,5 +618,5 @@ cargo test --all-targets
 ## Attribution
 
 CPA（[`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI)）
-负责外部供应商协议转换并提供原生 Codex 模型目录。ModelMux 不包含 CPA
+负责外部供应商协议转换并提供原生 Codex 模型目录。CodexMux 不包含 CPA
 源码。

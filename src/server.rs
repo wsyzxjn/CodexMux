@@ -1,4 +1,11 @@
-use std::{fmt, future::Future, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    io,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use async_stream::stream;
 use axum::{
@@ -16,6 +23,7 @@ use serde::{
     de::{MapAccess, Visitor},
 };
 use serde_json::{Map, Value, json};
+use tokio::{sync::watch, time::Instant};
 
 use crate::{
     catalog::{self, CatalogRoute, CatalogStore},
@@ -23,17 +31,21 @@ use crate::{
     continuity::{ContinuityStore, portable_input_items, portable_output_items},
     dialect::sse,
     router,
-    telemetry::{TelemetrySession, TelemetrySnapshot, TelemetryStore},
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
+const PROXY_TOKEN_HEADER: &str = "x-codexmux-token";
+const PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CPA_CATALOG_FRESH_FOR: Duration = Duration::from_secs(20);
+const CPA_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+const CPA_SYNC_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Route {
     Official,
     Cpa,
-    /// ModelMux proxies straight to this upstream, bypassing CPA.
+    /// CodexMux proxies straight to this upstream, bypassing CPA.
     Direct {
         base_url: String,
         token: String,
@@ -45,7 +57,7 @@ impl Route {
         match self {
             Self::Official => format!("official:{model}"),
             Self::Cpa => format!("cpa:{model}"),
-            Self::Direct { .. } => format!("direct:{model}"),
+            Self::Direct { base_url, .. } => format!("direct:{base_url}:{model}"),
         }
     }
 
@@ -62,10 +74,18 @@ pub struct AppState {
     credentials: Arc<Credentials>,
     catalog: Arc<CatalogStore>,
     continuity: Arc<ContinuityStore>,
-    telemetry: Arc<TelemetryStore>,
     /// Profile store path; read per-request for the review model override so
     /// menu-bar changes apply without a proxy restart.
     cpa_profiles_path: PathBuf,
+    activity: watch::Sender<Instant>,
+    cpa_catalog: Arc<RwLock<Option<CachedCpaCatalog>>>,
+}
+
+#[derive(Clone)]
+struct CachedCpaCatalog {
+    value: Value,
+    fetched_at: Instant,
+    generation: u64,
 }
 
 impl AppState {
@@ -78,6 +98,7 @@ impl AppState {
         settings.validate()?;
         credentials.validate()?;
         let catalog = CatalogStore::load(catalog_path)?;
+        let (activity, _) = watch::channel(Instant::now());
         Ok(Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
@@ -87,9 +108,62 @@ impl AppState {
             credentials: Arc::new(credentials),
             catalog: Arc::new(catalog),
             continuity: Arc::new(ContinuityStore::new()),
-            telemetry: Arc::new(TelemetryStore::new()),
             cpa_profiles_path,
+            activity,
+            cpa_catalog: Arc::new(RwLock::new(None)),
         })
+    }
+
+    pub async fn wait_for_idle(&self) {
+        let mut activity = self.activity.subscribe();
+        loop {
+            let deadline = *activity.borrow() + PROXY_IDLE_TIMEOUT;
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    if Instant::now().duration_since(*activity.borrow()) >= PROXY_IDLE_TIMEOUT {
+                        tracing::info!(idle_seconds = PROXY_IDLE_TIMEOUT.as_secs(), "proxy idle timeout reached");
+                        return;
+                    }
+                }
+                changed = activity.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn touch(&self) {
+        self.activity.send_replace(Instant::now());
+    }
+
+    fn cached_cpa_catalog(&self, max_age: Duration) -> Option<Value> {
+        self.cpa_catalog
+            .read()
+            .expect("CPA catalog cache lock poisoned")
+            .as_ref()
+            .filter(|cached| cached.fetched_at.elapsed() <= max_age)
+            .map(|cached| cached.value.clone())
+    }
+
+    fn store_cpa_catalog(&self, value: Value) {
+        let mut cache = self
+            .cpa_catalog
+            .write()
+            .expect("CPA catalog cache lock poisoned");
+        let changed = cache.as_ref().is_none_or(|cached| cached.value != value);
+        let generation = cache.as_ref().map_or(1, |cached| {
+            cached.generation.saturating_add(u64::from(changed))
+        });
+        *cache = Some(CachedCpaCatalog {
+            value,
+            fetched_at: Instant::now(),
+            generation,
+        });
+        if changed {
+            tracing::info!(generation, "CPA model catalog synchronized");
+        }
     }
 }
 
@@ -102,17 +176,20 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let address = listener.local_addr()?;
-    tracing::info!(%address, "ModelMux listening");
-    axum::serve(listener, router(state))
+    tracing::info!(%address, "CodexMux listening");
+    let sync_state = state.clone();
+    let sync_task = tokio::spawn(async move { synchronize_cpa_catalog(sync_state).await });
+    let result = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
-        .await?;
+        .await;
+    sync_task.abort();
+    result?;
     Ok(())
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/telemetry", get(handle_telemetry))
         .route("/v1/models", get(handle_models))
         .route("/v1/responses", post(handle_responses))
         .route("/v1/responses/compact", post(handle_responses))
@@ -130,15 +207,12 @@ async fn require_proxy_token(
     next: Next,
 ) -> Result<axum::response::Response, ProxyError> {
     authenticate(request.headers(), &state.credentials.proxy_token)?;
+    state.touch();
     Ok(next.run(request).await)
 }
 
 async fn health() -> Json<Value> {
-    Json(json!({"ok": true, "service": "modelmux"}))
-}
-
-async fn handle_telemetry(State(state): State<AppState>) -> Json<TelemetrySnapshot> {
-    Json(state.telemetry.snapshot())
+    Json(json!({"ok": true, "service": "codexmux"}))
 }
 
 #[derive(Deserialize)]
@@ -172,13 +246,49 @@ async fn refresh_catalog(
 ) -> Result<Value, ProxyError> {
     let official_headers = router::official_headers(incoming_headers)
         .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?;
-    let cpa_headers = router::cpa_headers(incoming_headers, &state.credentials.cpa_token)
-        .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?;
     let official_url = models_url(OFFICIAL_BASE_URL, client_version)?;
-    let cpa_url = models_url(&state.settings.cpa.base_url, client_version)?;
-    refresh_catalog_from_urls(state, official_headers, cpa_headers, official_url, cpa_url).await
+    let (official, cpa) = tokio::join!(
+        fetch_catalog(&state.client, official_url, official_headers, "official"),
+        async {
+            if let Some(cached) = state.cached_cpa_catalog(CPA_CATALOG_FRESH_FOR) {
+                Ok(cached)
+            } else {
+                fetch_cpa_catalog(state, client_version).await
+            }
+        }
+    );
+    merge_catalog_results(state, official, cpa)
 }
 
+async fn fetch_cpa_catalog(state: &AppState, client_version: &str) -> Result<Value, ProxyError> {
+    let headers = router::cpa_headers(&HeaderMap::new(), &state.credentials.cpa_token)
+        .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?;
+    let url = models_url(&state.settings.cpa.base_url, client_version)?;
+    let catalog = fetch_catalog(&state.client, url, headers, "CPA").await?;
+    state.store_cpa_catalog(catalog.clone());
+    Ok(catalog)
+}
+
+async fn synchronize_cpa_catalog(state: AppState) {
+    let mut retry = Duration::from_secs(5);
+    loop {
+        let delay = match fetch_cpa_catalog(&state, "").await {
+            Ok(_) => {
+                retry = Duration::from_secs(5);
+                CPA_SYNC_INTERVAL
+            }
+            Err(error) => {
+                tracing::warn!(%error.message, retry_seconds = retry.as_secs(), "CPA catalog synchronization failed");
+                let delay = retry;
+                retry = retry.saturating_mul(2).min(CPA_SYNC_MAX_BACKOFF);
+                delay
+            }
+        };
+        tokio::time::sleep(delay).await;
+    }
+}
+
+#[cfg(test)]
 async fn refresh_catalog_from_urls(
     state: &AppState,
     official_headers: HeaderMap,
@@ -187,15 +297,46 @@ async fn refresh_catalog_from_urls(
     cpa_url: reqwest::Url,
 ) -> Result<Value, ProxyError> {
     let (official, cpa) = tokio::join!(
-        fetch_catalog(&state.client, official_url, official_headers, "official"),
+        fetch_catalog(
+            &state.client,
+            official_url.clone(),
+            official_headers,
+            "official"
+        ),
         fetch_catalog(&state.client, cpa_url, cpa_headers, "CPA")
     );
-    let official = official?;
-    let cpa = cpa?;
-    state
-        .catalog
-        .replace(&official, &cpa)
-        .map_err(|error| ProxyError::bad_gateway("catalog", error.to_string()))
+    merge_catalog_results(state, official, cpa)
+}
+
+fn merge_catalog_results(
+    state: &AppState,
+    official: Result<Value, ProxyError>,
+    cpa: Result<Value, ProxyError>,
+) -> Result<Value, ProxyError> {
+    match (official, cpa) {
+        (Ok(official), Ok(cpa)) => {
+            let direct = crate::cpa::declared_direct_models(&state.cpa_profiles_path);
+            state
+                .catalog
+                .replace(&official, &cpa, &direct)
+                .map_err(|error| ProxyError::bad_gateway("catalog", error.to_string()))
+        }
+        // CPA unreachable or absent: serve the official catalog plus declared
+        // direct models. The merged view is never persisted; a stored
+        // snapshot still requires both upstream catalogs to validate.
+        (Ok(official), Err(cpa_error)) => {
+            tracing::warn!(%cpa_error.message, "CPA catalog unavailable; merging direct routes only");
+            let direct = crate::cpa::declared_direct_models(&state.cpa_profiles_path);
+            catalog::merge_official_direct(&official, &direct)
+                .map_err(|error| ProxyError::bad_gateway("catalog", error.to_string()))
+        }
+        (Err(official_error), cpa_result) => {
+            if let Err(cpa_error) = cpa_result {
+                tracing::warn!(%cpa_error.message, "CPA catalog unavailable during failed refresh");
+            }
+            Err(official_error)
+        }
+    }
 }
 
 fn models_url(base_url: &str, client_version: &str) -> Result<reqwest::Url, ProxyError> {
@@ -336,26 +477,12 @@ async fn handle_responses(
         turn_input,
     };
 
-    // Direct routes bypass both the catalog and CPA entirely.
-    if let Some(stripped) = request.model.strip_prefix(crate::config::CPA_MODEL_PREFIX)
-        && let Some(direct) = crate::cpa::direct_route_for(&state.cpa_profiles_path, stripped)
-    {
-        return forward_response(
-            &state,
-            &headers,
-            endpoint,
-            &request,
-            &Route::Direct {
-                base_url: direct.base_url,
-                token: direct.token,
-            },
-            Some(stripped),
-        )
-        .await;
-    }
     let catalog_route = state
         .catalog
-        .resolve(&request.model)
+        .resolve_with_direct(
+            &request.model,
+            &crate::cpa::declared_direct_models(&state.cpa_profiles_path),
+        )
         .map_err(|error| ProxyError::bad_request("route", error.to_string()))?;
 
     match catalog_route {
@@ -363,110 +490,76 @@ async fn handle_responses(
             forward_response(&state, &headers, endpoint, &request, &Route::Official, None).await
         }
         CatalogRoute::Cpa { upstream_model } => {
+            let (route, routed_model) = cpa_route(&state, &upstream_model)?;
             forward_response(
                 &state,
                 &headers,
                 endpoint,
                 &request,
-                &Route::Cpa,
-                Some(&upstream_model),
+                &route,
+                Some(&routed_model),
             )
             .await
         }
-        CatalogRoute::AutoReview { cpa_upstream_model } => {
-            // A review override sends codex-auto-review straight to the chosen
-            // CPA model; otherwise official runs first with CPA as fallback.
+        CatalogRoute::AutoReview => {
+            // An explicit override sends codex-auto-review to the selected CPA
+            // model. Without one, it remains on the official route.
             let override_model = crate::cpa::review_override(&state.cpa_profiles_path);
             if let Some(slug) = override_model {
+                let local_model = format!("{}{slug}", crate::config::CPA_MODEL_PREFIX);
+                let upstream_model = match state.catalog.resolve_with_direct(
+                    &local_model,
+                    &crate::cpa::declared_direct_models(&state.cpa_profiles_path),
+                ) {
+                    Ok(CatalogRoute::Cpa { upstream_model }) => upstream_model,
+                    _ => {
+                        return Err(ProxyError::bad_request(
+                            "review_override",
+                            format!("review override model {local_model} is not in the catalog"),
+                        ));
+                    }
+                };
+                let (route, routed_model) = cpa_route(&state, &upstream_model)?;
                 forward_response(
                     &state,
                     &headers,
                     endpoint,
                     &request,
-                    &Route::Cpa,
-                    Some(&slug),
+                    &route,
+                    Some(&routed_model),
                 )
                 .await
             } else {
-                forward_auto_review(
-                    &state,
-                    &headers,
-                    endpoint,
-                    &request,
-                    cpa_upstream_model.as_deref(),
-                )
-                .await
+                forward_response(&state, &headers, endpoint, &request, &Route::Official, None).await
             }
         }
     }
 }
 
-async fn forward_auto_review(
-    state: &AppState,
-    headers: &HeaderMap,
-    endpoint: &str,
-    request: &ResponseRequest,
-    cpa_upstream_model: Option<&str>,
-) -> Result<Response<Body>, ProxyError> {
-    let (official_body, official_route_id) = prepare_request(
-        &request.body,
-        &request.value,
-        &request.model,
-        request.parent.as_deref(),
-        &request.turn_input,
-        &Route::Official,
-        None,
-        &state.continuity,
-    )?;
-    let official_telemetry = state.telemetry.begin(&official_route_id);
-    let official = send_upstream(state, headers, endpoint, &Route::Official, official_body).await;
-    match official {
-        Ok(upstream) if upstream.status().is_success() => {
-            return finish_response(
-                upstream,
-                request.parent.clone(),
-                request.turn_input.clone(),
-                official_route_id,
-                state.continuity.clone(),
-                official_telemetry,
+fn cpa_route(state: &AppState, upstream_model: &str) -> Result<(Route, String), ProxyError> {
+    let direct = crate::cpa::direct_route_for(&state.cpa_profiles_path, upstream_model)
+        .map_err(|error| ProxyError::bad_gateway("direct_route", error.to_string()))?;
+    Ok(match direct {
+        Some(direct) => {
+            if direct.token == state.credentials.proxy_token
+                || direct.token == state.credentials.cpa_token
+                || direct.token == state.credentials.cpa_management_key
+            {
+                return Err(ProxyError::bad_gateway(
+                    "direct_route",
+                    "direct route token must be distinct from CodexMux credentials",
+                ));
+            }
+            (
+                Route::Direct {
+                    base_url: direct.base_url,
+                    token: direct.token,
+                },
+                direct.upstream_model,
             )
-            .await;
         }
-        Ok(upstream) if cpa_upstream_model.is_none() => {
-            return Ok(passthrough_response(upstream));
-        }
-        Err(error) if cpa_upstream_model.is_none() => return Err(error),
-        Ok(upstream) => {
-            tracing::warn!(status = %upstream.status(), "official auto-review failed; falling back to CPA");
-        }
-        Err(error) => {
-            tracing::warn!(message = %error.message, "official auto-review failed; falling back to CPA");
-        }
-    }
-    drop(official_telemetry);
-
-    let cpa_upstream_model = cpa_upstream_model.expect("CPA fallback was checked above");
-    let (cpa_body, cpa_route_id) = prepare_request(
-        &request.body,
-        &request.value,
-        &request.model,
-        request.parent.as_deref(),
-        &request.turn_input,
-        &Route::Cpa,
-        Some(cpa_upstream_model),
-        &state.continuity,
-    )?;
-    let cpa_telemetry = state.telemetry.begin(&cpa_route_id);
-    let upstream = send_upstream(state, headers, endpoint, &Route::Cpa, cpa_body).await?;
-    finish_response(
-        upstream,
-        request.parent.clone(),
-        request.turn_input.clone(),
-        cpa_route_id,
-        state.continuity.clone(),
-        cpa_telemetry,
-    )
-    .await
+        None => (Route::Cpa, upstream_model.to_owned()),
+    })
 }
 
 async fn forward_response(
@@ -487,7 +580,6 @@ async fn forward_response(
         cpa_upstream_model,
         &state.continuity,
     )?;
-    let telemetry = state.telemetry.begin(&route_id);
     let upstream = send_upstream(state, headers, endpoint, route, outgoing).await?;
     finish_response(
         upstream,
@@ -495,7 +587,6 @@ async fn forward_response(
         request.turn_input.clone(),
         route_id,
         state.continuity.clone(),
-        telemetry,
     )
     .await
 }
@@ -553,23 +644,8 @@ async fn send_upstream(
             .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?,
         Route::Cpa => router::cpa_headers(headers, &state.credentials.cpa_token)
             .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?,
-        Route::Direct { token, .. } => {
-            let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?;
-            value.set_sensitive(true);
-            let mut direct = HeaderMap::new();
-            direct.insert(header::AUTHORIZATION, value);
-            for name in ["accept", "user-agent"] {
-                for v in headers.get_all(name) {
-                    direct.append(header::HeaderName::from_static(name), v.clone());
-                }
-            }
-            direct.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
-            direct
-        }
+        Route::Direct { token, .. } => router::cpa_headers(headers, token)
+            .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?,
     };
     let target = target_url(&state.settings, &state.official_base_url, route, endpoint);
     state
@@ -588,7 +664,6 @@ async fn finish_response(
     turn_input: Vec<Value>,
     route_id: String,
     continuity: Arc<ContinuityStore>,
-    telemetry: TelemetrySession,
 ) -> Result<Response<Body>, ProxyError> {
     let status = upstream.status();
     let is_sse = upstream
@@ -607,18 +682,10 @@ async fn finish_response(
 
     if is_sse {
         Ok(streaming_response(
-            upstream, parent, turn_input, route_id, continuity, telemetry,
+            upstream, parent, turn_input, route_id, continuity,
         ))
     } else {
-        non_streaming_response(
-            upstream,
-            parent,
-            turn_input,
-            route_id,
-            &continuity,
-            telemetry,
-        )
-        .await
+        non_streaming_response(upstream, parent, turn_input, route_id, &continuity).await
     }
 }
 
@@ -665,13 +732,13 @@ fn rewrite_for_continuity(
 
 fn authenticate(headers: &HeaderMap, expected: &str) -> Result<(), ProxyError> {
     let supplied = headers
-        .get("x-modelmux-token")
+        .get(PROXY_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok());
     if supplied != Some(expected) {
         return Err(ProxyError::new(
             StatusCode::FORBIDDEN,
             "forbidden",
-            "missing or invalid ModelMux token",
+            "missing or invalid CodexMux token",
         ));
     }
     Ok(())
@@ -717,7 +784,6 @@ async fn non_streaming_response(
     turn_input: Vec<Value>,
     route_id: String,
     continuity: &ContinuityStore,
-    mut telemetry: TelemetrySession,
 ) -> Result<Response<Body>, ProxyError> {
     let status = upstream.status();
     let content_type = upstream
@@ -731,7 +797,6 @@ async fn non_streaming_response(
         .await
         .map_err(|error| ProxyError::bad_gateway("upstream_body", error.to_string()))?;
     if let Ok(response) = serde_json::from_slice::<Value>(&bytes) {
-        telemetry.complete(&response);
         record_response(
             continuity,
             &response,
@@ -759,56 +824,36 @@ struct ResponseCapture {
     buffer: Vec<u8>,
 }
 
-#[derive(Default)]
-struct CaptureUpdate {
-    deltas: Vec<String>,
-    completed: Option<Value>,
-}
-
 impl ResponseCapture {
     fn new() -> Self {
         Self { buffer: Vec::new() }
     }
 
-    fn push(&mut self, bytes: &[u8]) -> CaptureUpdate {
-        let mut update = CaptureUpdate::default();
+    fn push(&mut self, bytes: &[u8]) -> Option<Value> {
+        let mut completed = None;
         for frame in sse::frames(&mut self.buffer, bytes) {
-            update_frame(&frame, &mut update);
+            if let Some(response) = completed_response(&frame) {
+                completed = Some(response);
+            }
         }
-        update
+        completed
     }
 
-    fn finish(&mut self) -> CaptureUpdate {
+    fn finish(&mut self) -> Option<Value> {
         if self.buffer.is_empty() {
-            return CaptureUpdate::default();
+            return None;
         }
         let frame = std::mem::take(&mut self.buffer);
-        let mut update = CaptureUpdate::default();
-        update_frame(&frame, &mut update);
-        update
+        completed_response(&frame)
     }
 }
 
-fn update_frame(frame: &[u8], update: &mut CaptureUpdate) {
-    let Some(data) = sse::data(frame) else {
-        return;
-    };
-    let Ok(event) = serde_json::from_str::<Value>(&data) else {
-        return;
-    };
-    let event_type = event
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if event_type == "response.completed" {
-        update.completed = event.get("response").cloned();
-    } else if event_type.starts_with("response.")
-        && event_type.ends_with(".delta")
-        && !event_type.contains("audio")
-        && let Some(delta) = event.get("delta").and_then(Value::as_str)
-    {
-        update.deltas.push(delta.to_owned());
-    }
+fn completed_response(frame: &[u8]) -> Option<Value> {
+    let data = sse::data(frame)?;
+    let event = serde_json::from_str::<Value>(&data).ok()?;
+    (event.get("type").and_then(Value::as_str) == Some("response.completed"))
+        .then(|| event.get("response").cloned())
+        .flatten()
 }
 
 fn streaming_response(
@@ -817,35 +862,29 @@ fn streaming_response(
     turn_input: Vec<Value>,
     route_id: String,
     continuity: Arc<ContinuityStore>,
-    telemetry: TelemetrySession,
 ) -> Response<Body> {
     let source = upstream.bytes_stream();
     let output = stream! {
         let mut source = Box::pin(source);
         let mut capture = ResponseCapture::new();
-        let mut telemetry = telemetry;
         let mut recorded = false;
         let mut capture_bytes = 0usize;
         while let Some(chunk) = source.next().await {
             match chunk {
                 Ok(chunk) => {
                     capture_bytes = capture_bytes.saturating_add(chunk.len());
-                    if !recorded && capture_bytes <= MAX_CAPTURE_BYTES {
-                        let update = capture.push(&chunk);
-                        for delta in update.deltas {
-                            telemetry.observe_delta(&delta);
-                        }
-                        if let Some(response) = update.completed {
-                            telemetry.complete(&response);
-                            record_response(
-                                &continuity,
-                                &response,
-                                parent.as_deref(),
-                                &route_id,
-                                turn_input.clone(),
-                            );
-                            recorded = true;
-                        }
+                    if !recorded
+                        && capture_bytes <= MAX_CAPTURE_BYTES
+                        && let Some(response) = capture.push(&chunk)
+                    {
+                        record_response(
+                            &continuity,
+                            &response,
+                            parent.as_deref(),
+                            &route_id,
+                            turn_input.clone(),
+                        );
+                        recorded = true;
                     }
                     yield Ok::<Bytes, io::Error>(chunk);
                 }
@@ -855,15 +894,10 @@ fn streaming_response(
                 }
             }
         }
-        if !recorded && capture_bytes <= MAX_CAPTURE_BYTES {
-            let update = capture.finish();
-            for delta in update.deltas {
-                telemetry.observe_delta(&delta);
-            }
-            if let Some(response) = update.completed {
-                telemetry.complete(&response);
-                record_response(&continuity, &response, parent.as_deref(), &route_id, turn_input);
-            }
+        if !recorded && capture_bytes <= MAX_CAPTURE_BYTES
+            && let Some(response) = capture.finish()
+        {
+            record_response(&continuity, &response, parent.as_deref(), &route_id, turn_input);
         }
     };
     Response::builder()
@@ -972,9 +1006,11 @@ mod tests {
                 &json!({"models":[{
                     "slug":catalog::AUTO_REVIEW_MODEL, "visibility":"hide"
                 }]}),
-                &json!({"models":[{
-                    "slug":"codex-auto-review", "visibility":"hide"
-                }]}),
+                &json!({"models":[
+                    {"slug":"codex-auto-review", "visibility":"hide"},
+                    {"slug":"glm-5.3-flash", "visibility":"list"}
+                ]}),
+                &[],
             )
             .unwrap();
         drop(store);
@@ -988,6 +1024,7 @@ mod tests {
             Credentials {
                 proxy_token: "proxy".into(),
                 cpa_token: "cpa-secret".into(),
+                cpa_management_key: "management-secret".into(),
             },
             catalog_path,
             root.join("cpa-profiles.toml"),
@@ -1034,7 +1071,7 @@ mod tests {
 
         let response = reqwest::Client::new()
             .post(format!("http://{proxy_address}/v1/responses"))
-            .header("x-modelmux-token", "proxy")
+            .header("x-codexmux-token", "proxy")
             .header(header::AUTHORIZATION, "Bearer oauth")
             .header("chatgpt-account-id", "account")
             .json(&json!({
@@ -1058,7 +1095,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_review_falls_back_to_cpa_after_official_failure_with_isolated_credentials() {
+    async fn auto_review_does_not_fail_over_after_official_failure() {
         async fn official(
             State(capture): State<TestCapture>,
             headers: HeaderMap,
@@ -1071,19 +1108,9 @@ mod tests {
                 .body(Body::from(r#"{"error":"official quota exhausted"}"#))
                 .unwrap()
         }
-        async fn cpa(
-            State(capture): State<TestCapture>,
-            headers: HeaderMap,
-            Json(body): Json<Value>,
-        ) -> Response<Body> {
-            capture.0.lock().await.push((headers, body));
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/event-stream")
-                .body(Body::from(
-                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cpa_review\",\"status\":\"completed\",\"output\":[]}}\n\n",
-                ))
-                .unwrap()
+        async fn cpa(State(capture): State<TestCapture>) -> StatusCode {
+            capture.0.lock().await.push((HeaderMap::new(), Value::Null));
+            StatusCode::OK
         }
 
         let official_capture = TestCapture::default();
@@ -1106,7 +1133,7 @@ mod tests {
 
         let response = reqwest::Client::new()
             .post(format!("http://{proxy_address}/v1/responses"))
-            .header("x-modelmux-token", "proxy")
+            .header("x-codexmux-token", "proxy")
             .header(header::AUTHORIZATION, "Bearer oauth")
             .header("chatgpt-account-id", "account")
             .header("x-api-key", "incoming-secret")
@@ -1117,14 +1144,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()[header::CONTENT_TYPE],
-            "text/event-stream"
-        );
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             response.text().await.unwrap(),
-            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cpa_review\",\"status\":\"completed\",\"output\":[]}}\n\n"
+            r#"{"error":"official quota exhausted"}"#
         );
         let official = official_capture.0.lock().await;
         assert_eq!(official.len(), 1);
@@ -1133,12 +1156,7 @@ mod tests {
         assert_ne!(official[0].0[header::AUTHORIZATION], "Bearer cpa-secret");
         assert_eq!(official[0].1["model"], catalog::AUTO_REVIEW_MODEL);
         drop(official);
-        let cpa = cpa_capture.0.lock().await;
-        assert_eq!(cpa.len(), 1);
-        assert_eq!(cpa[0].0[header::AUTHORIZATION], "Bearer cpa-secret");
-        assert!(!cpa[0].0.contains_key("chatgpt-account-id"));
-        assert!(!cpa[0].0.contains_key("x-api-key"));
-        assert_eq!(cpa[0].1["model"], "codex-auto-review");
+        assert!(cpa_capture.0.lock().await.is_empty());
 
         proxy_handle.abort();
         official_handle.abort();
@@ -1197,7 +1215,7 @@ mod tests {
         let (proxy_address, proxy_handle) = spawn_test_app(router(state)).await;
         let response = reqwest::Client::new()
             .post(format!("http://{proxy_address}/v1/responses"))
-            .header("x-modelmux-token", "proxy")
+            .header("x-codexmux-token", "proxy")
             .header(header::AUTHORIZATION, "Bearer oauth")
             .json(&json!({
                 "model":catalog::AUTO_REVIEW_MODEL, "input":"review", "stream":false
@@ -1216,7 +1234,7 @@ mod tests {
         assert_eq!(cpa[0].1["model"], "glm-5.3-flash");
         drop(cpa);
 
-        // Clearing the override restores official-first behavior (official gets contacted).
+        // Clearing the override restores the official route.
         let profiles_path = root.path().join("cpa-profiles.toml");
         crate::cpa::set_review_override(&profiles_path, None).unwrap();
         let state2 = auto_review_state(root.path(), official_address, cpa_address);
@@ -1224,7 +1242,7 @@ mod tests {
 
         let response = reqwest::Client::new()
             .post(format!("http://{proxy_address2}/v1/responses"))
-            .header("x-modelmux-token", "proxy")
+            .header("x-codexmux-token", "proxy")
             .header(header::AUTHORIZATION, "Bearer oauth")
             .json(&json!({
                 "model":catalog::AUTO_REVIEW_MODEL, "input":"review", "stream":false
@@ -1232,13 +1250,137 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(official_capture.0.lock().await.len(), 1);
 
         proxy_handle.abort();
         official_handle.abort();
         cpa_handle.abort();
         proxy_handle2.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_route_is_catalog_bound_and_credential_isolated() {
+        async fn direct(
+            State(capture): State<TestCapture>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            capture.0.lock().await.push((headers, body.clone()));
+            Json(json!({
+                "id":"resp_direct", "status":"completed", "model":body["model"], "output":[]
+            }))
+        }
+
+        let direct_capture = TestCapture::default();
+        let (direct_address, direct_handle) = spawn_test_app(
+            Router::new()
+                .route("/v1/responses", post(direct))
+                .with_state(direct_capture.clone()),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let credentials = Credentials {
+            proxy_token: "proxy".into(),
+            cpa_token: "cpa-secret".into(),
+            cpa_management_key: "management-secret".into(),
+        };
+        crate::secrets::save(&root.path().join("credentials.json"), &credentials).unwrap();
+        let paths = crate::config::Paths::from_root(root.path().to_owned());
+        crate::cpa::set_direct_routes(
+            &paths,
+            vec![crate::cpa::DirectRoute {
+                base_url: format!("http://{direct_address}/v1"),
+                token: "direct-secret".into(),
+                models: vec!["direct-model".into(), "not-in-catalog".into()],
+                model_aliases: std::collections::BTreeMap::from([(
+                    "mapped-model".into(),
+                    "provider/native-model".into(),
+                )]),
+            }],
+        )
+        .unwrap();
+
+        let catalog_path = root.path().join("catalog.json");
+        CatalogStore::load(catalog_path.clone())
+            .unwrap()
+            .replace(
+                &json!({"models":[]}),
+                &json!({"models":[{"slug":"direct-model"}]}),
+                &[],
+            )
+            .unwrap();
+        let state = AppState::new(
+            Settings::default(),
+            credentials,
+            catalog_path,
+            paths.cpa_profiles,
+        )
+        .unwrap();
+        let (proxy_address, proxy_handle) = spawn_test_app(router(state)).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .header("x-codexmux-token", "proxy")
+            .header(header::AUTHORIZATION, "Bearer official-oauth")
+            .header("chatgpt-account-id", "official-account")
+            .header("x-api-key", "incoming-secret")
+            .json(&json!({"model":"cpa/direct-model","input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = direct_capture.0.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0[header::AUTHORIZATION], "Bearer direct-secret");
+        assert!(!captured[0].0.contains_key("chatgpt-account-id"));
+        assert!(!captured[0].0.contains_key("x-api-key"));
+        assert_ne!(captured[0].0[header::AUTHORIZATION], "Bearer cpa-secret");
+        assert_eq!(captured[0].1["model"], "direct-model");
+        drop(captured);
+
+        let unknown = client
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .header("x-codexmux-token", "proxy")
+            .json(&json!({"model":"cpa/unknown-model","input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(direct_capture.0.lock().await.len(), 1);
+
+        // A declared direct model routes even when absent from the stored
+        // catalog snapshot, so direct endpoints work without CPA.
+        let declared = client
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .header("x-codexmux-token", "proxy")
+            .json(&json!({"model":"cpa/not-in-catalog","input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(declared.status(), StatusCode::OK);
+        assert_eq!(direct_capture.0.lock().await.len(), 2);
+        assert_eq!(
+            direct_capture.0.lock().await[1].1["model"],
+            "not-in-catalog"
+        );
+
+        let mapped = client
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .header("x-codexmux-token", "proxy")
+            .json(&json!({"model":"cpa/mapped-model","input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(mapped.status(), StatusCode::OK);
+        assert_eq!(direct_capture.0.lock().await.len(), 3);
+        assert_eq!(
+            direct_capture.0.lock().await[2].1["model"],
+            "provider/native-model"
+        );
+
+        proxy_handle.abort();
+        direct_handle.abort();
     }
 
     #[tokio::test]
@@ -1281,6 +1423,7 @@ mod tests {
             Credentials {
                 proxy_token: "proxy".into(),
                 cpa_token: "cpa-secret".into(),
+                cpa_management_key: "management-secret".into(),
             },
             root.path().join("catalog.json"),
             root.path().join("cpa-profiles.toml"),
@@ -1322,6 +1465,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn valid_cpa_catalog_omission_keeps_the_previous_model_routable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn official() -> Json<Value> {
+            Json(json!({"models":[{"slug":"official","priority":1}]}))
+        }
+        async fn cpa(State(calls): State<Arc<AtomicUsize>>) -> Json<Value> {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Json(json!({"models":[{
+                    "slug":"glm-5.3-uni", "display_name":"GLM 5.3 Uni",
+                    "context_window":202_752
+                }]}))
+            } else {
+                // CPA cooling can return HTTP 200 with a structurally valid
+                // catalog that temporarily omits the affected model.
+                Json(json!({"models":[]}))
+            }
+        }
+
+        let (official_address, official_handle) =
+            spawn_test_app(Router::new().route("/models", get(official))).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (cpa_address, cpa_handle) = spawn_test_app(
+            Router::new()
+                .route("/v1/models", get(cpa))
+                .with_state(calls),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Settings {
+                cpa: crate::config::Cpa {
+                    base_url: format!("http://{cpa_address}/v1"),
+                },
+                ..Settings::default()
+            },
+            Credentials {
+                proxy_token: "proxy".into(),
+                cpa_token: "cpa-secret".into(),
+                cpa_management_key: "management-secret".into(),
+            },
+            root.path().join("catalog.json"),
+            root.path().join("cpa-profiles.toml"),
+        )
+        .unwrap();
+        let official_headers = router::official_headers(&HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer oauth"),
+        )]))
+        .unwrap();
+        let cpa_headers =
+            router::cpa_headers(&HeaderMap::new(), &state.credentials.cpa_token).unwrap();
+        let official_url = models_url(&format!("http://{official_address}"), "test").unwrap();
+        let cpa_url = models_url(&format!("http://{cpa_address}/v1"), "test").unwrap();
+
+        refresh_catalog_from_urls(
+            &state,
+            official_headers.clone(),
+            cpa_headers.clone(),
+            official_url.clone(),
+            cpa_url.clone(),
+        )
+        .await
+        .unwrap();
+        let after_omission =
+            refresh_catalog_from_urls(&state, official_headers, cpa_headers, official_url, cpa_url)
+                .await
+                .unwrap();
+        let retained = after_omission["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "cpa/glm-5.3-uni")
+            .unwrap();
+        assert_eq!(retained["display_name"], "GLM 5.3 Uni · CPA");
+        assert_eq!(retained["context_window"], 202_752);
+        assert_eq!(
+            state.catalog.resolve("cpa/glm-5.3-uni").unwrap(),
+            CatalogRoute::Cpa {
+                upstream_model: "glm-5.3-uni".into()
+            }
+        );
+
+        official_handle.abort();
+        cpa_handle.abort();
+    }
+
+    #[tokio::test]
     async fn models_endpoint_serves_saved_snapshot_when_refresh_fails() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("catalog.json");
@@ -1329,6 +1560,7 @@ mod tests {
         seed.replace(
             &json!({"models":[{"slug":"official-saved"}]}),
             &json!({"models":[{"slug":"cpa-saved"}]}),
+            &[],
         )
         .unwrap();
         drop(seed);
@@ -1342,6 +1574,7 @@ mod tests {
             Credentials {
                 proxy_token: "proxy".into(),
                 cpa_token: "cpa".into(),
+                cpa_management_key: "management".into(),
             },
             path,
             root.path().join("cpa-profiles.toml"),
@@ -1364,6 +1597,83 @@ mod tests {
         let response = state.catalog.current().unwrap();
         assert_eq!(response["models"][0]["slug"], "official-saved");
         assert_eq!(response["models"][1]["slug"], "cpa/cpa-saved");
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_degrades_to_official_plus_direct_when_cpa_is_down() {
+        async fn official(Query(query): Query<ModelsQuery>, _headers: HeaderMap) -> Json<Value> {
+            assert_eq!(query.client_version, "degraded");
+            Json(json!({"models":[{"slug":"gpt-5.6", "priority":1}]}))
+        }
+        let (official_address, official_handle) =
+            spawn_test_app(Router::new().route("/models", get(official))).await;
+
+        let root = tempfile::tempdir().unwrap();
+        let credentials = Credentials {
+            proxy_token: "proxy".into(),
+            cpa_token: "cpa-secret".into(),
+            cpa_management_key: "management-secret".into(),
+        };
+        crate::secrets::save(&root.path().join("credentials.json"), &credentials).unwrap();
+        let paths = crate::config::Paths::from_root(root.path().to_owned());
+        crate::cpa::add_direct_route(
+            &paths,
+            "https://direct.example/v1".into(),
+            "direct-secret".into(),
+            vec!["gpt-5.6-sol".into()],
+        )
+        .unwrap();
+
+        // No stored snapshot: the fresh state has never seen a catalog.
+        let declared = crate::cpa::declared_direct_models(&paths.cpa_profiles);
+        let state = AppState::new(
+            Settings {
+                cpa: crate::config::Cpa {
+                    // Port 9 (discard) is unreachable: CPA is down.
+                    base_url: "http://127.0.0.1:9/v1".into(),
+                },
+                ..Settings::default()
+            },
+            credentials,
+            root.path().join("catalog.json"),
+            paths.cpa_profiles,
+        )
+        .unwrap();
+
+        let catalog = refresh_catalog_from_urls(
+            &state,
+            router::official_headers(&HeaderMap::from_iter([(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer oauth"),
+            )]))
+            .unwrap(),
+            router::cpa_headers(&HeaderMap::new(), &state.credentials.cpa_token).unwrap(),
+            models_url(&format!("http://{official_address}"), "degraded").unwrap(),
+            models_url("http://127.0.0.1:9/v1", "degraded").unwrap(),
+        )
+        .await
+        .unwrap();
+        let slugs: Vec<&str> = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["slug"].as_str().unwrap())
+            .collect();
+        assert_eq!(slugs, vec!["gpt-5.6", "cpa/gpt-5.6-sol"]);
+        // The degraded view is not persisted as a snapshot.
+        assert!(state.catalog.current().is_none());
+        // Declared direct models still resolve without any snapshot.
+        assert_eq!(
+            state
+                .catalog
+                .resolve_with_direct("cpa/gpt-5.6-sol", &declared)
+                .unwrap(),
+            CatalogRoute::Cpa {
+                upstream_model: "gpt-5.6-sol".into()
+            }
+        );
+
+        official_handle.abort();
     }
 
     #[test]

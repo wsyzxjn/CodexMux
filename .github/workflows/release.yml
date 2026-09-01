@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish macOS release
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out tagged revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Update Rust stable
+        run: rustup update stable
+
+      - name: Validate tag and project versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          cargo_version="$(sed -nE 's/^version = "([^"]+)"$/\1/p' Cargo.toml | head -1)"
+          app_version="$(plutil -extract CFBundleShortVersionString raw menubar/Resources/Info.plist)"
+          test "$tag" = "v$version"
+          test "$version" = "$cargo_version"
+          test "$version" = "$app_version"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Rust
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+
+      - name: Build release artifacts
+        run: |
+          rustup target add aarch64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          menubar/package-app.sh release arm64
+
+      - name: Package release artifacts
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          arch="arm64"
+          bundle="codexmux-${VERSION}-macos-${arch}"
+          mkdir -p "dist/$bundle"
+          install -m 755 target/aarch64-apple-darwin/release/codexmux \
+            "dist/$bundle/codexmux"
+          install -m 644 README.md LICENSE "dist/$bundle/"
+          tar -C dist -czf "dist/$bundle.tar.gz" "$bundle"
+          rm -r "dist/$bundle"
+          ditto -c -k --sequesterRsrc --keepParent \
+            menubar/.build/release/CodexMux.app \
+            "dist/CodexMux-${VERSION}-macos-${arch}.zip"
+          cd dist
+          shasum -a 256 ./*.tar.gz ./*.zip > SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

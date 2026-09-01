@@ -13,6 +13,8 @@ pub const DEFAULT_PORT: u16 = 48682;
 pub const DEFAULT_CPA_BASE_URL: &str = "http://127.0.0.1:8317/v1";
 pub const OFFICIAL_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const CPA_MODEL_PREFIX: &str = "cpa/";
+pub const HOME_ENV: &str = "CODEXMUX_HOME";
+const DATA_DIR_NAME: &str = "CodexMux";
 
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -27,12 +29,10 @@ pub struct Paths {
 
 impl Paths {
     pub fn discover() -> Result<Self> {
-        let root = if let Some(root) = std::env::var_os("MODELMUX_HOME") {
-            PathBuf::from(root)
+        let root = if let Some(root) = env_root(HOME_ENV)? {
+            root
         } else {
-            dirs::data_dir()
-                .context("cannot locate the user data directory")?
-                .join("ModelMux")
+            default_root(&dirs::data_dir().context("cannot locate the user data directory")?)
         };
         Ok(Self::from_root(root))
     }
@@ -55,6 +55,18 @@ impl Paths {
     }
 }
 
+fn env_root(name: &str) -> Result<Option<PathBuf>> {
+    let Some(root) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(!root.is_empty(), "{name} must not be empty");
+    Ok(Some(PathBuf::from(root)))
+}
+
+fn default_root(data_dir: &Path) -> PathBuf {
+    data_dir.join(DATA_DIR_NAME)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
@@ -74,7 +86,7 @@ impl Default for Settings {
 impl Settings {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        let settings: Self = toml::from_slice(&bytes).context("invalid ModelMux config.toml")?;
+        let settings: Self = toml::from_slice(&bytes).context("invalid CodexMux config.toml")?;
         settings.validate()?;
         Ok(settings)
     }
@@ -107,6 +119,12 @@ impl Default for Cpa {
 }
 
 impl Cpa {
+    pub fn is_loopback(&self) -> bool {
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .is_some_and(|url| is_loopback_host(url.host_str()))
+    }
+
     pub fn validate(&self) -> Result<()> {
         let url = reqwest::Url::parse(&self.base_url).context("CPA has an invalid base_url")?;
         if !matches!(url.scheme(), "http" | "https") {
@@ -122,6 +140,51 @@ impl Cpa {
             bail!("CPA base_url must not contain a query or fragment");
         }
         Ok(())
+    }
+
+    /// Return the CPA management page corresponding to this API base URL.
+    /// CPA serves its management UI at the service root, while CodexMux
+    /// normally stores the Responses API root with a trailing `/v1`.
+    pub fn management_url(&self) -> Result<reqwest::Url> {
+        self.validate()?;
+        let mut url = reqwest::Url::parse(&self.base_url).context("CPA has an invalid base_url")?;
+        let path = url.path().trim_end_matches('/');
+        let prefix = path.strip_suffix("/v1").unwrap_or(path);
+        let management_path = if prefix.is_empty() {
+            "/management.html".to_owned()
+        } else {
+            format!("{prefix}/management.html")
+        };
+        url.set_path(&management_path);
+        Ok(url)
+    }
+
+    /// Origin the management UI should call for `/v0/management`.
+    pub fn management_api_base(&self) -> Result<String> {
+        let mut base = self.management_url()?;
+        let path = base
+            .path()
+            .trim_end_matches("/management.html")
+            .trim_end_matches('/')
+            .to_owned();
+        base.set_query(None);
+        base.set_fragment(None);
+        base.set_path(if path.is_empty() { "/" } else { &path });
+        Ok(base.as_str().trim_end_matches('/').to_owned())
+    }
+
+    /// Loopback management URL with login query so the bundled Web UI can
+    /// auto-fill the current endpoint and management key. Remote endpoints
+    /// keep a bare page URL; CodexMux must not put their key in a query.
+    pub fn management_connect_url(&self, management_key: &str) -> Result<reqwest::Url> {
+        let mut url = self.management_url()?;
+        if self.is_loopback() && !management_key.trim().is_empty() {
+            let api_base = self.management_api_base()?;
+            url.query_pairs_mut()
+                .append_pair("cmb", &api_base)
+                .append_pair("cmk", management_key);
+        }
+        Ok(url)
     }
 }
 
@@ -144,6 +207,8 @@ fn is_loopback_host(host: Option<&str>) -> bool {
 pub struct Credentials {
     pub proxy_token: String,
     pub cpa_token: String,
+    #[serde(default)]
+    pub cpa_management_key: String,
 }
 
 impl Credentials {
@@ -154,8 +219,21 @@ impl Credentials {
         if self.cpa_token.trim().is_empty() {
             bail!("CPA token must not be empty");
         }
-        if self.proxy_token == self.cpa_token {
-            bail!("proxy token and CPA token must be different");
+        if self.cpa_management_key.trim().is_empty() {
+            bail!("CPA management key must not be empty");
+        }
+        if !self
+            .cpa_management_key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        {
+            bail!("CPA management key contains unsupported characters");
+        }
+        if self.proxy_token == self.cpa_token
+            || self.proxy_token == self.cpa_management_key
+            || self.cpa_token == self.cpa_management_key
+        {
+            bail!("proxy token, CPA token, and CPA management key must be different");
         }
         Ok(())
     }
@@ -163,12 +241,22 @@ impl Credentials {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
+
+    #[test]
+    fn default_data_root_is_codexmux() {
+        let data = tempdir().unwrap();
+        assert_eq!(default_root(data.path()), data.path().join(DATA_DIR_NAME));
+    }
 
     #[test]
     fn cpa_allows_remote_https_and_local_http_without_url_state() {
         let mut settings = Settings::default();
+        assert!(settings.cpa.is_loopback());
         settings.cpa.base_url = "https://cpa.example.com/v1".into();
+        assert!(!settings.cpa.is_loopback());
         assert!(settings.validate().is_ok());
         settings.cpa.base_url = "http://cpa.example.com/v1".into();
         assert!(settings.validate().is_err());
@@ -176,5 +264,54 @@ mod tests {
         assert!(settings.validate().is_err());
         settings.cpa.base_url = "http://[::1]:8317/v1".into();
         assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn cpa_management_url_maps_api_root_to_service_root() {
+        let cpa = Cpa {
+            base_url: "http://127.0.0.1:8317/v1/".into(),
+        };
+        assert_eq!(
+            cpa.management_url().unwrap().as_str(),
+            "http://127.0.0.1:8317/management.html"
+        );
+        assert_eq!(cpa.management_api_base().unwrap(), "http://127.0.0.1:8317");
+
+        let cpa = Cpa {
+            base_url: "https://cpa.example.com/proxy/v1".into(),
+        };
+        assert_eq!(
+            cpa.management_url().unwrap().as_str(),
+            "https://cpa.example.com/proxy/management.html"
+        );
+        assert_eq!(
+            cpa.management_api_base().unwrap(),
+            "https://cpa.example.com/proxy"
+        );
+    }
+
+    #[test]
+    fn loopback_management_connect_url_carries_current_endpoint() {
+        let cpa = Cpa {
+            base_url: "http://127.0.0.1:8317/v1".into(),
+        };
+        let url = cpa.management_connect_url("mgmt-key").unwrap();
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.path(), "/management.html");
+        let query: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert!(query.contains(&("cmb".into(), "http://127.0.0.1:8317".into())));
+        assert!(query.contains(&("cmk".into(), "mgmt-key".into())));
+
+        let remote = Cpa {
+            base_url: "https://cpa.example.com/v1".into(),
+        };
+        assert_eq!(
+            remote.management_connect_url("mgmt-key").unwrap().as_str(),
+            "https://cpa.example.com/management.html"
+        );
     }
 }
