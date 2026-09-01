@@ -51,7 +51,7 @@ jobs:
         run: |
           rustup target add aarch64-apple-darwin
           cargo build --locked --release --target aarch64-apple-darwin
-          menubar/package-app.sh release arm64
+          menubar/package-app.sh release arm64 target/aarch64-apple-darwin/release/codexmux
 
       - name: Package release artifacts
         shell: bash

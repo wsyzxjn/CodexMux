@@ -187,7 +187,9 @@ async fn main() -> Result<()> {
         Command::Status => status(&paths),
         Command::Doctor => doctor(&paths).await,
         Command::Install => {
+            ensure_initialized(&paths)?;
             let settings = Settings::load(&paths.settings)?;
+            let credentials = secrets::load(&paths.credentials)?;
             // Enable the Codex configuration from the caller's context: the
             // LaunchAgent runs serve --no-codex-config because background
             // processes may be denied access to the Codex config's volume by
@@ -196,13 +198,18 @@ async fn main() -> Result<()> {
             let lease = manager.enable(&format!("http://{}/v1", settings.listen))?;
             let executable = std::env::current_exe()?.canonicalize()?;
             let install_result =
-                launch_agent::install(&paths, &executable, &codex_config_path()?, settings.listen)
-                    .map(|plist| {
-                        println!("installed {}", plist.display());
-                    });
+                launch_agent::install(&paths, &executable, &codex_config_path()?, settings.listen);
             // Keep the configuration enabled only when the agent was installed.
             match install_result {
-                Ok(()) => {
+                Ok(plist) => {
+                    if let Err(error) = set_launchctl_proxy_token(&credentials.proxy_token) {
+                        launch_agent::uninstall().ok();
+                        lease.restore().ok();
+                        return Err(error).context(
+                            "failed to prepare the Codex environment; installation rolled back",
+                        );
+                    }
+                    println!("installed {}", plist.display());
                     std::mem::forget(lease);
                     Ok(())
                 }
@@ -218,6 +225,21 @@ async fn main() -> Result<()> {
 }
 
 fn init(paths: &Paths) -> Result<()> {
+    ensure_initialized(paths)?;
+    println!("initialized {}", paths.root.display());
+    println!(
+        "edit {} to configure the CPA endpoint",
+        paths.settings.display()
+    );
+    println!(
+        "set cpa_token in {} to the token accepted by CPA",
+        paths.credentials.display()
+    );
+    println!("set {PROXY_TOKEN_ENV} from credentials.json before starting Codex");
+    Ok(())
+}
+
+fn ensure_initialized(paths: &Paths) -> Result<()> {
     paths.ensure()?;
     if !paths.settings.exists() {
         Settings::default().save(&paths.settings)?;
@@ -232,16 +254,23 @@ fn init(paths: &Paths) -> Result<()> {
             },
         )?;
     }
-    println!("initialized {}", paths.root.display());
-    println!(
-        "edit {} to configure the CPA endpoint",
-        paths.settings.display()
-    );
-    println!(
-        "set cpa_token in {} to the token accepted by CPA",
-        paths.credentials.display()
-    );
-    println!("set {PROXY_TOKEN_ENV} from credentials.json before starting Codex");
+    Ok(())
+}
+
+fn set_launchctl_proxy_token(token: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("launchctl")
+            .args(["setenv", PROXY_TOKEN_ENV, token])
+            .status()
+            .context("failed to run launchctl setenv")?;
+        anyhow::ensure!(
+            status.success(),
+            "launchctl setenv {PROXY_TOKEN_ENV} failed with {status}"
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = token;
     Ok(())
 }
 
@@ -377,6 +406,22 @@ fn uninstall(paths: &Paths) -> Result<()> {
     if was_managed {
         println!("restored Codex configuration");
     }
+    unset_launchctl_proxy_token()?;
+    Ok(())
+}
+
+fn unset_launchctl_proxy_token() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("launchctl")
+            .args(["unsetenv", PROXY_TOKEN_ENV])
+            .status()
+            .context("failed to run launchctl unsetenv")?;
+        anyhow::ensure!(
+            status.success(),
+            "launchctl unsetenv {PROXY_TOKEN_ENV} failed with {status}"
+        );
+    }
     Ok(())
 }
 
@@ -404,7 +449,7 @@ async fn doctor(paths: &Paths) -> Result<()> {
     let settings = Settings::load(&paths.settings).context("settings check failed")?;
     let credentials = secrets::load(&paths.credentials).context("credentials check failed")?;
     anyhow::ensure!(
-        std::env::var(PROXY_TOKEN_ENV).as_deref() == Ok(credentials.proxy_token.as_str()),
+        proxy_token_is_available(&credentials.proxy_token),
         "{PROXY_TOKEN_ENV} is missing or does not match credentials.json"
     );
     let status = config_manager(paths)?.status()?;
@@ -449,6 +494,24 @@ async fn doctor(paths: &Paths) -> Result<()> {
         }
     );
     Ok(())
+}
+
+fn proxy_token_is_available(expected: &str) -> bool {
+    if std::env::var(PROXY_TOKEN_ENV).as_deref() == Ok(expected) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("launchctl")
+            .args(["getenv", PROXY_TOKEN_ENV])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).trim() == expected
+            })
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
 }
 
 fn config_manager(paths: &Paths) -> Result<ConfigManager> {
@@ -778,4 +841,41 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
 
 fn codex_config_path() -> Result<PathBuf> {
     codexmux::codex_config::codex_config_path()
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn initialization_creates_private_state_and_preserves_it() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("CodexMux"));
+
+        ensure_initialized(&paths).unwrap();
+        let first_settings = std::fs::read(&paths.settings).unwrap();
+        let first_credentials = std::fs::read(&paths.credentials).unwrap();
+        let credentials = secrets::load(&paths.credentials).unwrap();
+        credentials.validate().unwrap();
+
+        ensure_initialized(&paths).unwrap();
+        assert_eq!(std::fs::read(&paths.settings).unwrap(), first_settings);
+        assert_eq!(
+            std::fs::read(&paths.credentials).unwrap(),
+            first_credentials
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&paths.credentials)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 }

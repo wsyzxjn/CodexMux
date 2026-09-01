@@ -15,6 +15,7 @@ struct L10n {
     let startCPA: String
     let stopCPA: String
     let installCPA: String
+    let installingCPA: String
     let cpaAutostart: String
     let openLogs: String
     let openCpaManagement: String
@@ -63,7 +64,8 @@ struct L10n {
         stopCodexMux: "Stop CodexMux",
         startCPA: "Start CPA service",
         stopCPA: "Stop CPA service",
-        installCPA: "Install CPA…",
+        installCPA: "Download and Enable CPA…",
+        installingCPA: "Downloading and enabling CPA…",
         cpaAutostart: "Start CPA with CodexMux",
         openLogs: "Open Logs Folder",
         openCpaManagement: "Open CPA Web Management",
@@ -113,7 +115,8 @@ struct L10n {
         stopCodexMux: "停止 CodexMux",
         startCPA: "启动 CPA 服务",
         stopCPA: "停止 CPA 服务",
-        installCPA: "安装 CPA…",
+        installCPA: "下载并启用 CPA…",
+        installingCPA: "正在下载并启用 CPA…",
         cpaAutostart: "随 CodexMux 启动 CPA",
         openLogs: "打开日志文件夹",
         openCpaManagement: "打开 CPA Web 管理",
@@ -209,9 +212,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
-    private let codexmuxURL = URL(fileURLWithPath: NSString(
-        string: "~/.local/bin/codexmux"
-    ).expandingTildeInPath)
+    /// Release builds are self-contained. Copy the bundled CLI to a stable
+    /// private runtime path so LaunchAgents keep working if the App is moved.
+    private lazy var codexmuxURL: URL = {
+        if let bundled = Bundle.main.url(forResource: "codexmux", withExtension: nil) {
+            let runtimeDirectory = URL(fileURLWithPath: codexmuxHome, isDirectory: true)
+                .appendingPathComponent("bin", isDirectory: true)
+            let runtime = runtimeDirectory.appendingPathComponent("codexmux")
+            do {
+                try FileManager.default.createDirectory(
+                    at: runtimeDirectory,
+                    withIntermediateDirectories: true
+                )
+                let bundledData = try Data(contentsOf: bundled)
+                let installedData = try? Data(contentsOf: runtime)
+                if installedData != bundledData {
+                    try bundledData.write(to: runtime, options: .atomic)
+                }
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o755],
+                    ofItemAtPath: runtime.path
+                )
+                return runtime
+            } catch {
+                return bundled
+            }
+        }
+        return URL(fileURLWithPath: NSString(
+            string: "~/.local/bin/codexmux"
+        ).expandingTildeInPath)
+    }()
     private let codexmuxHome: String = {
         let environment = ProcessInfo.processInfo.environment
         if let configured = environment["CODEXMUX_HOME"], !configured.isEmpty {
@@ -226,6 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var proxyIdle = false
     private var cpaRunning = false
     private var cpaInstalled = false
+    private var cpaInstalling = false
     private var cpaAutostart: Bool?
     private var activeProfile: String?
     private var savedProfiles: [(name: String, baseURL: String)] = []
@@ -253,6 +284,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runCodexMuxDetached(["install"]) { [weak self] ok in
             if !ok {
                 self?.showAlert(self?.l10n.restartFailed ?? "")
+            } else {
+                self?.relaunchRunningCodex()
             }
             // launchd now wakes the proxy and an enabled local CPA only when
             // Codex Desktop or CLI actually connects.
@@ -304,6 +337,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         group.notify(queue: .main) { [weak self] in
             self?.updateIcon()
             self?.rebuildMenu()
+        }
+    }
+
+    /// `codexmux install` places the private proxy token in the current GUI
+    /// launchd environment. A running Codex process cannot observe that new
+    /// value, so restart only an already-running Desktop app. If Codex was not
+    /// open, its next launch naturally inherits the prepared environment.
+    private func relaunchRunningCodex() {
+        let applications = NSRunningApplication.runningApplications(
+            withBundleIdentifier: "com.openai.codex"
+        )
+        guard let application = applications.first,
+              let bundleURL = application.bundleURL else { return }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        if !application.terminate() {
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            for _ in 0..<50 {
+                if application.isTerminated { break }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            guard application.isTerminated else { return }
+            DispatchQueue.main.async {
+                NSWorkspace.shared.openApplication(
+                    at: bundleURL,
+                    configuration: configuration
+                )
+            }
         }
     }
 
@@ -470,10 +535,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stopCPAItem.isEnabled = cpaRunning
             controls.addItem(stopCPAItem)
         } else {
-            let installItem = NSMenuItem(title: l10n.installCPA, action: #selector(installCPA),
+            let installItem = NSMenuItem(title: cpaInstalling ? l10n.installingCPA : l10n.installCPA,
+                                         action: #selector(installCPA),
                                          keyEquivalent: "")
             installItem.target = self
-            installItem.isEnabled = true
+            installItem.isEnabled = !cpaInstalling
             controls.addItem(installItem)
         }
 
@@ -577,12 +643,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                        action: #selector(openCpaManagement),
                                        keyEquivalent: "")
         cpaManagement.target = self
+        cpaManagement.isEnabled = cpaInstalled
         menu.addItem(cpaManagement)
 
         let copyManagementKey = NSMenuItem(title: l10n.copyCpaManagementKey,
                                            action: #selector(copyCpaManagementKey),
                                            keyEquivalent: "")
         copyManagementKey.target = self
+        copyManagementKey.isEnabled = cpaInstalled
         menu.addItem(copyManagementKey)
 
         // Language submenu with the three options; checkmark marks the active one.
@@ -680,9 +748,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func installCPA() {
+        guard !cpaInstalling else { return }
+        cpaInstalling = true
+        rebuildMenu()
         runCodexMuxDetached(["cpa", "install"]) { [weak self] ok in
+            self?.cpaInstalling = false
             if !ok {
                 self?.showAlert(self?.l10n.installCPAFailed ?? "")
+            } else {
+                // Installation also starts CPA and enables autostart. Hand
+                // off directly to its Web UI for provider credentials.
+                self?.openCpaManagement()
             }
             self?.refreshStatus()
         }

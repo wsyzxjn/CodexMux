@@ -38,11 +38,12 @@ jobs:
         run: cargo build --locked --release
 
       - name: Package menu bar app
-        run: menubar/package-app.sh release
+        run: menubar/package-app.sh release "" target/release/codexmux
 
       - name: Verify menu bar app
         run: |
           app="menubar/.build/release/CodexMux.app"
           test -x "$app/Contents/MacOS/CodexMux"
+          test -x "$app/Contents/Resources/codexmux"
           plutil -lint "$app/Contents/Info.plist"
           codesign --verify --deep --strict "$app"

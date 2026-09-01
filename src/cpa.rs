@@ -20,10 +20,10 @@ use crate::{
 /// GitHub repository that publishes the CLIProxyAPI release archive.
 pub const CPA_REPO: &str = "router-for-me/CLIProxyAPI";
 /// Pin the release CodexMux installs so catalog and wire behavior stay predictable.
-pub const CPA_VERSION: &str = "7.2.146";
-/// sha256 of `CLIProxyAPI_7.2.146_darwin_aarch64.tar.gz`, matching the published digest.
+pub const CPA_VERSION: &str = "7.2.147";
+/// sha256 of `CLIProxyAPI_7.2.147_darwin_aarch64.tar.gz`, matching the published digest.
 pub const CPA_DARWIN_AARCH64_SHA256: &str =
-    "faf4c735b289cb88344f87fd6d745cf9a11d28a231d000173d8045910503b543";
+    "4ac1db83b00591265ebb93a3277d812aaf6e45e8b21bb3b4786598520afdf4be";
 const CPA_BINARY_NAME: &str = "cli-proxy-api";
 const CPA_AGENT_LABEL: &str = "dev.codexmux.cpa";
 
