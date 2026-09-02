@@ -463,4 +463,99 @@ alias = \"gpt-5.6-terra\"
         let (active, _) = profiles(&paths);
         assert_eq!(active, None);
     }
+
+    #[test]
+    fn release_versions_compare_numeric_segments() {
+        assert!(ReleaseVersion::parse("7.2.148").unwrap() > ReleaseVersion::parse("7.2.147").unwrap());
+        assert!(ReleaseVersion::parse("7.10.0").unwrap() > ReleaseVersion::parse("7.9.9").unwrap());
+        assert!(ReleaseVersion::parse("v7.2.147").unwrap() == ReleaseVersion::parse("7.2.147").unwrap());
+        assert!(ReleaseVersion::parse("1.2").unwrap() < ReleaseVersion::parse("1.2.0").unwrap());
+        assert!(ReleaseVersion::parse("not-a-version").is_err());
+    }
+
+    #[test]
+    fn update_asset_names_match_platforms() {
+        assert_eq!(
+            asset_name_for("darwin_aarch64", "7.2.147"),
+            "CLIProxyAPI_7.2.147_darwin_aarch64.tar.gz"
+        );
+        assert_eq!(
+            asset_name_for("darwin_amd64", "7.2.147"),
+            "CLIProxyAPI_7.2.147_darwin_amd64.tar.gz"
+        );
+    }
+
+    #[test]
+    fn published_checksums_require_an_exact_asset_digest() {
+        let checksums = [
+            "0000000000000000000000000000000000000000000000000000000000000000  CLIProxyAPI_7.2.147_darwin_amd64.tar.gz",
+            "4ac1db83b00591265ebb93a3277d812aaf6e45e8b21bb3b4786598520afdf4be  CLIProxyAPI_7.2.147_darwin_aarch64.tar.gz",
+        ]
+        .join("\n");
+        assert_eq!(
+            checksum_for(&checksums, "CLIProxyAPI_7.2.147_darwin_aarch64.tar.gz").unwrap(),
+            "4ac1db83b00591265ebb93a3277d812aaf6e45e8b21bb3b4786598520afdf4be"
+        );
+        assert!(checksum_for(&checksums, "missing.tar.gz").is_err());
+        assert!(checksum_for("not-a-digest file.tar.gz", "file.tar.gz").is_err());
+    }
+
+    #[test]
+    fn asset_digest_parser_accepts_only_sha256_hex() {
+        let asset = GithubAsset {
+            name: "CLIProxyAPI_7.2.147_darwin_aarch64.tar.gz".into(),
+            browser_download_url: "https://example.com/asset".into(),
+            digest: Some(
+                "sha256:4ac1db83b00591265ebb93a3277d812aaf6e45e8b21bb3b4786598520afdf4be".into(),
+            ),
+        };
+        assert_eq!(
+            asset_digest(&asset).unwrap(),
+            "4ac1db83b00591265ebb93a3277d812aaf6e45e8b21bb3b4786598520afdf4be"
+        );
+        let no_digest = GithubAsset {
+            name: asset.name,
+            browser_download_url: asset.browser_download_url,
+            digest: None,
+        };
+        assert!(asset_digest(&no_digest).is_err());
+    }
+
+    #[test]
+    fn installed_version_reads_legacy_json_without_update_metadata() {
+        let paths = paths();
+        fs::create_dir_all(version_path(&paths).parent().unwrap()).unwrap();
+        fs::write(
+            version_path(&paths),
+            r#"{"version":"7.2.147","sha256":"4ac1db83b00591265ebb93a3277d812aaf6e45e8b21bb3b4786598520afdf4be"}"#,
+        )
+        .unwrap();
+        let installed = installed_version(&paths).unwrap();
+        assert_eq!(installed.version, "7.2.147");
+        assert!(installed.source.is_none());
+        assert!(installed.updated_at.is_none());
+    }
+
+    #[test]
+    fn update_snapshot_restores_previous_binary_and_version() {
+        let paths = paths();
+        fs::create_dir_all(version_path(&paths).parent().unwrap()).unwrap();
+        let binary = b"old binary";
+        let version = serde_json::to_vec(&InstalledVersion {
+            version: "7.2.147".into(),
+            sha256: "4ac1db83b00591265ebb93a3277d812aaf6e45e8b21bb3b4786598520afdf4be".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        fs::write(binary_path(&paths), binary).unwrap();
+        fs::write(version_path(&paths), &version).unwrap();
+        fs::rename(binary_path(&paths), previous_binary_path(&paths)).unwrap();
+        fs::rename(version_path(&paths), previous_version_path(&paths)).unwrap();
+
+        assert!(rollback_available(&paths));
+        restore_previous(&paths).unwrap();
+        assert_eq!(fs::read(binary_path(&paths)).unwrap(), binary);
+        assert_eq!(fs::read(version_path(&paths)).unwrap(), version);
+        assert!(!rollback_available(&paths));
+    }
 }

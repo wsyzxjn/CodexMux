@@ -1,13 +1,13 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use tar::Archive;
@@ -19,7 +19,7 @@ use crate::{
 
 /// GitHub repository that publishes the CLIProxyAPI release archive.
 pub const CPA_REPO: &str = "router-for-me/CLIProxyAPI";
-/// Pin the release CodexMux installs so catalog and wire behavior stay predictable.
+/// Offline archive fallback; normal `cpa install` resolves the latest stable release.
 pub const CPA_VERSION: &str = "7.2.147";
 /// sha256 of `CLIProxyAPI_7.2.147_darwin_aarch64.tar.gz`, matching the published digest.
 pub const CPA_DARWIN_AARCH64_SHA256: &str =
@@ -61,10 +61,16 @@ fn plist_path_for(label: &str) -> Result<PathBuf> {
         .join(format!("Library/LaunchAgents/{label}.plist")))
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct InstalledVersion {
     pub version: String,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 pub fn installed_version(paths: &Paths) -> Option<InstalledVersion> {
@@ -120,6 +126,7 @@ include!("cpa/install.rs");
 include!("cpa/managed_config.rs");
 include!("cpa/profiles.rs");
 include!("cpa/service.rs");
+include!("cpa/update.rs");
 
 #[cfg(test)]
 include!("cpa/tests.rs");

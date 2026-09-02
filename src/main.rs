@@ -49,12 +49,25 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CpaCommand {
-    /// Download, verify, and install the pinned CLIProxyAPI release, then start it.
+    /// Download, verify, and install the latest stable CLIProxyAPI release, then start it.
     Install {
         /// Install from a local release archive instead of downloading it.
         #[arg(long)]
         archive: Option<PathBuf>,
     },
+    /// Query the latest stable CLIProxyAPI release without installing it.
+    UpdateCheck,
+    /// Update the managed local CPA to the latest stable CLIProxyAPI release.
+    Update {
+        /// Specific stable version to install, for example 7.2.147.
+        #[arg(long)]
+        version: Option<String>,
+        /// Resolve and verify the release without replacing the installed binary.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Restore the previous CPA binary after an update.
+    Rollback,
     /// Start the CPA LaunchAgent (installs the managed config).
     Start,
     /// Bring the CPA service in line with the saved startup preference:
@@ -169,8 +182,7 @@ enum CpaCommand {
     Uninstall,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -183,9 +195,9 @@ async fn main() -> Result<()> {
         Command::Serve {
             no_codex_config,
             launchd_socket,
-        } => serve(&paths, no_codex_config, launchd_socket).await,
+        } => run_async(serve(&paths, no_codex_config, launchd_socket)),
         Command::Status => status(&paths),
-        Command::Doctor => doctor(&paths).await,
+        Command::Doctor => run_async(doctor(&paths)),
         Command::Install => {
             ensure_initialized(&paths)?;
             let settings = Settings::load(&paths.settings)?;
@@ -222,6 +234,17 @@ async fn main() -> Result<()> {
         Command::Uninstall => uninstall(&paths),
         Command::Cpa { command } => cpa(&paths, command),
     }
+}
+
+fn run_async<F>(future: F) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the async runtime")?;
+    runtime.block_on(future)
 }
 
 fn init(paths: &Paths) -> Result<()> {
@@ -540,7 +563,9 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             }
             println!(
                 "CLIProxyAPI {} installed at {}",
-                codexmux::cpa::CPA_VERSION,
+                codexmux::cpa::installed_version(paths)
+                    .map(|version| version.version)
+                    .unwrap_or_else(|| codexmux::cpa::CPA_VERSION.to_owned()),
                 codexmux::cpa::binary_path(paths).display()
             );
             println!("config: {}", codexmux::cpa::config_path(paths).display());
@@ -548,6 +573,57 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
                 "service: started ({}); logs: {}/logs/cpa-*.log",
                 codexmux::cpa::agent_label(),
                 paths.root.display()
+            );
+        }
+        CpaCommand::UpdateCheck => {
+            let check = codexmux::cpa::check_cpa_update(paths, None)?;
+            println!(
+                "current: {}",
+                check.current_version.as_deref().unwrap_or("not installed")
+            );
+            println!("latest: {}", check.latest_version);
+            println!("update available: {}", check.update_available);
+        }
+        CpaCommand::Update { version, dry_run } => {
+            anyhow::ensure!(
+                settings.cpa.is_loopback(),
+                "CPA update only applies to the managed local CLIProxyAPI; remote profiles are not updated"
+            );
+            let credentials = secrets::load(&paths.credentials)?;
+            let outcome = codexmux::cpa::update_cpa(
+                paths,
+                &settings.cpa,
+                &credentials.cpa_token,
+                version.as_deref(),
+                dry_run,
+            )?;
+            if outcome.dry_run {
+                println!("current: {}", outcome.from_version);
+                println!("target: {}", outcome.to_version);
+                println!("dry run: true");
+                println!(
+                    "change: {}",
+                    if outcome.changed { "available" } else { "none" }
+                );
+            } else {
+                println!(
+                    "updated CPA {} -> {}",
+                    outcome.from_version, outcome.to_version
+                );
+            }
+        }
+        CpaCommand::Rollback => {
+            anyhow::ensure!(
+                settings.cpa.is_loopback(),
+                "CPA rollback only applies to the managed local CLIProxyAPI; remote profiles are not updated"
+            );
+            let credentials = secrets::load(&paths.credentials)?;
+            codexmux::cpa::rollback_cpa(paths, &settings.cpa, &credentials.cpa_token)?;
+            println!(
+                "CPA rolled back to {}",
+                codexmux::cpa::installed_version(paths)
+                    .map(|version| version.version)
+                    .unwrap_or_else(|| "unknown".into())
             );
         }
         CpaCommand::Start => {
@@ -612,6 +688,14 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
                     Some(true) => "enabled",
                     Some(false) => "disabled",
                     None => "not set",
+                }
+            );
+            println!(
+                "rollback: {}",
+                if codexmux::cpa::rollback_available(paths) {
+                    "available"
+                } else {
+                    "no previous version"
                 }
             );
             println!("config: {}", codexmux::cpa::config_path(paths).display());

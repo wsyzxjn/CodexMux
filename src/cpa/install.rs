@@ -1,57 +1,21 @@
-fn asset_url(version: &str) -> String {
-    format!(
-        "https://github.com/{CPA_REPO}/releases/download/v{version}/CLIProxyAPI_{version}_darwin_aarch64.tar.gz"
-    )
-}
-
-/// Download the pinned CPA release, verify its digest, and extract the binary.
+/// Resolve the latest stable CPA release, verify its digest, and install the binary.
 ///
-/// The archive is fully streamed to disk first so the digest can be checked
-/// before anything is executed; extraction only accepts the expected binary
-/// entry and rejects anything else.
+/// The archive is downloaded and checked against the published digest before
+/// anything is executed; extraction only accepts the expected binary entry.
 pub fn install(paths: &Paths, cpa: &Cpa, token: &str) -> Result<()> {
-    let archive = archive_path(paths);
-    let parent = archive
-        .parent()
-        .context("archive path has no parent directory")?;
-    fs::create_dir_all(parent).context("failed to create the CPA install directory")?;
-    let mut response = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .build()?
-        .get(asset_url(CPA_VERSION))
-        .send()
-        .context("failed to download the CLIProxyAPI release archive")?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "downloading the CLIProxyAPI release archive failed with HTTP {}",
-        response.status()
-    );
-    let mut file = fs::File::create(&archive)
-        .with_context(|| format!("failed to create {}", archive.display()))?;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = response
-            .read(&mut buffer)
-            .context("failed to stream the CLIProxyAPI release archive")?;
-        if read == 0 {
-            break;
-        }
-        file.write_all(&buffer[..read])?;
+    let release = resolve_release(None)?;
+    let archive = download_verified_asset(paths, &release)?;
+    let result = install_verified_archive(paths, cpa, token, &archive, &release);
+    let _ = fs::remove_file(&archive);
+    result?;
+    if !is_loaded()? {
+        start(paths, cpa, token)?;
     }
-    file.sync_all()?;
-    finish_download_install(
-        &archive,
-        install_from_archive(
-        paths,
-        cpa,
-        &archive,
-        CPA_VERSION,
-        CPA_DARWIN_AARCH64_SHA256,
-            token,
-        ),
-    )
+    model_slugs(cpa, token)?;
+    Ok(())
 }
 
+#[cfg(test)]
 fn finish_download_install(archive: &Path, result: Result<()>) -> Result<()> {
     result?;
     // The downloaded archive is staging data; offline archives supplied by
@@ -89,6 +53,7 @@ pub fn install_from_archive(
             &serde_json::to_vec_pretty(&InstalledVersion {
                 version: version.to_owned(),
                 sha256: sha256.to_owned(),
+                ..Default::default()
             })?,
         )
     })();
