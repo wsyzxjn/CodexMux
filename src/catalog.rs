@@ -1,22 +1,17 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::RwLock,
-    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{config::CPA_MODEL_PREFIX, fsutil::atomic_write};
 
 pub const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 pub const AUTO_REVIEW_MODEL: &str = "codex-auto-review";
-const MAX_RETENTION_STATE_BYTES: usize = 1024 * 1024;
-const RETENTION_STATE_VERSION: u8 = 1;
-const CPA_MODEL_REMOVAL_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 
 type RouteTable = HashMap<String, CatalogRoute>;
 
@@ -29,37 +24,11 @@ struct Snapshot {
 #[derive(Debug)]
 struct StoreState {
     snapshot: Option<Snapshot>,
-    retention: CpaRetentionState,
-    retention_initialized: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct CpaRetentionState {
-    version: u8,
-    models: BTreeMap<String, TrackedCpaModel>,
-}
-
-impl Default for CpaRetentionState {
-    fn default() -> Self {
-        Self {
-            version: RETENTION_STATE_VERSION,
-            models: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct TrackedCpaModel {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    first_missing_unix_seconds: Option<u64>,
 }
 
 #[derive(Debug)]
 pub struct CatalogStore {
     path: PathBuf,
-    retention_path: PathBuf,
     state: RwLock<StoreState>,
 }
 
@@ -98,16 +67,9 @@ impl CatalogStore {
         } else {
             None
         };
-        let retention_path = retention_path(&path);
-        let (retention, retention_initialized) = load_retention_state(&retention_path)?;
         Ok(Self {
             path,
-            retention_path,
-            state: RwLock::new(StoreState {
-                snapshot,
-                retention,
-                retention_initialized,
-            }),
+            state: RwLock::new(StoreState { snapshot }),
         })
     }
 
@@ -153,198 +115,21 @@ impl CatalogStore {
     }
 
     pub fn replace(&self, official: &Value, cpa: &Value, direct: &[DirectModel]) -> Result<Value> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before the Unix epoch")?
-            .as_secs();
-        self.replace_at(official, cpa, direct, now)
-    }
-
-    fn replace_at(
-        &self,
-        official: &Value,
-        cpa: &Value,
-        direct: &[DirectModel],
-        now_unix_seconds: u64,
-    ) -> Result<Value> {
         let mut catalog = merge(official, cpa)?;
-        let current_cpa_slugs = cpa_slugs(&catalog)?;
-        let mut state = self.state.write().expect("catalog snapshot lock poisoned");
-        if !state.retention_initialized {
-            if let Some(snapshot) = &state.snapshot {
-                state.retention.models = inferred_cpa_models(&snapshot.catalog)?;
-            }
-            state.retention_initialized = true;
-        }
-        let previous_catalog = state
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.catalog.clone());
-        retain_temporarily_missing_models(
-            &mut catalog,
-            previous_catalog.as_ref(),
-            &mut state.retention,
-            &current_cpa_slugs,
-            now_unix_seconds,
-        )?;
         merge_declared_direct(&mut catalog, direct)?;
         let routes = route_table_from_merged(&catalog)?;
         let bytes = serde_json::to_vec_pretty(&catalog)?;
         if bytes.len() > MAX_CATALOG_BYTES {
             bail!("merged model catalog exceeds 16 MiB");
         }
-        let retention_bytes = serde_json::to_vec_pretty(&state.retention)?;
-        if retention_bytes.len() > MAX_RETENTION_STATE_BYTES {
-            bail!("CPA model retention state exceeds 1 MiB");
-        }
-        // Persist the timer state first. If the process stops between these
-        // two atomic writes, the next refresh can safely reconcile the newer
-        // timers with the still-valid older catalog snapshot.
-        atomic_write(&self.retention_path, &retention_bytes)?;
         atomic_write(&self.path, &bytes)?;
+        let mut state = self.state.write().expect("catalog snapshot lock poisoned");
         state.snapshot = Some(Snapshot {
             catalog: catalog.clone(),
             routes,
         });
         Ok(catalog)
     }
-}
-
-fn retention_path(catalog_path: &Path) -> PathBuf {
-    catalog_path.with_extension("retention.json")
-}
-
-fn load_retention_state(path: &Path) -> Result<(CpaRetentionState, bool)> {
-    if !path.exists() {
-        return Ok((CpaRetentionState::default(), false));
-    }
-    let bytes = fs::read(path).with_context(|| {
-        format!(
-            "failed to read CPA model retention state {}",
-            path.display()
-        )
-    })?;
-    if bytes.len() > MAX_RETENTION_STATE_BYTES {
-        bail!("CPA model retention state exceeds 1 MiB");
-    }
-    let state: CpaRetentionState = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid CPA model retention state {}", path.display()))?;
-    anyhow::ensure!(
-        state.version == RETENTION_STATE_VERSION,
-        "unsupported CPA model retention state version {}",
-        state.version
-    );
-    for slug in state.models.keys() {
-        anyhow::ensure!(
-            slug.strip_prefix(CPA_MODEL_PREFIX)
-                .is_some_and(|upstream| !upstream.is_empty()),
-            "CPA model retention state contains invalid slug {slug}"
-        );
-    }
-    Ok((state, true))
-}
-
-fn cpa_slugs(catalog: &Value) -> Result<HashSet<String>> {
-    Ok(models(catalog)?
-        .iter()
-        .filter_map(model_slug)
-        .filter(|slug| slug.starts_with(CPA_MODEL_PREFIX))
-        .map(str::to_owned)
-        .collect())
-}
-
-fn inferred_cpa_models(catalog: &Value) -> Result<BTreeMap<String, TrackedCpaModel>> {
-    let mut tracked = BTreeMap::new();
-    for model in models(catalog)? {
-        let Some(slug) = model_slug(model).filter(|slug| slug.starts_with(CPA_MODEL_PREFIX)) else {
-            continue;
-        };
-        // Older snapshots predate explicit provenance state. The exact small
-        // synthetic shape identifies models contributed only by a direct
-        // declaration so removing a direct route does not leave it routable.
-        if is_synthetic_direct_model(model) {
-            continue;
-        }
-        tracked.insert(slug.to_owned(), TrackedCpaModel::default());
-    }
-    Ok(tracked)
-}
-
-fn is_synthetic_direct_model(model: &Value) -> bool {
-    let Some(object) = model.as_object() else {
-        return false;
-    };
-    let Some(slug) = model_slug(model) else {
-        return false;
-    };
-    let Some(upstream) = slug.strip_prefix(CPA_MODEL_PREFIX) else {
-        return false;
-    };
-    object.get("display_name").and_then(Value::as_str)
-        == Some(format!("{upstream} · Direct").as_str())
-        && object.get("priority").and_then(Value::as_i64).is_some()
-        && object.keys().all(|key| {
-            matches!(
-                key.as_str(),
-                "slug" | "display_name" | "priority" | "visibility"
-            )
-        })
-}
-
-fn retain_temporarily_missing_models(
-    catalog: &mut Value,
-    previous_catalog: Option<&Value>,
-    retention: &mut CpaRetentionState,
-    current_cpa_slugs: &HashSet<String>,
-    now_unix_seconds: u64,
-) -> Result<()> {
-    for slug in current_cpa_slugs {
-        retention
-            .models
-            .entry(slug.clone())
-            .or_default()
-            .first_missing_unix_seconds = None;
-    }
-
-    let previous_models: HashMap<&str, &Value> = previous_catalog
-        .map(models)
-        .transpose()?
-        .into_iter()
-        .flatten()
-        .filter_map(|model| model_slug(model).map(|slug| (slug, model)))
-        .collect();
-    let mut present: HashSet<String> = models(catalog)?
-        .iter()
-        .filter_map(model_slug)
-        .map(str::to_owned)
-        .collect();
-    let tracked_slugs: Vec<String> = retention.models.keys().cloned().collect();
-    let mut retained = Vec::new();
-    for slug in tracked_slugs {
-        if current_cpa_slugs.contains(&slug) {
-            continue;
-        }
-        let Some(previous_model) = previous_models.get(slug.as_str()) else {
-            retention.models.remove(&slug);
-            continue;
-        };
-        let tracked = retention
-            .models
-            .get_mut(&slug)
-            .expect("tracked CPA model disappeared during refresh");
-        let first_missing = *tracked
-            .first_missing_unix_seconds
-            .get_or_insert(now_unix_seconds);
-        if now_unix_seconds.saturating_sub(first_missing) < CPA_MODEL_REMOVAL_GRACE.as_secs() {
-            if present.insert(slug) {
-                retained.push((*previous_model).clone());
-            }
-        } else {
-            retention.models.remove(&slug);
-        }
-    }
-    models_mut(catalog)?.extend(retained);
-    Ok(())
 }
 
 pub fn parse(bytes: &[u8], source: &str) -> Result<Value> {
@@ -752,151 +537,31 @@ mod tests {
     }
 
     #[test]
-    fn temporarily_missing_cpa_model_keeps_its_snapshot_metadata() {
+    fn cpa_model_omission_drops_the_model_immediately() {
         let root = tempdir().unwrap();
         let path = root.path().join("catalog.json");
         let store = CatalogStore::load(path.clone()).unwrap();
         store
-            .replace_at(
-                &json!({"models":[{"slug":"official"}]}),
+            .replace(
+                &json!({"models":[]}),
                 &json!({"models":[{
-                    "slug":"glm-5.3-uni", "display_name":"GLM 5.3 Uni",
-                    "context_window":202_752, "future_field":{"kept":true}
+                    "slug":"glm-5.3-uni", "display_name":"GLM 5.3 Uni"
                 }]}),
                 &[],
-                1_000,
             )
             .unwrap();
+        assert!(store.resolve("cpa/glm-5.3-uni").is_ok());
 
-        let retained = store
-            .replace_at(
-                &json!({"models":[{"slug":"official"}]}),
-                &json!({"models":[]}),
-                &[],
-                1_010,
-            )
-            .unwrap();
-        let model = retained["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["slug"] == "cpa/glm-5.3-uni")
-            .unwrap();
-        assert_eq!(model["display_name"], "GLM 5.3 Uni · CPA");
-        assert_eq!(model["context_window"], 202_752);
-        assert_eq!(model["future_field"]["kept"], true);
-        assert_eq!(
-            store.resolve("cpa/glm-5.3-uni").unwrap(),
-            CatalogRoute::Cpa {
-                upstream_model: "glm-5.3-uni".into()
-            }
-        );
-
-        let persisted: Value =
-            serde_json::from_slice(&fs::read(retention_path(&path)).unwrap()).unwrap();
-        assert_eq!(
-            persisted["models"]["cpa/glm-5.3-uni"]["first_missing_unix_seconds"],
-            1_010
-        );
-    }
-
-    #[test]
-    fn missing_cpa_model_expires_after_the_persisted_grace_period() {
-        let root = tempdir().unwrap();
-        let path = root.path().join("catalog.json");
-        let store = CatalogStore::load(path.clone()).unwrap();
-        store
-            .replace_at(
-                &json!({"models":[]}),
-                &json!({"models":[{"slug":"temporary"}]}),
-                &[],
-                1_000,
-            )
-            .unwrap();
-        store
-            .replace_at(&json!({"models":[]}), &json!({"models":[]}), &[], 1_010)
-            .unwrap();
-        drop(store);
-
-        let restored = CatalogStore::load(path).unwrap();
-        let before_deadline = restored
-            .replace_at(
-                &json!({"models":[]}),
-                &json!({"models":[]}),
-                &[],
-                1_010 + CPA_MODEL_REMOVAL_GRACE.as_secs() - 1,
-            )
+        let after_omission = store
+            .replace(&json!({"models":[]}), &json!({"models":[]}), &[])
             .unwrap();
         assert!(
-            before_deadline["models"]
+            after_omission["models"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|model| model["slug"] == "cpa/temporary")
+                .all(|model| model["slug"] != "cpa/glm-5.3-uni")
         );
-
-        let expired = restored
-            .replace_at(
-                &json!({"models":[]}),
-                &json!({"models":[]}),
-                &[],
-                1_010 + CPA_MODEL_REMOVAL_GRACE.as_secs(),
-            )
-            .unwrap();
-        assert!(expired["models"].as_array().unwrap().is_empty());
-        assert!(restored.resolve("cpa/temporary").is_err());
-    }
-
-    #[test]
-    fn cpa_model_reappearance_resets_the_missing_deadline() {
-        let root = tempdir().unwrap();
-        let store = CatalogStore::load(root.path().join("catalog.json")).unwrap();
-        let official = json!({"models":[]});
-        let present = json!({"models":[{"slug":"returns"}]});
-        let absent = json!({"models":[]});
-        store.replace_at(&official, &present, &[], 1_000).unwrap();
-        store.replace_at(&official, &absent, &[], 1_010).unwrap();
-        store.replace_at(&official, &present, &[], 1_020).unwrap();
-        store.replace_at(&official, &absent, &[], 1_030).unwrap();
-
-        let after_original_deadline = store
-            .replace_at(
-                &official,
-                &absent,
-                &[],
-                1_010 + CPA_MODEL_REMOVAL_GRACE.as_secs(),
-            )
-            .unwrap();
-        assert!(
-            after_original_deadline["models"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|model| model["slug"] == "cpa/returns")
-        );
-    }
-
-    #[test]
-    fn removing_a_direct_declaration_does_not_start_a_grace_period() {
-        let root = tempdir().unwrap();
-        let path = root.path().join("catalog.json");
-        let direct = [DirectModel {
-            upstream_model: "direct-only".into(),
-            base_url: "https://direct.example/v1".into(),
-        }];
-        let store = CatalogStore::load(path.clone()).unwrap();
-        store
-            .replace_at(&json!({"models":[]}), &json!({"models":[]}), &direct, 1_000)
-            .unwrap();
-        drop(store);
-
-        // Simulate upgrading an older snapshot that has no provenance state.
-        fs::remove_file(retention_path(&path)).unwrap();
-        let restored = CatalogStore::load(path).unwrap();
-        let refreshed = restored
-            .replace_at(&json!({"models":[]}), &json!({"models":[]}), &[], 1_010)
-            .unwrap();
-        assert!(refreshed["models"].as_array().unwrap().is_empty());
-        assert!(restored.resolve("cpa/direct-only").is_err());
+        assert!(store.resolve("cpa/glm-5.3-uni").is_err());
     }
 }

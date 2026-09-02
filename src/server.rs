@@ -1465,7 +1465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_cpa_catalog_omission_keeps_the_previous_model_routable() {
+    async fn valid_cpa_catalog_omission_drops_the_previous_model() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         async fn official() -> Json<Value> {
@@ -1479,7 +1479,7 @@ mod tests {
                 }]}))
             } else {
                 // CPA cooling can return HTTP 200 with a structurally valid
-                // catalog that temporarily omits the affected model.
+                // catalog that omits the affected model; it is served as-is.
                 Json(json!({"models":[]}))
             }
         }
@@ -1533,20 +1533,13 @@ mod tests {
             refresh_catalog_from_urls(&state, official_headers, cpa_headers, official_url, cpa_url)
                 .await
                 .unwrap();
-        let retained = after_omission["models"]
+        let present = after_omission["models"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|model| model["slug"] == "cpa/glm-5.3-uni")
-            .unwrap();
-        assert_eq!(retained["display_name"], "GLM 5.3 Uni · CPA");
-        assert_eq!(retained["context_window"], 202_752);
-        assert_eq!(
-            state.catalog.resolve("cpa/glm-5.3-uni").unwrap(),
-            CatalogRoute::Cpa {
-                upstream_model: "glm-5.3-uni".into()
-            }
-        );
+            .any(|model| model["slug"] == "cpa/glm-5.3-uni");
+        assert!(!present);
+        assert!(state.catalog.resolve("cpa/glm-5.3-uni").is_err());
 
         official_handle.abort();
         cpa_handle.abort();
