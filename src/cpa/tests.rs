@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn cpa_autostart_preference_round_trips() {
         let paths = paths();
-        assert_eq!(cpa_autostart(&paths.cpa_profiles), None);
+        assert_eq!(cpa_autostart(&paths.cpa_profiles), Some(true));
         set_cpa_autostart(&paths.cpa_profiles, true).unwrap();
         assert_eq!(cpa_autostart(&paths.cpa_profiles), Some(true));
         set_cpa_autostart(&paths.cpa_profiles, false).unwrap();

@@ -329,9 +329,12 @@ pub fn remove_direct_routes(paths: &Paths, base_url: &str, models: &[String]) ->
     set_direct_routes(paths, routes)
 }
 
-/// Read the persisted CPA autostart preference (`None` = never chosen).
+/// Read the persisted CPA autostart preference. When no explicit choice has
+/// been saved yet, autostart defaults to enabled.
 pub fn cpa_autostart(profiles_path: &Path) -> Option<bool> {
-    load_profile_store_from(profiles_path).cpa_autostart
+    load_profile_store_from(profiles_path)
+        .cpa_autostart
+        .or(Some(true))
 }
 
 /// Persist the CPA autostart preference.
