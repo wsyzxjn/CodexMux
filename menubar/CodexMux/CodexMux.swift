@@ -17,6 +17,18 @@ struct L10n {
     let installCPA: String
     let installingCPA: String
     let cpaAutostart: String
+    let advertiseUltra: String
+    let advertiseUltraFailed: String
+    let cpaUpdate: String
+    let cpaVersionUnknown: String
+    let cpaCheckUpdate: String
+    let cpaRollback: String
+    let cpaUpdateCheckFailed: String
+    let cpaUpdateFailed: String
+    let cpaRollbackFailed: String
+    let cpaUpdateDialogTitle: String
+    let cpaRollbackDialogTitle: String
+    let cpaRollbackDialogBody: String
     let openLogs: String
     let openCpaManagement: String
     let copyCpaManagementKey: String
@@ -26,6 +38,7 @@ struct L10n {
     let directNoEndpoints: String
     let directAdd: String
     let directRemove: String
+    let advanced: String
     let reviewModel: String
     let reviewDefault: String
     let profileActiveSuffix: String
@@ -67,6 +80,18 @@ struct L10n {
         installCPA: "Download and Enable CPA…",
         installingCPA: "Downloading and enabling CPA…",
         cpaAutostart: "Start CPA with CodexMux",
+        advertiseUltra: "Advertise Ultra for All Models",
+        advertiseUltraFailed: "Failed to save the Ultra catalog setting. See logs.",
+        cpaUpdate: "CPA Update",
+        cpaVersionUnknown: "Version: unknown",
+        cpaCheckUpdate: "Check for CPA Updates…",
+        cpaRollback: "Roll Back CPA…",
+        cpaUpdateCheckFailed: "Failed to check for CPA updates. See logs.",
+        cpaUpdateFailed: "Failed to update CPA. The previous version was restored if possible. See logs.",
+        cpaRollbackFailed: "Failed to roll back CPA. The current version was kept. See logs.",
+        cpaUpdateDialogTitle: "Update CPA?",
+        cpaRollbackDialogTitle: "Roll Back CPA?",
+        cpaRollbackDialogBody: "Restore the previous CLIProxyAPI version and restart the service. The current version is kept if validation fails.",
         openLogs: "Open Logs Folder",
         openCpaManagement: "Open CPA Web Management",
         copyCpaManagementKey: "Copy CPA Management Key",
@@ -76,6 +101,7 @@ struct L10n {
         directNoEndpoints: "No direct endpoints",
         directAdd: "Add Direct Endpoint…",
         directRemove: "Remove",
+        advanced: "Advanced",
         reviewModel: "Review Model",
         reviewDefault: "Default (official route)",
         profileActiveSuffix: "  ✓",
@@ -118,6 +144,18 @@ struct L10n {
         installCPA: "下载并启用 CPA…",
         installingCPA: "正在下载并启用 CPA…",
         cpaAutostart: "随 CodexMux 启动 CPA",
+        advertiseUltra: "为所有模型声明 Ultra",
+        advertiseUltraFailed: "保存 Ultra 目录设置失败，请查看日志。",
+        cpaUpdate: "CPA 更新",
+        cpaVersionUnknown: "版本：未知",
+        cpaCheckUpdate: "检查 CPA 更新…",
+        cpaRollback: "回滚 CPA…",
+        cpaUpdateCheckFailed: "检查 CPA 更新失败，请查看日志。",
+        cpaUpdateFailed: "更新 CPA 失败，已尽量恢复上一版本，请查看日志。",
+        cpaRollbackFailed: "回滚 CPA 失败，已保留当前版本，请查看日志。",
+        cpaUpdateDialogTitle: "更新 CPA？",
+        cpaRollbackDialogTitle: "回滚 CPA？",
+        cpaRollbackDialogBody: "将恢复上一版 CLIProxyAPI 并重启服务；校验失败时会保留当前版本。",
         openLogs: "打开日志文件夹",
         openCpaManagement: "打开 CPA Web 管理",
         copyCpaManagementKey: "复制 CPA 管理密钥",
@@ -127,6 +165,7 @@ struct L10n {
         directNoEndpoints: "（暂无直接端点）",
         directAdd: "添加直接端点…",
         directRemove: "移除",
+        advanced: "高级功能",
         reviewModel: "审批模型",
         reviewDefault: "默认（官方路由）",
         profileActiveSuffix: "  ✓",
@@ -156,6 +195,25 @@ struct L10n {
 
     /// True when this is the Chinese localization.
     var isChinese: Bool { quit == "退出 CodexMux" }
+
+    func cpaUpdateAvailable(_ version: String) -> String {
+        isChinese ? "可用更新：\(version)" : "Update available: \(version)"
+    }
+
+    func cpaUpToDate(_ version: String) -> String {
+        isChinese ? "已是最新：\(version)" : "Up to date: \(version)"
+    }
+
+    func cpaUpdateTo(_ version: String) -> String {
+        isChinese ? "更新到 \(version)…" : "Update to \(version)…"
+    }
+
+    func cpaUpdateDialogBody(from: String, to: String) -> String {
+        if isChinese {
+            return "将受管的本地 CPA 从 \(from) 更新到 \(to)。更新后会重启并校验服务；失败时自动恢复上一版本。"
+        }
+        return "Update the managed local CPA from \(from) to \(to). The service is restarted and validated; the previous version is restored on failure."
+    }
 
     func profileSwitchFailed(_ name: String) -> String {
         if isChinese {
@@ -258,6 +316,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cpaInstalled = false
     private var cpaInstalling = false
     private var cpaAutostart: Bool?
+    private var advertiseUltra = false
+    private var cpaInstalledVersion: String?
+    private var cpaLatestVersion: String?
+    private var cpaUpdateAvailable = false
+    private var cpaRollbackAvailable = false
+    private var cpaUpdating = false
+    private var cpaCheckingUpdate = false
     private var activeProfile: String?
     private var savedProfiles: [(name: String, baseURL: String)] = []
     private var reviewOverride: String?
@@ -311,10 +376,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             group.leave()
         }
         group.enter()
-        checkCPA { [weak self] running, installed, autostart in
+        checkCPA { [weak self] running, installed, autostart, version, rollback in
             self?.cpaRunning = running
             self?.cpaInstalled = installed
             self?.cpaAutostart = autostart
+            self?.cpaInstalledVersion = version
+            self?.cpaRollbackAvailable = rollback
+            group.leave()
+        }
+        group.enter()
+        loadUltraState { [weak self] enabled in
+            self?.advertiseUltra = enabled
             group.leave()
         }
         group.enter()
@@ -391,6 +463,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Load whether CodexMux advertises `ultra` for every merged model.
+    private func loadUltraState(_ completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let output = self.captureCodexMux(["catalog", "ultra-get"])
+            let enabled = output
+                .split(separator: "\n")
+                .contains("ultra: true")
+            DispatchQueue.main.async { completion(enabled) }
+        }
+    }
+
     /// Parse `codexmux cpa profile-list` output (background queue only).
     private func loadProfiles(_ completion: @escaping (String?, [(name: String, baseURL: String)]) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -424,17 +507,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func checkCPA(_ completion: @escaping (Bool, Bool, Bool?) -> Void) {
+    private func checkCPA(_ completion: @escaping (Bool, Bool, Bool?, String?, Bool) -> Void) {
         runCodexMux(["cpa", "status"]) { output in
             let running = output.contains("service: running")
             let installed = output.contains("binary: installed")
+            let installedVersion: String? = {
+                let line = output
+                    .split(separator: "\n")
+                    .first { $0.hasPrefix("version: ") }
+                return line.map { String($0.dropFirst("version: ".count)) }
+            }()
             var autostart: Bool?
             if output.contains("autostart: enabled") {
                 autostart = true
             } else if output.contains("autostart: disabled") {
                 autostart = false
             }
-            completion(running, installed, autostart)
+            let rollback = output.contains("rollback: available")
+            completion(running, installed, autostart, installedVersion, rollback)
         }
     }
 
@@ -491,15 +581,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         codexmuxStatusItem.isEnabled = false
         menu.addItem(codexmuxStatusItem)
 
-        let cpaStatusItem = NSMenuItem(
-            title: cpaInstalled
-                ? (cpaRunning ? l10n.cpaStatusRunning : l10n.cpaStatusStopped)
-                : l10n.cpaStatusNotInstalled,
-            action: nil, keyEquivalent: ""
-        )
-        cpaStatusItem.isEnabled = false
-        menu.addItem(cpaStatusItem)
-
         // Controls submenu: start/stop actions for both services.
         let controlsTitle = cpaRunning
             ? l10n.controlsRunning
@@ -519,40 +600,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stop.target = self
         stop.isEnabled = proxyReachable
         controls.addItem(stop)
+        controlsItem.submenu = controls
+        menu.addItem(controlsItem)
 
-        controls.addItem(.separator())
+        // One CPA menu owns installation, lifecycle, updates, profiles,
+        // review routing, and web management.
+        let cpaItem = NSMenuItem(title: "CPA", action: nil, keyEquivalent: "")
+        let cpaMenu = NSMenu()
+        cpaMenu.autoenablesItems = false
+
+        let cpaStatusItem = NSMenuItem(
+            title: cpaInstalled
+                ? (cpaRunning ? l10n.cpaStatusRunning : l10n.cpaStatusStopped)
+                : l10n.cpaStatusNotInstalled,
+            action: nil, keyEquivalent: ""
+        )
+        cpaStatusItem.isEnabled = false
+        cpaMenu.addItem(cpaStatusItem)
+        cpaMenu.addItem(.separator())
 
         if cpaInstalled {
             let startCPAItem = NSMenuItem(title: l10n.startCPA, action: #selector(startCPA),
                                           keyEquivalent: "")
             startCPAItem.target = self
             startCPAItem.isEnabled = !cpaRunning
-            controls.addItem(startCPAItem)
+            cpaMenu.addItem(startCPAItem)
 
             let stopCPAItem = NSMenuItem(title: l10n.stopCPA, action: #selector(stopCPA),
                                          keyEquivalent: "")
             stopCPAItem.target = self
             stopCPAItem.isEnabled = cpaRunning
-            controls.addItem(stopCPAItem)
+            cpaMenu.addItem(stopCPAItem)
         } else {
             let installItem = NSMenuItem(title: cpaInstalling ? l10n.installingCPA : l10n.installCPA,
                                          action: #selector(installCPA),
                                          keyEquivalent: "")
             installItem.target = self
             installItem.isEnabled = !cpaInstalling
-            controls.addItem(installItem)
+            cpaMenu.addItem(installItem)
         }
 
-        // Startup preference: whether CPA starts together with CodexMux.
         let autostartItem = NSMenuItem(title: l10n.cpaAutostart,
                                        action: #selector(toggleCPAAutostart),
                                        keyEquivalent: "")
         autostartItem.target = self
         autostartItem.isEnabled = cpaInstalled
         autostartItem.state = (cpaAutostart == true) ? .on : .off
-        controls.addItem(autostartItem)
-        controlsItem.submenu = controls
-        menu.addItem(controlsItem)
+        cpaMenu.addItem(autostartItem)
+        cpaMenu.addItem(.separator())
+
+        // CPA update submenu: check, apply, and roll back the managed local
+        // CLIProxyAPI release from the menu bar.
+        let updateItem = NSMenuItem(title: l10n.cpaUpdate, action: nil, keyEquivalent: "")
+        let updateMenu = NSMenu()
+        updateMenu.autoenablesItems = false
+        let updateStatus: String
+        if let latest = cpaLatestVersion {
+            updateStatus = cpaUpdateAvailable
+                ? l10n.cpaUpdateAvailable(latest)
+                : l10n.cpaUpToDate(cpaInstalledVersion ?? latest)
+        } else {
+            updateStatus = l10n.cpaVersionUnknown
+        }
+        let updateStatusItem = NSMenuItem(title: updateStatus, action: nil, keyEquivalent: "")
+        updateStatusItem.isEnabled = false
+        updateMenu.addItem(updateStatusItem)
+        updateMenu.addItem(.separator())
+
+        let checkUpdateItem = NSMenuItem(title: l10n.cpaCheckUpdate,
+                                         action: #selector(checkCpaUpdate),
+                                         keyEquivalent: "")
+        checkUpdateItem.target = self
+        checkUpdateItem.isEnabled = cpaInstalled && !cpaUpdating && !cpaCheckingUpdate
+        updateMenu.addItem(checkUpdateItem)
+
+        if let latest = cpaLatestVersion, cpaUpdateAvailable {
+            let updateToItem = NSMenuItem(title: l10n.cpaUpdateTo(latest),
+                                          action: #selector(updateCpa),
+                                          keyEquivalent: "")
+            updateToItem.target = self
+            updateToItem.isEnabled = cpaInstalled && !cpaUpdating
+            updateMenu.addItem(updateToItem)
+        }
+        if cpaRollbackAvailable {
+            let rollbackItem = NSMenuItem(title: l10n.cpaRollback,
+                                          action: #selector(rollbackCpa),
+                                          keyEquivalent: "")
+            rollbackItem.target = self
+            rollbackItem.isEnabled = cpaInstalled && !cpaUpdating
+            updateMenu.addItem(rollbackItem)
+        }
+        updateItem.submenu = updateMenu
+        cpaMenu.addItem(updateItem)
 
         // CPA profiles submenu: click a saved endpoint to validate and switch.
         let profilesItem = NSMenuItem(title: l10n.profiles, action: nil, keyEquivalent: "")
@@ -576,7 +715,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         profilesItem.submenu = profilesMenu
-        menu.addItem(profilesItem)
+        cpaMenu.addItem(profilesItem)
+
+        cpaMenu.addItem(.separator())
+        let cpaManagement = NSMenuItem(title: l10n.openCpaManagement,
+                                       action: #selector(openCpaManagement),
+                                       keyEquivalent: "")
+        cpaManagement.target = self
+        cpaManagement.isEnabled = cpaInstalled
+        cpaMenu.addItem(cpaManagement)
+
+        let copyManagementKey = NSMenuItem(title: l10n.copyCpaManagementKey,
+                                           action: #selector(copyCpaManagementKey),
+                                           keyEquivalent: "")
+        copyManagementKey.target = self
+        copyManagementKey.isEnabled = cpaInstalled
+        cpaMenu.addItem(copyManagementKey)
+
+        cpaItem.submenu = cpaMenu
+        menu.addItem(cpaItem)
 
         // Direct endpoints submenu: upstreams CodexMux routes to directly,
         // bypassing CPA. Works with or without CPA installed.
@@ -609,6 +766,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         directItem.submenu = directMenu
         menu.addItem(directItem)
 
+        // Advanced catalog settings that affect how Codex sees merged models.
+        let advancedItem = NSMenuItem(title: l10n.advanced, action: nil, keyEquivalent: "")
+        let advancedMenu = NSMenu()
+        advancedMenu.autoenablesItems = false
+        let ultraItem = NSMenuItem(title: l10n.advertiseUltra,
+                                   action: #selector(toggleAdvertiseUltra),
+                                   keyEquivalent: "")
+        ultraItem.target = self
+        ultraItem.state = advertiseUltra ? .on : .off
+        advancedMenu.addItem(ultraItem)
+        advancedItem.submenu = advancedMenu
+        menu.addItem(advancedItem)
+
         // Review model submenu: pick which CPA model handles codex-auto-review.
         let reviewItem = NSMenuItem(title: l10n.reviewModel, action: nil, keyEquivalent: "")
         let reviewMenu = NSMenu()
@@ -638,20 +808,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                               keyEquivalent: "l")
         logs.target = self
         menu.addItem(logs)
-
-        let cpaManagement = NSMenuItem(title: l10n.openCpaManagement,
-                                       action: #selector(openCpaManagement),
-                                       keyEquivalent: "")
-        cpaManagement.target = self
-        cpaManagement.isEnabled = cpaInstalled
-        menu.addItem(cpaManagement)
-
-        let copyManagementKey = NSMenuItem(title: l10n.copyCpaManagementKey,
-                                           action: #selector(copyCpaManagementKey),
-                                           keyEquivalent: "")
-        copyManagementKey.target = self
-        copyManagementKey.isEnabled = cpaInstalled
-        menu.addItem(copyManagementKey)
 
         // Language submenu with the three options; checkmark marks the active one.
         let languageItem = NSMenuItem(title: l10n.language, action: nil, keyEquivalent: "")
@@ -774,6 +930,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func toggleAdvertiseUltra(_ sender: NSMenuItem) {
+        let enabled = sender.state != .on
+        runCodexMuxDetached(["catalog", "ultra-set", enabled ? "true" : "false"]) { [weak self] ok in
+            if !ok {
+                self?.showAlert(self?.l10n.advertiseUltraFailed ?? "")
+            } else {
+                self?.restartProxy()
+            }
+        }
+    }
+
+    @objc private func checkCpaUpdate() {
+        guard cpaInstalled, !cpaCheckingUpdate else { return }
+        cpaCheckingUpdate = true
+        rebuildMenu()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.captureCodexMuxResult(["cpa", "update-check"])
+            let latest: String? = result.output
+                .split(separator: "\n")
+                .first { $0.hasPrefix("latest: ") }
+                .map { String($0.dropFirst("latest: ".count)) }
+            DispatchQueue.main.async {
+                self.cpaCheckingUpdate = false
+                guard result.status == 0, let latest, !latest.isEmpty else {
+                    self.showAlert(self.l10n.cpaUpdateCheckFailed)
+                    self.rebuildMenu()
+                    return
+                }
+                self.cpaLatestVersion = latest
+                self.cpaUpdateAvailable = result.output.contains("update available: true")
+                self.rebuildMenu()
+            }
+        }
+    }
+
+    @objc private func updateCpa() {
+        guard cpaInstalled, !cpaUpdating,
+              let latest = cpaLatestVersion, cpaUpdateAvailable else { return }
+        let alert = NSAlert()
+        alert.messageText = l10n.cpaUpdateDialogTitle
+        alert.informativeText = l10n.cpaUpdateDialogBody(
+            from: cpaInstalledVersion ?? "unknown",
+            to: latest
+        )
+        alert.addButton(withTitle: l10n.cpaUpdateTo(latest))
+        alert.addButton(withTitle: l10n.quitDialogCancel)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        cpaUpdating = true
+        rebuildMenu()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.captureCodexMuxResult(["cpa", "update"])
+            DispatchQueue.main.async {
+                self.cpaUpdating = false
+                self.cpaLatestVersion = nil
+                self.cpaUpdateAvailable = false
+                if result.status != 0 {
+                    self.showAlert(self.l10n.cpaUpdateFailed)
+                }
+                self.refreshStatus()
+            }
+        }
+    }
+
+    @objc private func rollbackCpa() {
+        guard cpaInstalled, !cpaUpdating, cpaRollbackAvailable else { return }
+        let alert = NSAlert()
+        alert.messageText = l10n.cpaRollbackDialogTitle
+        alert.informativeText = l10n.cpaRollbackDialogBody
+        alert.addButton(withTitle: l10n.cpaRollback)
+        alert.addButton(withTitle: l10n.quitDialogCancel)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        cpaUpdating = true
+        rebuildMenu()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.captureCodexMuxResult(["cpa", "rollback"])
+            DispatchQueue.main.async {
+                self.cpaUpdating = false
+                if result.status != 0 {
+                    self.showAlert(self.l10n.cpaRollbackFailed)
+                }
+                self.refreshStatus()
+            }
+        }
+    }
+
     @objc private func addDirectRoute() {
         let l10n = self.l10n
         let alert = NSAlert()
@@ -781,6 +1027,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = l10n.directDialogHint
 
         let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = true
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
@@ -789,8 +1036,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         baseURLField.placeholderString = "https://example.com/v1"
         baseURLField.widthAnchor.constraint(equalToConstant: 320).isActive = true
         let tokenField = NSSecureTextField()
+        tokenField.widthAnchor.constraint(equalToConstant: 320).isActive = true
         let modelsField = NSTextField()
         modelsField.placeholderString = "gpt-5.6-sol, gpt-5.6-terra"
+        modelsField.widthAnchor.constraint(equalToConstant: 320).isActive = true
 
         func row(_ label: String, _ field: NSView) -> NSView {
             let container = NSStackView()
@@ -805,6 +1054,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stack.addArrangedSubview(row(l10n.directDialogBaseURL, baseURLField))
         stack.addArrangedSubview(row(l10n.directDialogToken, tokenField))
         stack.addArrangedSubview(row(l10n.directDialogModels, modelsField))
+        // NSAlert uses the accessory view's frame rather than Auto Layout for
+        // sizing, so give the stack an explicit size before presenting it.
+        let accessorySize = stack.fittingSize
+        stack.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: max(accessorySize.width, 478),
+            height: accessorySize.height + 12
+        )
         alert.accessoryView = stack
         alert.addButton(withTitle: l10n.alertOK)
         alert.addButton(withTitle: l10n.quitDialogCancel)
@@ -934,6 +1192,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Run codexmux synchronously and return its combined output (background queue only).
     private func captureCodexMux(_ arguments: [String]) -> String {
+        captureCodexMuxResult(arguments).output
+    }
+
+    /// Run codexmux synchronously and return combined output plus exit status.
+    private func captureCodexMuxResult(_ arguments: [String]) -> (output: String, status: Int32) {
         let process = Process()
         process.executableURL = codexmuxURL
         process.arguments = arguments
@@ -944,11 +1207,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try process.run()
         } catch {
-            return "codexmux is not installed at \(codexmuxURL.path)"
+            return ("codexmux is not installed at \(codexmuxURL.path)", 1)
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        return String(data: data, encoding: .utf8) ?? ""
+        return (String(data: data, encoding: .utf8) ?? "", process.terminationStatus)
     }
 
     private func runCodexMuxDetached(
