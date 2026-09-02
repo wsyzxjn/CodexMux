@@ -28,11 +28,10 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
 
 1. 打开 `/Applications/CodexMux.app`。
 2. 菜单栏将出现 CodexMux 图标，支持以下图形化操作：
-   - **下载并启用 CPA**：点击一次即可自动下载、校验、安装、配置并启动 CPA，同时打开 CPA Web 管理页面；
-   - **打开 CPA Web 管理**：自动携带管理密钥一键登录，方便配置外部模型别名与 API Key；
+   - **CPA**：统一管理安装/启停、随 CodexMux 启动（默认开启）、更新/回滚、配置方案切换、Web 管理入口与管理密钥；
    - **直接端点（Direct Endpoints）**：在弹窗中快速添加/移除原生 Responses 端点与模型映射；
-   - **审批模型覆盖**：为 `codex-auto-review` 指定走特定的 CPA 模型；
-   - **CPA 配置方案切换**：在多个预设 CPA 端点间自由切换；
+   - **高级功能 ▸ 为所有模型声明 Ultra**：开启后在模型目录中为每个模型显示 Codex 侧的 `ultra` 预设；Codex 会把该预设映射到模型支持的实际档位。
+   - **审批模型**：为 `codex-auto-review` 指定走特定的 CPA 模型；
    - **查看日志与状态**：一键打开日志目录或查看服务运行状态。
 3. CodexMux 会在启动时为 Codex Desktop 准备代理令牌；若 Desktop 正在运行会自动重启它。随后打开模型选择器即可看到官方模型与 Direct/CPA 模型。
 
@@ -46,7 +45,10 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
 | --- | --- |
 | `codexmux doctor` | 检查配置、凭据、Token 环境变量及服务连通性 |
 | `codexmux status` | 查看数据路径与 Codex 配置接管状态 |
-| `codexmux cpa install` | 下载、校验并安装托管的本地 CLIProxyAPI |
+| `codexmux cpa install` | 下载、校验并安装最新稳定版的本地 CLIProxyAPI |
+| `codexmux cpa update-check` | 查询最新稳定版并比较当前版本，不执行安装 |
+| `codexmux cpa update [--version <tag>] [--dry-run]` | 校验并更新本地 CPA；`--version` 固定目标版本，`--dry-run` 只检查 |
+| `codexmux cpa rollback` | 恢复更新前的本地 CPA 二进制和版本记录 |
 | `codexmux cpa start` / `stop` | 启动或停止本地 CPA 服务 |
 | `codexmux cpa model-list` | 列出当前 CPA 端点提供的所有可用模型 |
 | `codexmux install` | （无菜单栏时）注册并启动后台 LaunchAgent 并接管配置 |
@@ -56,6 +58,7 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
 
 - **`CODEXMUX_PROXY_TOKEN is missing or does not match`**：退出并重新打开 CodexMux；App 会重新准备 GUI 会话令牌并重启正在运行的 Codex Desktop。仅手动运行 CLI 时才需要自行导出该环境变量。
 - **`CPA: not reachable`**：在菜单栏中确认 CPA 已启动；若使用远端 CPA，确认 `cpa.base_url` 为 HTTPS 地址且远端已允许对应 `cpa_token`。
+- **更新后服务不可用**：先运行 `codexmux cpa rollback` 恢复上一版本；菜单栏的“CPA 更新”也提供同一操作。
 - **模型选择器没有显示 CPA 模型**：运行 `codexmux doctor` 确认连通性；完全重启 Codex 以触发重新拉取模型目录。
 - **停用与卸载**：退出 `CodexMux.app`（或执行 `codexmux uninstall`）即可自动还原 Codex 配置。如需彻底删除数据，清理 `~/Library/Application Support/CodexMux` 目录即可。
 
