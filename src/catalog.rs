@@ -29,6 +29,7 @@ struct StoreState {
 #[derive(Debug)]
 pub struct CatalogStore {
     path: PathBuf,
+    advertise_ultra: bool,
     state: RwLock<StoreState>,
 }
 
@@ -51,6 +52,10 @@ pub struct DirectModel {
 
 impl CatalogStore {
     pub fn load(path: PathBuf) -> Result<Self> {
+        Self::load_with_options(path, false)
+    }
+
+    pub fn load_with_options(path: PathBuf, advertise_ultra: bool) -> Result<Self> {
         let snapshot = if path.exists() {
             let bytes = fs::read(&path)
                 .with_context(|| format!("failed to read catalog snapshot {}", path.display()))?;
@@ -69,6 +74,7 @@ impl CatalogStore {
         };
         Ok(Self {
             path,
+            advertise_ultra,
             state: RwLock::new(StoreState { snapshot }),
         })
     }
@@ -117,6 +123,9 @@ impl CatalogStore {
     pub fn replace(&self, official: &Value, cpa: &Value, direct: &[DirectModel]) -> Result<Value> {
         let mut catalog = merge(official, cpa)?;
         merge_declared_direct(&mut catalog, direct)?;
+        if self.advertise_ultra {
+            advertise_ultra_all(&mut catalog)?;
+        }
         let routes = route_table_from_merged(&catalog)?;
         let bytes = serde_json::to_vec_pretty(&catalog)?;
         if bytes.len() > MAX_CATALOG_BYTES {
@@ -152,6 +161,57 @@ pub fn merge_official_direct(official: &Value, direct: &[DirectModel]) -> Result
     merge_declared_direct(&mut output, direct)?;
     Ok(output)
 }
+
+/// Degraded-view variant that also advertises the Codex-side `ultra` preset.
+pub fn merge_official_direct_with_ultra(official: &Value, direct: &[DirectModel]) -> Result<Value> {
+    let mut output = merge_official_direct(official, direct)?;
+    advertise_ultra_all(&mut output)?;
+    Ok(output)
+}
+
+/// Codex maps the `ultra` preset to a real model-supported effort before the
+/// request leaves the client, so advertising it only changes catalog metadata.
+fn advertise_ultra_all(catalog: &mut Value) -> Result<()> {
+    for model in models_mut(catalog)? {
+        let object = model
+            .as_object_mut()
+            .context("merged catalog contains a non-object model")?;
+        let levels = object
+            .entry("supported_reasoning_levels")
+            .or_insert_with(|| json!([]));
+        let levels = levels
+            .as_array_mut()
+            .context("supported_reasoning_levels must be an array")?;
+        if levels.is_empty() {
+            for (effort, description) in [
+                ("low", "Fast responses with lighter reasoning"),
+                (
+                    "medium",
+                    "Balances speed and reasoning depth for everyday tasks",
+                ),
+                ("high", "Greater reasoning depth for complex problems"),
+                (
+                    "max",
+                    "Maximum available reasoning depth for complex problems",
+                ),
+            ] {
+                levels.push(json!({ "effort": effort, "description": description }));
+            }
+        }
+        let has_ultra = levels.iter().any(|entry| {
+            entry.get("effort").and_then(Value::as_str) == Some(ULTRA_REASONING_EFFORT)
+        });
+        if !has_ultra {
+            levels.push(json!({
+                "effort": ULTRA_REASONING_EFFORT,
+                "description": "Maximum reasoning with proactive multi-agent delegation"
+            }));
+        }
+    }
+    Ok(())
+}
+
+const ULTRA_REASONING_EFFORT: &str = "ultra";
 
 /// Append direct-route model declarations to an already-merged catalog so
 /// declared models stay routable even when CPA's catalog omits them.
@@ -372,6 +432,57 @@ mod tests {
         assert_eq!(merged["models"][1]["display_name"], "5.6 · CPA");
         assert_eq!(merged["models"][1]["context_window"], 1_000_000);
         assert_eq!(merged["models"][1]["unknown_future_field"]["kept"], true);
+    }
+
+    #[test]
+    fn ultra_advertisement_applies_to_every_merged_entry_when_enabled() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("catalog.json");
+        let store = CatalogStore::load_with_options(path.clone(), true).unwrap();
+        store
+            .replace(
+                &json!({"models":[{"slug":"gpt-5.6","priority":1,"supported_reasoning_levels":[{"effort":"high","description":"High"}]}]}),
+                &json!({"models":[{"slug":"deepseek","priority":1,"supported_reasoning_levels":[{"effort":"max","description":"Max"}]}]}),
+                &[DirectModel {
+                    upstream_model: "direct-model".into(),
+                    base_url: "https://direct.example/v1".into(),
+                }],
+            )
+            .unwrap();
+        let catalog = store.current().unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        for slug in ["gpt-5.6", "cpa/deepseek", "cpa/direct-model"] {
+            let model = models.iter().find(|model| model["slug"] == slug).unwrap();
+            let has_ultra = model["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["effort"] == "ultra");
+            assert!(has_ultra, "{slug} did not advertise ultra");
+        }
+    }
+
+    #[test]
+    fn ultra_advertisement_remains_off_by_default() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("catalog.json");
+        let store = CatalogStore::load(path.clone()).unwrap();
+        store
+            .replace(
+                &json!({"models":[{"slug":"gpt-5.6","priority":1,"supported_reasoning_levels":[{"effort":"high","description":"High"}]}]}),
+                &json!({"models":[]}),
+                &[],
+            )
+            .unwrap();
+        let catalog = store.current().unwrap();
+        let model = &catalog["models"][0];
+        assert!(
+            !model["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["effort"] == "ultra")
+        );
     }
 
     #[test]

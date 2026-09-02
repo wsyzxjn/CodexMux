@@ -45,6 +45,22 @@ enum Command {
         #[command(subcommand)]
         command: CpaCommand,
     },
+    /// Manage Codex-facing catalog metadata.
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatalogCommand {
+    /// Show whether the `ultra` preset is advertised for every model.
+    UltraGet,
+    /// Enable or disable `ultra` advertisement for every model.
+    UltraSet {
+        /// `true`/`false`: whether every model advertises `ultra`.
+        enabled: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -233,6 +249,7 @@ fn main() -> Result<()> {
         }
         Command::Uninstall => uninstall(&paths),
         Command::Cpa { command } => cpa(&paths, command),
+        Command::Catalog { command } => catalog(&paths, command),
     }
 }
 
@@ -260,6 +277,25 @@ fn init(paths: &Paths) -> Result<()> {
     );
     println!("set {PROXY_TOKEN_ENV} from credentials.json before starting Codex");
     Ok(())
+}
+
+fn catalog(paths: &Paths, command: CatalogCommand) -> Result<()> {
+    let mut settings = Settings::load(&paths.settings)?;
+    match command {
+        CatalogCommand::UltraGet => {
+            println!("ultra: {}", settings.catalog.advertise_ultra);
+            Ok(())
+        }
+        CatalogCommand::UltraSet { enabled } => {
+            let enabled = enabled
+                .parse::<bool>()
+                .context("enabled must be true or false")?;
+            settings.catalog.advertise_ultra = enabled;
+            settings.save(&paths.settings)?;
+            println!("ultra: {}", enabled);
+            Ok(())
+        }
+    }
 }
 
 fn ensure_initialized(paths: &Paths) -> Result<()> {

@@ -97,7 +97,8 @@ impl AppState {
     ) -> anyhow::Result<Self> {
         settings.validate()?;
         credentials.validate()?;
-        let catalog = CatalogStore::load(catalog_path)?;
+        let catalog =
+            CatalogStore::load_with_options(catalog_path, settings.catalog.advertise_ultra)?;
         let (activity, _) = watch::channel(Instant::now());
         Ok(Self {
             client: reqwest::Client::builder()
@@ -327,7 +328,7 @@ fn merge_catalog_results(
         (Ok(official), Err(cpa_error)) => {
             tracing::warn!(%cpa_error.message, "CPA catalog unavailable; merging direct routes only");
             let direct = crate::cpa::declared_direct_models(&state.cpa_profiles_path);
-            catalog::merge_official_direct(&official, &direct)
+            catalog::merge_official_direct_with_ultra(&official, &direct)
                 .map_err(|error| ProxyError::bad_gateway("catalog", error.to_string()))
         }
         (Err(official_error), cpa_result) => {

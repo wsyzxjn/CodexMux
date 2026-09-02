@@ -72,6 +72,7 @@ fn default_root(data_dir: &Path) -> PathBuf {
 pub struct Settings {
     pub listen: SocketAddr,
     pub cpa: Cpa,
+    pub catalog: Catalog,
 }
 
 impl Default for Settings {
@@ -79,6 +80,7 @@ impl Default for Settings {
         Self {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_PORT),
             cpa: Cpa::default(),
+            catalog: Catalog::default(),
         }
     }
 }
@@ -102,6 +104,15 @@ impl Settings {
         }
         self.cpa.validate()
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Catalog {
+    /// Advertise the Codex-side `ultra` preset for every merged model. Codex
+    /// maps `ultra` to a real model-supported effort before sending requests,
+    /// so this only changes catalog metadata exposed to the Codex client.
+    pub advertise_ultra: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
