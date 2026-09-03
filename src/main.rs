@@ -33,7 +33,12 @@ enum Command {
         launchd_socket: bool,
     },
     /// Show paths and managed configuration state.
-    Status,
+    Status {
+        /// Skip reading the managed Codex configuration. Used by the menu bar
+        /// status poll so it never touches a TCC-gated external volume.
+        #[arg(long)]
+        no_codex_config: bool,
+    },
     /// Validate config, credentials, snapshot, and the managed Codex block.
     Doctor,
     /// Install and start the per-user macOS LaunchAgent.
@@ -177,6 +182,15 @@ enum CpaCommand {
     DirectList,
     /// Remove all direct routes (everything goes through CPA again).
     DirectClear,
+    /// List model ids exposed by a direct Responses endpoint.
+    DirectDiscover {
+        /// Upstream Responses API base URL.
+        #[arg(long)]
+        base_url: String,
+        /// Environment variable containing the direct upstream token.
+        #[arg(long, default_value = "CODEXMUX_DIRECT_TOKEN")]
+        token_env: String,
+    },
     /// Show whether the CPA service should start with CodexMux.
     AutostartGet,
     /// Set whether the CPA service should start with CodexMux.
@@ -212,7 +226,7 @@ fn main() -> Result<()> {
             no_codex_config,
             launchd_socket,
         } => run_async(serve(&paths, no_codex_config, launchd_socket)),
-        Command::Status => status(&paths),
+        Command::Status { no_codex_config } => status(&paths, no_codex_config),
         Command::Doctor => run_async(doctor(&paths)),
         Command::Install => {
             ensure_initialized(&paths)?;
@@ -223,7 +237,9 @@ fn main() -> Result<()> {
             // processes may be denied access to the Codex config's volume by
             // macOS TCC, which blocks open() indefinitely.
             let manager = config_manager(&paths)?;
-            let lease = manager.enable(&format!("http://{}/v1", settings.listen))?;
+            let lease = manager
+                .enable(&format!("http://{}/v1", settings.listen))
+                .context("failed to enable the managed Codex configuration")?;
             let executable = std::env::current_exe()?.canonicalize()?;
             let install_result =
                 launch_agent::install(&paths, &executable, &codex_config_path()?, settings.listen);
@@ -484,7 +500,7 @@ fn unset_launchctl_proxy_token() -> Result<()> {
     Ok(())
 }
 
-fn status(paths: &Paths) -> Result<()> {
+fn status(paths: &Paths, no_codex_config: bool) -> Result<()> {
     println!("root: {}", paths.root.display());
     println!("settings: {}", paths.settings.display());
     println!("credentials: {}", paths.credentials.display());
@@ -497,10 +513,14 @@ fn status(paths: &Paths) -> Result<()> {
             launch_agent::RuntimeState::NotInstalled => "not installed",
         }
     );
-    let status = config_manager(paths)?.status()?;
-    println!("enabled: {}", status.enabled);
-    println!("codex config: {}", status.config_path.display());
-    println!("config unchanged: {}", status.unchanged_since_enable);
+    if no_codex_config {
+        println!("enabled: not checked (--no-codex-config)");
+    } else {
+        let status = config_manager(paths)?.status()?;
+        println!("enabled: {}", status.enabled);
+        println!("codex config: {}", status.config_path.display());
+        println!("config unchanged: {}", status.unchanged_since_enable);
+    }
     Ok(())
 }
 
@@ -927,6 +947,16 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
         CpaCommand::DirectClear => {
             codexmux::cpa::set_direct_routes(paths, Vec::new())?;
             println!("direct routes cleared");
+        }
+        CpaCommand::DirectDiscover {
+            base_url,
+            token_env,
+        } => {
+            let token = std::env::var(&token_env)
+                .with_context(|| format!("{token_env} must contain the direct route token"))?;
+            for model in codexmux::cpa::direct_model_slugs(&base_url, &token)? {
+                println!("{model}");
+            }
         }
         CpaCommand::AutostartGet => match codexmux::cpa::cpa_autostart(&paths.cpa_profiles) {
             Some(true) => println!("cpa autostart: enabled"),

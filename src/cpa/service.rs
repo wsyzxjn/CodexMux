@@ -44,7 +44,7 @@ fn bootstrap_service(paths: &Paths) -> Result<()> {
         &config_path(paths),
         &logs.join("cpa-stdout.log"),
         &logs.join("cpa-stderr.log"),
-    );
+    )?;
     let plist = plist_path()?;
     atomic_write(&plist, document.as_bytes())?;
     bootstrap(&plist)
@@ -155,8 +155,11 @@ fn launch_domain() -> Result<String> {
     Ok(format!("gui/{}", String::from_utf8(output.stdout)?.trim()))
 }
 
-fn render_agent(binary: &Path, config: &Path, stdout: &Path, stderr: &Path) -> String {
-    format!(
+fn render_agent(binary: &Path, config: &Path, stdout: &Path, stderr: &Path) -> Result<String> {
+    let working_dir = binary
+        .parent()
+        .context("CLIProxyAPI binary path has no parent directory")?;
+    Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -164,6 +167,7 @@ fn render_agent(binary: &Path, config: &Path, stdout: &Path, stderr: &Path) -> S
   <key>Label</key><string>{CPA_AGENT_LABEL}</string>
   <key>ProgramArguments</key>
   <array><string>{}</string><string>-config</string><string>{}</string></array>
+  <key>WorkingDirectory</key><string>{}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
@@ -174,9 +178,10 @@ fn render_agent(binary: &Path, config: &Path, stdout: &Path, stderr: &Path) -> S
 "#,
         xml(binary),
         xml(config),
+        xml(working_dir),
         xml(stdout),
         xml(stderr),
-    )
+    ))
 }
 
 fn xml(path: &Path) -> String {

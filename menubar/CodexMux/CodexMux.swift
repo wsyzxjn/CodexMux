@@ -73,6 +73,19 @@ struct L10n {
     let directDialogToken: String
     let directDialogModels: String
     let directDialogHint: String
+    let directDiscover: String
+    let directDiscovering: String
+    let directDiscoverFailed: String
+    let directMissingFields: String
+    let directMissingModels: String
+    let directModelsFound: String
+    let directNoModels: String
+    let directSelectAll: String
+    let directClearAll: String
+    let directSave: String
+    let directManualModels: String
+    let directManualPlaceholder: String
+    let directTokenPlaceholder: String
 
     static let english = L10n(
         codexmuxStatusRunning: "CodexMux: running",
@@ -144,7 +157,20 @@ struct L10n {
         directDialogBaseURL: "Base URL:",
         directDialogToken: "Token:",
         directDialogModels: "Models (comma-separated):",
-        directDialogHint: "Models route as cpa/<slug> straight to this endpoint; CPA is bypassed."
+        directDialogHint: "Models route as cpa/<slug> straight to this endpoint; CPA is bypassed.",
+        directDiscover: "Connect & Fetch Models",
+        directDiscovering: "Fetching models…",
+        directDiscoverFailed: "Failed to fetch models. Check the URL, token, and network.",
+        directMissingFields: "Enter the base URL and token first.",
+        directMissingModels: "Select or add at least one model.",
+        directModelsFound: "Found %d models",
+        directNoModels: "No models found; add them manually.",
+        directSelectAll: "Select All",
+        directClearAll: "Clear",
+        directSave: "Save",
+        directManualModels: "Additional models (comma-separated, optional):",
+        directManualPlaceholder: "gpt-5.6-sol, gpt-5.6-terra",
+        directTokenPlaceholder: "Token",
     )
 
     static let chinese = L10n(
@@ -179,9 +205,9 @@ struct L10n {
         copyCpaManagementKey: "复制 CPA 管理密钥",
         profiles: "CPA 配置",
         profileNoProfiles: "（暂无保存的配置）",
-        directEndpoints: "直接端点",
-        directNoEndpoints: "（暂无直接端点）",
-        directAdd: "添加直接端点…",
+        directEndpoints: "直连端点",
+        directNoEndpoints: "（暂无直连端点）",
+        directAdd: "添加直连端点…",
         directRemove: "移除",
         advanced: "高级功能",
         reviewModel: "审批模型",
@@ -207,17 +233,30 @@ struct L10n {
         openCpaManagementFailed: "打开 CPA Web 管理失败，请检查 CPA 地址。",
         copyCpaManagementKeyFailed: "复制 CPA 管理密钥失败，请更新 CodexMux 后重试。",
         reviewSetFailed: "设置审批模型失败，请查看日志。",
-        directSetFailed: "保存直接端点失败，请查看日志。",
+        directSetFailed: "保存直连端点失败，请查看日志。",
         quitDialogTitle: "退出 CodexMux？",
         quitDialogBody: "将停止 CodexMux 代理与 CPA 服务，并还原 Codex 配置。",
         quitDialogConfirm: "退出并停止服务",
         quitDialogCancel: "取消",
         alertOK: "好",
-        directDialogTitle: "添加直接端点",
+        directDialogTitle: "添加直连端点",
         directDialogBaseURL: "基础 URL：",
         directDialogToken: "令牌：",
         directDialogModels: "模型（逗号分隔）：",
-        directDialogHint: "模型将以 cpa/<slug> 直接路由到该端点，绕过 CPA。"
+        directDialogHint: "模型将以 cpa/<slug> 直连路由到该端点，绕过 CPA。",
+        directDiscover: "连接并获取模型",
+        directDiscovering: "正在获取模型…",
+        directDiscoverFailed: "获取模型失败，请检查地址、令牌和网络。",
+        directMissingFields: "请先填写基础 URL 和令牌。",
+        directMissingModels: "请至少选择或填写一个模型。",
+        directModelsFound: "已发现 %d 个模型",
+        directNoModels: "未发现模型，可手动填写。",
+        directSelectAll: "全选",
+        directClearAll: "清空",
+        directSave: "保存",
+        directManualModels: "手动补充模型（逗号分隔，可选）：",
+        directManualPlaceholder: "gpt-5.6-sol, gpt-5.6-terra",
+        directTokenPlaceholder: "令牌",
     )
 
     /// True when this is the Chinese localization.
@@ -310,6 +349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellables = Set<AnyCancellable>()
     private let appUpdater = AppUpdater(repository: "wsyzxjn/CodexMux")
     private var aboutWindowController: AboutWindowController?
+    private var directWindowController: DirectEndpointWindowController?
     private var appUpdateInProgress = false
 
     /// Release builds are self-contained. Copy the bundled CLI to a stable
@@ -378,6 +418,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var l10n: L10n { L10n.forLanguage(language) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Initialize the lazy CLI URL on the main thread before status and
+        // controller actions race to access it from background queues.
+        _ = codexmuxURL
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateIcon()
         menu = NSMenu()
@@ -388,15 +431,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The menu bar app is the controller: opening it brings the proxy up
         // and enables the managed Codex configuration from this GUI context
         // (LaunchAgent serve uses --no-codex-config because of TCC).
-        runCodexMuxDetached(["install"]) { [weak self] ok in
-            if !ok {
-                self?.showAlert(self?.l10n.restartFailed ?? "")
-            } else {
-                self?.relaunchRunningCodex()
+        let managedState = URL(fileURLWithPath: codexmuxHome)
+            .appendingPathComponent("state/codex-config.json")
+        if FileManager.default.fileExists(atPath: managedState.path) {
+            refreshStatus()
+        } else {
+            runCodexMuxDetached(["install"]) { [weak self] ok in
+                if !ok {
+                    self?.showAlert(self?.l10n.restartFailed ?? "")
+                } else {
+                    self?.relaunchRunningCodex()
+                }
+                // launchd now wakes the proxy and an enabled local CPA only when
+                // Codex Desktop or CLI actually connects.
+                self?.refreshStatus()
             }
-            // launchd now wakes the proxy and an enabled local CPA only when
-            // Codex Desktop or CLI actually connects.
-            self?.refreshStatus()
         }
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.refreshStatus()
@@ -542,7 +591,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func checkProxy(_ completion: @escaping (Bool, Bool) -> Void) {
-        runCodexMux(["status"]) { output in
+        runCodexMux(["status", "--no-codex-config"]) { output in
             let running = output.contains("proxy service: running")
             let idle = output.contains("proxy service: idle")
             completion(running || idle, idle)
@@ -1198,74 +1247,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func addDirectRoute() {
         let l10n = self.l10n
-        let alert = NSAlert()
-        alert.messageText = l10n.directDialogTitle
-        alert.informativeText = l10n.directDialogHint
-
-        let stack = NSStackView()
-        stack.translatesAutoresizingMaskIntoConstraints = true
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 6
-
-        let baseURLField = NSTextField()
-        baseURLField.placeholderString = "https://example.com/v1"
-        baseURLField.widthAnchor.constraint(equalToConstant: 320).isActive = true
-        let tokenField = NSSecureTextField()
-        tokenField.widthAnchor.constraint(equalToConstant: 320).isActive = true
-        let modelsField = NSTextField()
-        modelsField.placeholderString = "gpt-5.6-sol, gpt-5.6-terra"
-        modelsField.widthAnchor.constraint(equalToConstant: 320).isActive = true
-
-        func row(_ label: String, _ field: NSView) -> NSView {
-            let container = NSStackView()
-            container.orientation = .horizontal
-            container.spacing = 8
-            let text = NSTextField(labelWithString: label)
-            text.widthAnchor.constraint(equalToConstant: 150).isActive = true
-            container.addArrangedSubview(text)
-            container.addArrangedSubview(field)
-            return container
-        }
-        stack.addArrangedSubview(row(l10n.directDialogBaseURL, baseURLField))
-        stack.addArrangedSubview(row(l10n.directDialogToken, tokenField))
-        stack.addArrangedSubview(row(l10n.directDialogModels, modelsField))
-        // NSAlert uses the accessory view's frame rather than Auto Layout for
-        // sizing, so give the stack an explicit size before presenting it.
-        let accessorySize = stack.fittingSize
-        stack.frame = NSRect(
-            x: 0,
-            y: 0,
-            width: max(accessorySize.width, 478),
-            height: accessorySize.height + 12
+        let controller = directWindowController ?? DirectEndpointWindowController()
+        controller.configure(
+            l10n: l10n,
+            onDiscover: { [weak self, weak controller] baseURL, token in
+                self?.discoverDirectModels(baseURL: baseURL, token: token, controller: controller)
+            },
+            onSave: { [weak self] baseURL, token, models, completion in
+                self?.saveDirectRoute(
+                    baseURL: baseURL,
+                    token: token,
+                    models: models,
+                    completion: completion
+                )
+            }
         )
-        alert.accessoryView = stack
-        alert.addButton(withTitle: l10n.alertOK)
-        alert.addButton(withTitle: l10n.quitDialogCancel)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        directWindowController = controller
+        controller.present()
+    }
 
-        let baseURL = baseURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let token = tokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        var models: [String] = []
-        for rawModel in modelsField.stringValue.split(separator: ",") {
-            let model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !model.isEmpty {
-                models.append(model)
+    private func discoverDirectModels(
+        baseURL: String,
+        token: String,
+        controller: DirectEndpointWindowController?
+    ) {
+        guard let controller else { return }
+        var environment = codexMuxEnvironment
+        environment["CODEXMUX_DIRECT_TOKEN"] = token
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.captureCodexMuxResult(
+                ["cpa", "direct-discover", "--base-url", baseURL],
+                environment: environment
+            )
+            DispatchQueue.main.async {
+                controller.setDiscovering(false)
+                if result.status == 0 {
+                    let models = result.output
+                        .split(whereSeparator: \.isNewline)
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                    controller.setModels(models)
+                } else {
+                    let detail = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    controller.setError(
+                        detail.isEmpty
+                            ? self.l10n.directDiscoverFailed
+                            : "\(self.l10n.directDiscoverFailed)\n\(detail)"
+                    )
+                }
             }
         }
-        guard !baseURL.isEmpty, !token.isEmpty, !models.isEmpty else { return }
+    }
 
-        // The CLI reads the upstream token from the environment so it never
-        // appears in process arguments or menu logs.
+    private func saveDirectRoute(
+        baseURL: String,
+        token: String,
+        models: [String],
+        completion: @escaping (Bool) -> Void
+    ) {
         var environment = codexMuxEnvironment
         environment["CODEXMUX_DIRECT_TOKEN"] = token
         runCodexMuxDetached(
             ["cpa", "direct-add", models.joined(separator: ","), "--base-url", baseURL],
             environment: environment
         ) { [weak self] ok in
-            if !ok {
-                self?.showAlert(self?.l10n.directSetFailed ?? "")
-            }
+            completion(ok)
             self?.refreshStatus()
         }
     }
@@ -1372,11 +1419,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Run codexmux synchronously and return combined output plus exit status.
-    private func captureCodexMuxResult(_ arguments: [String]) -> (output: String, status: Int32) {
+    private func captureCodexMuxResult(
+        _ arguments: [String],
+        environment: [String: String]? = nil
+    ) -> (output: String, status: Int32) {
         let process = Process()
         process.executableURL = codexmuxURL
         process.arguments = arguments
-        process.environment = codexMuxEnvironment
+        process.environment = environment ?? codexMuxEnvironment
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe

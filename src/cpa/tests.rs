@@ -368,11 +368,15 @@ alias = \"gpt-5.6-terra\"
             Path::new("/tmp/root/cpa/config.yaml"),
             Path::new("/tmp/root/logs/out.log"),
             Path::new("/tmp/root/logs/err.log"),
-        );
+        )
+        .unwrap();
         assert!(plist.contains("/tmp/a&amp;b/cli-proxy-api"));
         assert!(plist.contains("<string>-config</string>"));
         assert!(plist.contains("/tmp/root/cpa/config.yaml"));
         assert!(plist.contains("dev.codexmux.cpa"));
+        assert!(plist.contains(
+            "<key>WorkingDirectory</key><string>/tmp/a&amp;b</string>"
+        ));
     }
 
     #[test]

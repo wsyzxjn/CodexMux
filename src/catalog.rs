@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fmt, fs,
     path::PathBuf,
     sync::RwLock,
 };
@@ -38,6 +38,16 @@ pub enum CatalogRoute {
     Official,
     Cpa { upstream_model: String },
     AutoReview,
+}
+
+impl fmt::Display for CatalogRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Official => formatter.write_str("official"),
+            Self::Cpa { upstream_model } => write!(formatter, "cpa:{upstream_model}"),
+            Self::AutoReview => formatter.write_str("auto-review"),
+        }
+    }
 }
 
 /// A model declared by a direct route: proxied straight to an upstream even

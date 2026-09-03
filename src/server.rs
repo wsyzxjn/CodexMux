@@ -207,9 +207,29 @@ async fn require_proxy_token(
     request: Request,
     next: Next,
 ) -> Result<axum::response::Response, ProxyError> {
-    authenticate(request.headers(), &state.credentials.proxy_token)?;
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = tokio::time::Instant::now();
+    if let Err(error) = authenticate(request.headers(), &state.credentials.proxy_token) {
+        tracing::warn!(
+            %method,
+            %path,
+            status = error.status.as_u16(),
+            error_code = error.code,
+            "request rejected"
+        );
+        return Err(error);
+    }
     state.touch();
-    Ok(next.run(request).await)
+    let response = next.run(request).await;
+    tracing::debug!(
+        %method,
+        %path,
+        status = response.status().as_u16(),
+        latency_ms = started.elapsed().as_millis() as u64,
+        "request completed"
+    );
+    Ok(response)
 }
 
 async fn health() -> Json<Value> {
@@ -478,20 +498,51 @@ async fn handle_responses(
         turn_input,
     };
 
-    let catalog_route = state
-        .catalog
-        .resolve_with_direct(
-            &request.model,
-            &crate::cpa::declared_direct_models(&state.cpa_profiles_path),
-        )
-        .map_err(|error| ProxyError::bad_request("route", error.to_string()))?;
+    let catalog_route = match state.catalog.resolve_with_direct(
+        &request.model,
+        &crate::cpa::declared_direct_models(&state.cpa_profiles_path),
+    ) {
+        Ok(route) => route,
+        Err(error) => {
+            let error = ProxyError::bad_request("route", error.to_string());
+            tracing::warn!(
+                model = %request.model,
+                endpoint,
+                status = error.status.as_u16(),
+                error_code = error.code,
+                error = %error.message,
+                "response route resolution failed"
+            );
+            return Err(error);
+        }
+    };
+    tracing::debug!(
+        model = %request.model,
+        endpoint,
+        catalog_route = %catalog_route,
+        "response route resolved"
+    );
 
     match catalog_route {
         CatalogRoute::Official => {
             forward_response(&state, &headers, endpoint, &request, &Route::Official, None).await
         }
         CatalogRoute::Cpa { upstream_model } => {
-            let (route, routed_model) = cpa_route(&state, &upstream_model)?;
+            let (route, routed_model) = match cpa_route(&state, &upstream_model) {
+                Ok(route) => route,
+                Err(error) => {
+                    tracing::warn!(
+                        model = %request.model,
+                        endpoint,
+                        upstream_model = %upstream_model,
+                        status = error.status.as_u16(),
+                        error_code = error.code,
+                        error = %error.message,
+                        "CPA route selection failed"
+                    );
+                    return Err(error);
+                }
+            };
             forward_response(
                 &state,
                 &headers,
@@ -514,13 +565,37 @@ async fn handle_responses(
                 ) {
                     Ok(CatalogRoute::Cpa { upstream_model }) => upstream_model,
                     _ => {
-                        return Err(ProxyError::bad_request(
+                        let error = ProxyError::bad_request(
                             "review_override",
                             format!("review override model {local_model} is not in the catalog"),
-                        ));
+                        );
+                        tracing::warn!(
+                            model = %request.model,
+                            endpoint,
+                            review_override = %slug,
+                            status = error.status.as_u16(),
+                            error_code = error.code,
+                            error = %error.message,
+                            "review override resolution failed"
+                        );
+                        return Err(error);
                     }
                 };
-                let (route, routed_model) = cpa_route(&state, &upstream_model)?;
+                let (route, routed_model) = match cpa_route(&state, &upstream_model) {
+                    Ok(route) => route,
+                    Err(error) => {
+                        tracing::warn!(
+                            model = %request.model,
+                            endpoint,
+                            upstream_model = %upstream_model,
+                            status = error.status.as_u16(),
+                            error_code = error.code,
+                            error = %error.message,
+                            "review override route selection failed"
+                        );
+                        return Err(error);
+                    }
+                };
                 forward_response(
                     &state,
                     &headers,
@@ -571,6 +646,28 @@ async fn forward_response(
     route: &Route,
     cpa_upstream_model: Option<&str>,
 ) -> Result<Response<Body>, ProxyError> {
+    let started = tokio::time::Instant::now();
+    let result =
+        forward_response_inner(state, headers, endpoint, request, route, cpa_upstream_model).await;
+    log_forward_result(
+        request,
+        route,
+        cpa_upstream_model,
+        endpoint,
+        started,
+        &result,
+    );
+    result
+}
+
+async fn forward_response_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    endpoint: &str,
+    request: &ResponseRequest,
+    route: &Route,
+    cpa_upstream_model: Option<&str>,
+) -> Result<Response<Body>, ProxyError> {
     let (outgoing, route_id) = prepare_request(
         &request.body,
         &request.value,
@@ -588,8 +685,74 @@ async fn forward_response(
         request.turn_input.clone(),
         route_id,
         state.continuity.clone(),
+        &request.model,
     )
     .await
+}
+
+fn log_forward_result(
+    request: &ResponseRequest,
+    route: &Route,
+    upstream_model: Option<&str>,
+    endpoint: &str,
+    started: tokio::time::Instant,
+    result: &Result<Response<Body>, ProxyError>,
+) {
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let stream = request
+        .value
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (route_name, upstream_host) = match route {
+        Route::Official => ("official", None),
+        Route::Cpa => ("cpa", None),
+        Route::Direct { base_url, .. } => {
+            let host = base_url
+                .split("://")
+                .nth(1)
+                .unwrap_or(base_url)
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            ("direct", Some(host))
+        }
+    };
+    match result {
+        Ok(response) => {
+            tracing::info!(
+                model = %request.model,
+                upstream_model = ?upstream_model,
+                upstream_host = ?upstream_host,
+                route = route_name,
+                endpoint,
+                status = response.status().as_u16(),
+                stream,
+                has_parent = request.parent.is_some(),
+                input_items = request.turn_input.len(),
+                latency_ms,
+                "response forwarded"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                model = %request.model,
+                upstream_model = ?upstream_model,
+                upstream_host = ?upstream_host,
+                route = route_name,
+                endpoint,
+                status = error.status.as_u16(),
+                error_code = error.code,
+                error = %error.message,
+                stream,
+                has_parent = request.parent.is_some(),
+                input_items = request.turn_input.len(),
+                latency_ms,
+                "response forwarding failed"
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -665,6 +828,7 @@ async fn finish_response(
     turn_input: Vec<Value>,
     route_id: String,
     continuity: Arc<ContinuityStore>,
+    model: &str,
 ) -> Result<Response<Body>, ProxyError> {
     let status = upstream.status();
     let is_sse = upstream
@@ -683,7 +847,7 @@ async fn finish_response(
 
     if is_sse {
         Ok(streaming_response(
-            upstream, parent, turn_input, route_id, continuity,
+            upstream, parent, turn_input, route_id, continuity, model,
         ))
     } else {
         non_streaming_response(upstream, parent, turn_input, route_id, &continuity).await
@@ -863,7 +1027,9 @@ fn streaming_response(
     turn_input: Vec<Value>,
     route_id: String,
     continuity: Arc<ContinuityStore>,
+    model: &str,
 ) -> Response<Body> {
+    let model = model.to_owned();
     let source = upstream.bytes_stream();
     let output = stream! {
         let mut source = Box::pin(source);
@@ -890,11 +1056,18 @@ fn streaming_response(
                     yield Ok::<Bytes, io::Error>(chunk);
                 }
                 Err(error) => {
+                    tracing::warn!(
+                        %model,
+                        route_id = %route_id,
+                        error = %error,
+                        "upstream response stream failed"
+                    );
                     yield Err(io::Error::other(error));
                     return;
                 }
             }
         }
+        tracing::debug!(%model, route_id = %route_id, "upstream response stream completed");
         if !recorded && capture_bytes <= MAX_CAPTURE_BYTES
             && let Some(response) = capture.finish()
         {

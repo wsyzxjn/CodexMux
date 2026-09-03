@@ -4,7 +4,7 @@ CodexMux 是面向 macOS 的本地模型路由器，让 Codex Desktop 和 Codex 
 
 - **官方模型**：当前 ChatGPT 账号可用的官方 Codex 模型（名称不变，如 `gpt-5.6`）；
 - **CPA 外部模型**：通过 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 接入的外部模型（统一加 `cpa/` 前缀，如 `cpa/gpt-5.6`、`cpa/glm-5.3-uni`）；
-- **直接端点（Direct Endpoints）**：显式直连第三方原生 Responses API 端点（无需安装 CPA 亦可使用）。
+- **直连端点（Direct Endpoints）**：显式直连第三方原生 Responses API 端点（无需安装 CPA 亦可使用）。
 
 CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与模型切换时的公开对话历史安全衔接。
 
@@ -22,14 +22,14 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
 
 ### 2. 直接路由：打开即可体验
 
-首次启动不安装 CPA 也可以使用官方模型和 Direct Endpoint。点击菜单栏的“直接端点”，填入原生 Responses API 的地址、令牌和模型列表，CodexMux 会把对应的 `cpa/<slug>` 模型直接路由到该端点。令牌只保存在本机权限为 `0600` 的私有配置中。
+首次启动不安装 CPA 也可以使用官方模型和 Direct Endpoint。点击菜单栏的“直连端点”，填入原生 Responses API 的地址、令牌和模型列表，CodexMux 会把对应的 `cpa/<slug>` 模型直接路由到该端点。令牌只保存在本机权限为 `0600` 的私有配置中。
 
 ### 3. 启动与日常使用
 
 1. 打开 `/Applications/CodexMux.app`。
 2. 菜单栏将出现 CodexMux 图标，支持以下图形化操作：
    - **CPA**：统一管理安装/启停、随 CodexMux 启动（默认开启）、更新/回滚、配置方案切换、Web 管理入口与管理密钥；
-   - **直接端点（Direct Endpoints）**：在弹窗中快速添加/移除原生 Responses 端点与模型映射；
+   - **直连端点（Direct Endpoints）**：在弹窗中快速添加/移除原生 Responses 端点与模型映射；
    - **高级功能 ▸ 为所有模型声明 Ultra**：开启后在模型目录中为每个模型显示 Codex 侧的 `ultra` 预设；Codex 会把该预设映射到模型支持的实际档位。
    - **审批模型**：为 `codex-auto-review` 指定走特定的 CPA 模型；
    - **关于与 App 更新**：查看 App/内置 CLI 版本及源码仓库；可检查 GitHub 最新稳定版，下载后校验 `SHA256SUMS`、Bundle 标识、版本和代码签名，再备份当前 App、替换并重新启动；

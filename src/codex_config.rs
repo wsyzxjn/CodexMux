@@ -183,10 +183,29 @@ impl ConfigManager {
 
     fn ensure_managed_block(&self, state: &ConfigState) -> Result<()> {
         let current = fs::read(&self.config_path)?;
-        anyhow::ensure!(
-            contains_block(&current, &state.managed_block),
-            "Codex config changed inside the managed CodexMux block"
-        );
+        if contains_block(&current, &state.managed_block) {
+            return Ok(());
+        }
+        // Codex Desktop rewrites config.toml on its own settings edits and
+        // has stomped only the selector line before. Rewrite the managed
+        // region in place, preserving everything around it so a later
+        // uninstall still restores the exact pre-CodexMux file.
+        let text = std::str::from_utf8(&current).context("Codex config is not UTF-8")?;
+        let start = text
+            .find(START_MARKER)
+            .context("CodexMux managed block is missing from the Codex config")?;
+        let content_start = start + START_MARKER.len();
+        let end = text[content_start..]
+            .find(END_MARKER)
+            .map(|offset| content_start + offset)
+            .context("CodexMux managed block end marker is missing from the Codex config")?;
+        let tail = text[end + END_MARKER.len()..].trim_start_matches(['\n', '\r']);
+        let mut rewritten = String::with_capacity(start + state.managed_block.len() + tail.len());
+        rewritten.push_str(&text[..start]);
+        rewritten.push_str(&state.managed_block);
+        rewritten.push_str(tail);
+        let rewritten = rewritten.into_bytes();
+        replace_if_unchanged(&self.config_path, &current, &rewritten, true)?;
         Ok(())
     }
 
@@ -541,6 +560,51 @@ mod tests {
             fs::read_to_string(&config).unwrap(),
             "model = \"gpt\"\napproval_policy = \"never\"\n"
         );
+    }
+
+    #[test]
+    fn enable_heals_a_selector_edit_inside_the_managed_block() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        fs::write(&config, b"model = \"gpt\"\n").unwrap();
+        let manager = manager(root.path(), config.clone());
+        let lease = manager.enable(LOOPBACK_BASE_URL).unwrap();
+        drop(lease);
+
+        let enabled = fs::read_to_string(&config).unwrap();
+        let stomped = enabled.replace(
+            "model_provider = \"codexmux\"",
+            "model_provider = \"openai\"",
+        );
+        fs::write(&config, &stomped).unwrap();
+
+        let lease = manager.enable(LOOPBACK_BASE_URL).unwrap();
+        let healed = fs::read_to_string(&config).unwrap();
+        // The selector is restored and the file is exactly the enabled shape
+        // again, so a future desktop rewrite is healed the same way.
+        assert_eq!(healed, enabled);
+        let document = healed.parse::<DocumentMut>().unwrap();
+        assert_eq!(document["model_provider"].as_str().unwrap(), "codexmux");
+        lease.restore().unwrap();
+        assert_eq!(fs::read(&config).unwrap(), b"model = \"gpt\"\n");
+    }
+
+    #[test]
+    fn enable_fails_when_the_managed_block_is_missing() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        fs::write(&config, b"model = \"gpt\"\n").unwrap();
+        let manager = manager(root.path(), config.clone());
+        let lease = manager.enable(LOOPBACK_BASE_URL).unwrap();
+        drop(lease);
+
+        let current = fs::read_to_string(&config).unwrap();
+        let start = current.find(START_MARKER).unwrap();
+        let end = current.find(END_MARKER).unwrap() + END_MARKER.len();
+        fs::write(&config, format!("{}{}", &current[..start], &current[end..])).unwrap();
+
+        let error = manager.enable(LOOPBACK_BASE_URL).unwrap_err();
+        assert!(error.to_string().contains("missing"));
     }
 
     #[test]

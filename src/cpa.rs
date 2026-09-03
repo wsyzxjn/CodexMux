@@ -120,6 +120,16 @@ fn model_slugs_from_value(value: &serde_json::Value) -> Result<Vec<String>> {
     Ok(slugs)
 }
 
+/// Fetch model ids from a direct Responses endpoint without persisting them.
+pub fn direct_model_slugs(base_url: &str, token: &str) -> Result<Vec<String>> {
+    model_slugs(
+        &Cpa {
+            base_url: base_url.to_owned(),
+        },
+        token,
+    )
+}
+
 // These files share this module's private namespace. Keeping the boundaries here
 // avoids widening internal APIs merely to organize the implementation.
 include!("cpa/install.rs");
