@@ -43,6 +43,15 @@ struct L10n {
     let reviewDefault: String
     let profileActiveSuffix: String
     let language: String
+    let about: String
+    let checkAppUpdates: String
+    let checkingAppUpdates: String
+    let openRepository: String
+    let appUpToDate: String
+    let appUpdateCheckFailed: String
+    let appUpdateFailed: String
+    let appUpdateDialogTitle: String
+    let appUpdateDialogInstall: String
     let quit: String
     let restartFailed: String
     let stopFailed: String
@@ -106,6 +115,15 @@ struct L10n {
         reviewDefault: "Default (official route)",
         profileActiveSuffix: "  ✓",
         language: "Language",
+        about: "About CodexMux…",
+        checkAppUpdates: "Check for CodexMux Updates…",
+        checkingAppUpdates: "Checking for updates…",
+        openRepository: "Open Repository",
+        appUpToDate: "CodexMux is up to date.",
+        appUpdateCheckFailed: "Failed to check for CodexMux updates.",
+        appUpdateFailed: "Failed to prepare the CodexMux update. The installed app was not changed.",
+        appUpdateDialogTitle: "Update CodexMux?",
+        appUpdateDialogInstall: "Install and Restart",
         quit: "Quit CodexMux",
         restartFailed: "Failed to restart CodexMux. See logs.",
         stopFailed: "Failed to stop CodexMux. See logs.",
@@ -170,6 +188,15 @@ struct L10n {
         reviewDefault: "默认（官方路由）",
         profileActiveSuffix: "  ✓",
         language: "语言",
+        about: "关于 CodexMux…",
+        checkAppUpdates: "检查 CodexMux 更新…",
+        checkingAppUpdates: "正在检查更新…",
+        openRepository: "打开仓库",
+        appUpToDate: "CodexMux 已是最新版本。",
+        appUpdateCheckFailed: "检查 CodexMux 更新失败。",
+        appUpdateFailed: "准备 CodexMux 更新失败，已安装的 App 未被修改。",
+        appUpdateDialogTitle: "更新 CodexMux？",
+        appUpdateDialogInstall: "安装并重新启动",
         quit: "退出 CodexMux",
         restartFailed: "重启 CodexMux 失败，请查看日志。",
         stopFailed: "停止 CodexMux 失败，请查看日志。",
@@ -213,6 +240,17 @@ struct L10n {
             return "将受管的本地 CPA 从 \(from) 更新到 \(to)。更新后会重启并校验服务；失败时自动恢复上一版本。"
         }
         return "Update the managed local CPA from \(from) to \(to). The service is restarted and validated; the previous version is restored on failure."
+    }
+
+    func appUpdateDialogBody(from: String, to: String) -> String {
+        if isChinese {
+            return "将 CodexMux 从 \(from) 更新到 \(to)。下载内容会经过校验，当前 App 会在替换前保留备份。"
+        }
+        return "Update CodexMux from \(from) to \(to). The download is verified and the current app is backed up before replacement."
+    }
+
+    func appUpdateAvailable(_ version: String) -> String {
+        isChinese ? "可用更新：\(version)" : "Update available: \(version)"
     }
 
     func profileSwitchFailed(_ name: String) -> String {
@@ -265,10 +303,14 @@ extension Array where Element: Hashable {
 /// service). General model selection stays in Codex; the only routing control
 /// here is the explicit codex-auto-review override.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let repositoryURL = URL(string: "https://github.com/wsyzxjn/CodexMux")!
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
+    private let appUpdater = AppUpdater(repository: "wsyzxjn/CodexMux")
+    private var aboutWindowController: AboutWindowController?
+    private var appUpdateInProgress = false
 
     /// Release builds are self-contained. Copy the bundled CLI to a stable
     /// private runtime path so LaunchAgents keep working if the App is moved.
@@ -829,6 +871,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(languageItem)
 
         menu.addItem(.separator())
+        let about = NSMenuItem(title: l10n.about, action: #selector(showAbout),
+                               keyEquivalent: "")
+        about.target = self
+        menu.addItem(about)
+
+        let checkAppUpdates = NSMenuItem(
+            title: appUpdateInProgress ? l10n.checkingAppUpdates : l10n.checkAppUpdates,
+            action: #selector(checkAppUpdates),
+            keyEquivalent: ""
+        )
+        checkAppUpdates.target = self
+        checkAppUpdates.isEnabled = !appUpdateInProgress
+        menu.addItem(checkAppUpdates)
+
+        menu.addItem(.separator())
         let quit = NSMenuItem(title: l10n.quit, action: #selector(confirmQuit(_:)),
                               keyEquivalent: "q")
         quit.target = self
@@ -836,6 +893,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Actions
+
+    @objc private func showAbout() {
+        let controller = aboutWindowController ?? AboutWindowController(
+            repositoryURL: Self.repositoryURL
+        )
+        controller.configure(
+            appVersion: appVersion,
+            cliVersion: bundledCLIVersion,
+            l10n: l10n,
+            isChecking: appUpdateInProgress,
+            onCheckForUpdates: { [weak self] in self?.beginAppUpdateCheck() }
+        )
+        aboutWindowController = controller
+        controller.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func checkAppUpdates() {
+        beginAppUpdateCheck()
+    }
+
+    private var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "unknown"
+    }
+
+    private var bundledCLIVersion: String {
+        let output = captureCodexMux(["--version"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return output.isEmpty ? "unknown" : output
+    }
+
+    private func beginAppUpdateCheck() {
+        guard !appUpdateInProgress else { return }
+        appUpdateInProgress = true
+        aboutWindowController?.setUpdateState(
+            message: l10n.checkingAppUpdates,
+            isChecking: true
+        )
+        rebuildMenu()
+
+        appUpdater.checkForUpdate(currentVersion: appVersion) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.appUpdateInProgress = false
+                self.rebuildMenu()
+                switch result {
+                case .success(nil):
+                    self.aboutWindowController?.setUpdateState(
+                        message: self.l10n.appUpToDate,
+                        isChecking: false
+                    )
+                    if self.aboutWindowController?.window?.isVisible != true {
+                        self.showAlert(self.l10n.appUpToDate)
+                    }
+                case .success(let release?):
+                    self.confirmAppUpdate(release)
+                case .failure:
+                    self.aboutWindowController?.setUpdateState(
+                        message: self.l10n.appUpdateCheckFailed,
+                        isChecking: false
+                    )
+                    self.showAlert(self.l10n.appUpdateCheckFailed)
+                }
+            }
+        }
+    }
+
+    private func confirmAppUpdate(_ release: AppRelease) {
+        let alert = NSAlert()
+        alert.messageText = l10n.appUpdateDialogTitle
+        alert.informativeText = l10n.appUpdateDialogBody(
+            from: appVersion,
+            to: release.version
+        )
+        alert.addButton(withTitle: l10n.appUpdateDialogInstall)
+        alert.addButton(withTitle: l10n.quitDialogCancel)
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            aboutWindowController?.setUpdateState(
+                message: l10n.appUpdateAvailable(release.version),
+                isChecking: false
+            )
+            return
+        }
+
+        appUpdateInProgress = true
+        aboutWindowController?.setUpdateState(
+            message: l10n.isChinese ? "正在下载并校验更新…" : "Downloading and verifying update…",
+            isChecking: true
+        )
+        rebuildMenu()
+        appUpdater.prepareUpdate(release) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let prepared):
+                    do {
+                        try self.appUpdater.installAndRelaunch(prepared)
+                    } catch {
+                        self.appUpdateInProgress = false
+                        self.rebuildMenu()
+                        self.showAlert(self.l10n.appUpdateFailed)
+                    }
+                case .failure:
+                    self.appUpdateInProgress = false
+                    self.rebuildMenu()
+                    self.aboutWindowController?.setUpdateState(
+                        message: self.l10n.appUpdateFailed,
+                        isChecking: false
+                    )
+                    self.showAlert(self.l10n.appUpdateFailed)
+                }
+            }
+        }
+    }
 
     @objc private func selectLanguage(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
@@ -1256,11 +1428,3 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 }
-
-/// Entry point: bootstrap NSApplication, install the delegate, and run the
-/// event loop so the status item actually renders.
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()

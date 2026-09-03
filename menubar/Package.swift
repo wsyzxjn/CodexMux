@@ -8,6 +8,11 @@ let package = Package(
         .executableTarget(
             name: "CodexMux",
             path: "CodexMux"
+        ),
+        .testTarget(
+            name: "CodexMuxTests",
+            dependencies: ["CodexMux"],
+            path: "Tests"
         )
     ]
 )

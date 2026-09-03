@@ -32,6 +32,7 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
    - **直接端点（Direct Endpoints）**：在弹窗中快速添加/移除原生 Responses 端点与模型映射；
    - **高级功能 ▸ 为所有模型声明 Ultra**：开启后在模型目录中为每个模型显示 Codex 侧的 `ultra` 预设；Codex 会把该预设映射到模型支持的实际档位。
    - **审批模型**：为 `codex-auto-review` 指定走特定的 CPA 模型；
+   - **关于与 App 更新**：查看 App/内置 CLI 版本及源码仓库；可检查 GitHub 最新稳定版，下载后校验 `SHA256SUMS`、Bundle 标识、版本和代码签名，再备份当前 App、替换并重新启动；
    - **查看日志与状态**：一键打开日志目录或查看服务运行状态。
 3. CodexMux 会在启动时为 Codex Desktop 准备代理令牌；若 Desktop 正在运行会自动重启它。随后打开模型选择器即可看到官方模型与 Direct/CPA 模型。
 
