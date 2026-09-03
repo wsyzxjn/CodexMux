@@ -746,8 +746,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             directMenu.addItem(empty)
         } else {
             for route in directRoutes {
-                let host = URL(string: route.baseURL)?.host ?? route.baseURL
-                let title = "\(host) (\(route.models.count))"
+                let url = URL(string: route.baseURL)
+                let host = url?.host ?? route.baseURL
+                let path = (url?.path ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let pathLabel = path.hasSuffix("/v1") ? String(path.dropLast(3)) : path
+                let endpoint = pathLabel.isEmpty ? host : "\(host)/\(pathLabel)"
+                let title = "\(endpoint) (\(route.models.count))"
                 let item = NSMenuItem(title: title,
                                       action: #selector(removeDirectRoute(_:)),
                                       keyEquivalent: "")
