@@ -9,6 +9,7 @@ const OFFICIAL_PASSTHROUGH_HEADERS: &[&str] = &[
     "conversation_id",
     "openai-beta",
     "x-codex-turn-metadata",
+    "x-openai-internal-codex-responses-lite",
 ];
 const CPA_PASSTHROUGH_HEADERS: &[&str] = &["accept", "user-agent"];
 
