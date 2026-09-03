@@ -233,6 +233,19 @@ fn merge_declared_direct(catalog: &mut Value, direct: &[DirectModel]) -> Result<
     let mut next_priority = max_priority.saturating_add(100);
     for model in direct {
         let local = format!("{CPA_MODEL_PREFIX}{}", model.upstream_model);
+        if let Some(existing) = output_models
+            .iter_mut()
+            .find(|entry| model_slug(entry) == Some(local.as_str()))
+        {
+            existing
+                .as_object_mut()
+                .expect("merged catalog contains a non-object model")
+                .insert(
+                    "display_name".into(),
+                    json!(format!("{} · Direct", model.upstream_model)),
+                );
+            continue;
+        }
         if !known.insert(local.clone()) {
             continue;
         }
@@ -549,13 +562,13 @@ mod tests {
             .find(|model| model["slug"] == "cpa/gpt-5.6-sol")
             .unwrap();
         assert_eq!(merged["display_name"], "gpt-5.6-sol · Direct");
-        // A CPA model with the same slug wins over the declaration.
+        // A direct route overrides the CPA display name while preserving metadata.
         drop(store);
         let store = CatalogStore::load(path).unwrap();
         store
             .replace(
                 &json!({"models":[]}),
-                &json!({"models":[{"slug":"gpt-5.6-sol","display_name":"Sol"}]}),
+                &json!({"models":[{"slug":"gpt-5.6-sol","display_name":"Sol","context_window":200_000}]}),
                 &[DirectModel {
                     upstream_model: "gpt-5.6-sol".into(),
                     base_url: "https://direct.example/v1".into(),
@@ -569,7 +582,8 @@ mod tests {
             .iter()
             .find(|model| model["slug"] == "cpa/gpt-5.6-sol")
             .unwrap();
-        assert_eq!(from_cpa["display_name"], "Sol · CPA");
+        assert_eq!(from_cpa["display_name"], "gpt-5.6-sol · Direct");
+        assert_eq!(from_cpa["context_window"], 200_000);
     }
 
     #[test]
