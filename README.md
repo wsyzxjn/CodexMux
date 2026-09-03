@@ -52,6 +52,9 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
 | `codexmux cpa rollback` | 恢复更新前的本地 CPA 二进制和版本记录 |
 | `codexmux cpa start` / `stop` | 启动或停止本地 CPA 服务 |
 | `codexmux cpa model-list` | 列出当前 CPA 端点提供的所有可用模型 |
+| `codexmux cpa search-get` / `search-set` | 查询或设置共享 Web 搜索后端（模型、`off` 或 `default`） |
+| `codexmux cpa search-detect [--model <slug>] [--verify]` | 本地识别并缓存搜索能力；`--verify` 需配 `--model`，只验证一个后端 |
+| `codexmux cpa search-capabilities` | 打印缓存的搜索能力检测结果 |
 | `codexmux install` | （无菜单栏时）注册并启动后台 LaunchAgent 并接管配置 |
 | `codexmux uninstall` | 停止后台 LaunchAgent 并还原 Codex 配置 |
 
@@ -62,6 +65,30 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
 - **更新后服务不可用**：先运行 `codexmux cpa rollback` 恢复上一版本；菜单栏的“CPA 更新”也提供同一操作。
 - **模型选择器没有显示 CPA 模型**：运行 `codexmux doctor` 确认连通性；完全重启 Codex 以触发重新拉取模型目录。
 - **停用与卸载**：退出 `CodexMux.app`（或执行 `codexmux uninstall`）即可自动还原 Codex 配置。如需彻底删除数据，清理 `~/Library/Application Support/CodexMux` 目录即可。
+
+## 共享 Responses Web Search
+
+自定义模型自身不支持搜索时，可以让 CodexMux 先用一个支持 `web_search` 的
+Responses 后端完成搜索，再把结果作为上下文交给当前模型生成答案：
+
+```toml
+[web_search]
+enabled = true
+backend_model = "gpt-5.6-sol" # 合并后目录中的精确 slug
+```
+
+所有自定义模型默认都会声明支持搜索。配置 `backend_model` 后，CodexMux 会在
+原始 `/v1/responses` 请求声明的 `web_search` 工具时先调用该后端，把返回结果和
+来源注入 `input`，然后移除 `web_search` 工具并继续按用户选择的模型转发。后
+端不可用时搜索请求会失败，但不会隐藏 Codex 的搜索入口。
+
+菜单栏的“共享 Web 搜索”子菜单可以随时切换到“默认（config.toml）”、
+“关闭共享搜索”或任意目录模型，选择会写入 `cpa-profiles.toml` 并在下一次
+请求生效，不需要重启代理。“关闭共享搜索”只关闭共享执行，目录仍保留搜索能力。
+子菜单还提供“重新检测搜索后端…”和“仅显示已验证”；检测结果会缓存在
+`search-capabilities.json`。默认检测只做本地提供商能力识别，不会批量访问
+上游；需要确认真实搜索时用 `--model <slug> --verify` 单独验证。
+点击“重新检测”时会显示一个悬浮进度窗口，完成后自动关闭并刷新菜单。
 
 ---
 
@@ -107,5 +134,6 @@ cargo test --all-targets
 ### 5. 核心架构与安全原则
 
 - **本地回环与凭据隔离**：CodexMux 仅监听 `127.0.0.1` 并校验代理令牌；官方 ChatGPT OAuth 仅转发至官方端点，CPA 令牌与直连令牌绝不跨路由泄露。
+- **Codex Alpha Search 透传**：`/v1/alpha/search` 原样转发给 CPA，由 CPA 完成搜索模型与凭据选择；CodexMux 不翻译该搜索协议。
 - **对话历史安全回放**：跨不同提供商或模型切换时，移除 `previous_response_id`，仅在内存中回放公开安全消息与工具调用历史，拒绝传递私有状态或加密字段。
 - **安全配置接管**：通过托管标记块管理配置，启动时自动备份，退出时安全恢复，遇到冲突主动拒绝覆盖以保护用户原有配置。

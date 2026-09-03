@@ -63,6 +63,48 @@ async fn spawn_codexmux(
     .unwrap();
     spawn(server::router(state)).await
 }
+
+async fn spawn_codexmux_with_shared_search(
+    cpa_base_url: String,
+    official_models: &[&str],
+    cpa_models: &[&str],
+    backend_model: &str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let root = tempfile::tempdir().unwrap().keep();
+    let path = root.join("model-catalog.json");
+    let store = codexmux::catalog::CatalogStore::load(path.clone()).unwrap();
+    store
+        .replace(
+            &json!({"models": official_models.iter().map(|slug| json!({"slug":slug})).collect::<Vec<_>>()}),
+            &json!({"models": cpa_models.iter().map(|slug| json!({"slug":slug})).collect::<Vec<_>>()}),
+            &[],
+        )
+        .unwrap();
+    drop(store);
+    let mut settings = Settings {
+        cpa: Cpa {
+            base_url: cpa_base_url,
+        },
+        ..Settings::default()
+    };
+    settings.web_search = codexmux::config::WebSearch {
+        enabled: true,
+        backend_model: backend_model.to_owned(),
+    };
+    let state = AppState::new(
+        settings,
+        Credentials {
+            proxy_token: "proxy-token".into(),
+            cpa_token: "cpa-token".into(),
+            cpa_management_key: "management-key".into(),
+        },
+        root.join("model-catalog.json"),
+        root.join("cpa-profiles.toml"),
+    )
+    .unwrap();
+    spawn(server::router(state)).await
+}
+
 #[derive(Clone, Default)]
 struct RawCapture(Arc<Mutex<Vec<(HeaderMap, Bytes)>>>);
 
@@ -116,6 +158,171 @@ async fn cpa_json_rewrites_only_the_model_and_preserves_response_bytes() {
     assert_eq!(forwarded["metadata"], json!({"unknown_field": true}));
     assert_eq!(forwarded["stream"], false);
     drop(captured);
+    proxy_handle.abort();
+    cpa_handle.abort();
+}
+
+#[tokio::test]
+async fn alpha_search_is_proxied_to_cpa_unchanged_with_isolated_credentials() {
+    async fn upstream(
+        State(capture): State<RawCapture>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response<Body> {
+        capture.0.lock().await.push((headers, body));
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"ok":true}"#))
+            .unwrap()
+    }
+
+    let capture = RawCapture::default();
+    let (cpa_address, cpa_handle) = spawn(
+        Router::new()
+            .route("/v1/alpha/search", post(upstream))
+            .with_state(capture.clone()),
+    )
+    .await;
+    let (proxy_address, proxy_handle) =
+        spawn_codexmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
+    let body = json!({
+        "id": "search-session-1",
+        "model": "gpt-5.6-sol",
+        "commands": {"search_query": [{"q": "golang channels"}]}
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_address}/v1/alpha/search"))
+        .header("x-codexmux-token", "proxy-token")
+        .header(header::AUTHORIZATION, "Bearer oauth")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap(), json!({"ok": true}));
+
+    let captured = capture.0.lock().await;
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].0[header::AUTHORIZATION], "Bearer cpa-token");
+    assert!(captured[0].0.get(header::COOKIE).is_none());
+    let forwarded: Value = serde_json::from_slice(&captured[0].1).unwrap();
+    assert_eq!(forwarded, body);
+    drop(captured);
+
+    proxy_handle.abort();
+    cpa_handle.abort();
+}
+
+#[tokio::test]
+async fn shared_web_search_runs_backend_and_injects_results_into_custom_model() {
+    async fn upstream(
+        State(capture): State<RawCapture>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        capture
+            .0
+            .lock()
+            .await
+            .push((headers, Bytes::from(serde_json::to_vec(&body).unwrap())));
+        if body["model"] == "shared-search" {
+            Json(json!({
+                "id": "resp_search",
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "action": {"type": "search", "query": "shared query"}
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Search: first result",
+                            "annotations": [{
+                                "type": "url_citation",
+                                "title": "Example",
+                                "url": "https://example.com"
+                            }]
+                        }]
+                    }
+                ]
+            }))
+        } else {
+            Json(json!({
+                "id": "resp_custom",
+                "object": "response",
+                "status": "completed",
+                "model": body["model"],
+                "output": []
+            }))
+        }
+    }
+
+    let capture = RawCapture::default();
+    let (cpa_address, cpa_handle) = spawn(
+        Router::new()
+            .route("/v1/responses", post(upstream))
+            .with_state(capture.clone()),
+    )
+    .await;
+    let (proxy_address, proxy_handle) = spawn_codexmux_with_shared_search(
+        format!("http://{cpa_address}/v1"),
+        &[],
+        &["custom-model", "shared-search"],
+        "cpa/shared-search",
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_address}/v1/responses"))
+        .header("x-codexmux-token", "proxy-token")
+        .json(&json!({
+            "model": "cpa/custom-model",
+            "input": "What is the latest Codex release?",
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "apply_patch"}
+            ],
+            "tool_choice": {"type": "auto"},
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap()["id"], "resp_custom");
+
+    let captured = capture.0.lock().await;
+    assert_eq!(captured.len(), 2);
+    let backend: Value = serde_json::from_slice(&captured[0].1).unwrap();
+    assert_eq!(backend["model"], "shared-search");
+    assert_eq!(backend["tools"], json!([{"type": "web_search"}]));
+    assert_eq!(backend["tool_choice"], "required");
+    assert_eq!(captured[0].0[header::AUTHORIZATION], "Bearer cpa-token");
+
+    let custom: Value = serde_json::from_slice(&captured[1].1).unwrap();
+    assert_eq!(custom["model"], "custom-model");
+    assert_eq!(
+        custom["tools"],
+        json!([{"type": "function", "name": "apply_patch"}])
+    );
+    assert!(custom.get("tool_choice").is_none());
+    let items = custom["input"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0]["content"][0]["text"],
+        "What is the latest Codex release?"
+    );
+    let injected = items[1]["content"][0]["text"].as_str().unwrap();
+    assert!(injected.contains("Search: first result"));
+    assert!(injected.contains("Example: https://example.com"));
+    drop(captured);
+
     proxy_handle.abort();
     cpa_handle.abort();
 }
@@ -544,6 +751,69 @@ async fn cpa_error_status_content_type_and_body_are_passthrough() {
 }
 
 #[tokio::test]
+async fn cpa_model_cooldown_is_mapped_to_codex_server_overloaded() {
+    async fn upstream() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":{"code":"model_cooldown","message":"auth unavailable: 1 of 1 candidate(s) are in cooldown"}}"#,
+            ))
+            .unwrap()
+    }
+    let (cpa_address, cpa_handle) =
+        spawn(Router::new().route("/v1/responses", post(upstream))).await;
+    let (proxy_address, proxy_handle) =
+        spawn_codexmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_address}/v1/responses"))
+        .header("x-codexmux-token", "proxy-token")
+        .json(&json!({"model":"cpa/external-model","input":"hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "server_is_overloaded");
+    assert_eq!(body["error"]["type"], "server_is_overloaded");
+    assert_eq!(
+        body["error"]["message"],
+        "Selected model is at capacity. Please try a different model."
+    );
+    proxy_handle.abort();
+    cpa_handle.abort();
+}
+
+#[tokio::test]
+async fn cpa_unavailable_is_mapped_to_codex_server_overloaded() {
+    async fn upstream() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":{"code":"unavailable","message":"the service is temporarily unavailable; please try again shortly"}}"#,
+            ))
+            .unwrap()
+    }
+    let (cpa_address, cpa_handle) =
+        spawn(Router::new().route("/v1/responses", post(upstream))).await;
+    let (proxy_address, proxy_handle) =
+        spawn_codexmux(format!("http://{cpa_address}/v1"), &[], &["external-model"]).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_address}/v1/responses"))
+        .header("x-codexmux-token", "proxy-token")
+        .json(&json!({"model":"cpa/external-model","input":"hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "server_is_overloaded");
+    proxy_handle.abort();
+    cpa_handle.abort();
+}
+
+#[tokio::test]
 async fn unknown_models_and_history_fail_closed() {
     let (proxy_address, proxy_handle) = spawn_codexmux(
         "http://127.0.0.1:9/v1".into(),
@@ -613,6 +883,13 @@ async fn every_route_requires_the_proxy_token() {
         .await
         .unwrap();
     assert_eq!(missing_unknown.status(), StatusCode::FORBIDDEN);
+    let missing_alpha_search = client
+        .post(format!("http://{proxy_address}/v1/alpha/search"))
+        .json(&json!({"query": "golang"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_alpha_search.status(), StatusCode::FORBIDDEN);
     let accepted_unknown = client
         .get(format!("http://{proxy_address}/unknown"))
         .header("x-codexmux-token", "proxy-token")

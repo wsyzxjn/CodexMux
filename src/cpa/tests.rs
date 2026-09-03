@@ -427,6 +427,92 @@ alias = \"gpt-5.6-terra\"
     }
 
     #[test]
+    fn shared_search_backend_override_round_trips() {
+        let paths = paths();
+        assert!(search_backend_setting(&paths.cpa_profiles).is_none());
+
+        set_search_backend_setting(&paths.cpa_profiles, Some(Some("gpt-5.6-sol".into())))
+            .unwrap();
+        let setting = search_backend_setting(&paths.cpa_profiles).unwrap();
+        assert!(setting.enabled);
+        assert_eq!(setting.backend_model, "gpt-5.6-sol");
+
+        set_search_backend_setting(&paths.cpa_profiles, Some(None)).unwrap();
+        let setting = search_backend_setting(&paths.cpa_profiles).unwrap();
+        assert!(!setting.enabled);
+
+        set_search_backend_setting(&paths.cpa_profiles, None).unwrap();
+        assert!(search_backend_setting(&paths.cpa_profiles).is_none());
+    }
+
+    #[test]
+    fn search_capability_cache_round_trips() {
+        let paths = paths();
+        record_search_capability(
+            &paths.search_capabilities,
+            "gpt-5.6-sol",
+            SearchCapabilityStatus::Verified,
+        )
+        .unwrap();
+        record_search_capability(
+            &paths.search_capabilities,
+            "cpa/deepseek",
+            SearchCapabilityStatus::Unsupported,
+        )
+        .unwrap();
+        let store = load_search_capabilities(&paths.search_capabilities).unwrap();
+        assert_eq!(
+            store.status("gpt-5.6-sol"),
+            Some(SearchCapabilityStatus::Verified)
+        );
+        assert_eq!(
+            store.status("cpa/deepseek"),
+            Some(SearchCapabilityStatus::Unsupported)
+        );
+    }
+
+    #[test]
+    fn search_probe_classification() {
+        assert_eq!(
+            classify_search_probe(200, r#"{"output":[{"type":"web_search_call"}]}"#, true),
+            SearchCapabilityStatus::Verified
+        );
+        assert_eq!(
+            classify_search_probe(200, "{}", false),
+            SearchCapabilityStatus::Supported
+        );
+        assert_eq!(
+            classify_search_probe(400, r#"unsupported web_search"#, false),
+            SearchCapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            classify_search_probe(401, "auth", false),
+            SearchCapabilityStatus::Error
+        );
+    }
+
+    #[test]
+    fn quick_search_capability_is_local_and_non_aborting() {
+        let paths = paths();
+        assert_eq!(
+            quick_capability(&paths, "gpt-5.6-sol"),
+            SearchCapabilityStatus::Verified
+        );
+        assert_eq!(
+            quick_capability(&paths, "cpa/claude-opus-5"),
+            SearchCapabilityStatus::Supported
+        );
+        assert_eq!(
+            quick_capability(&paths, "cpa/gpt-5.6-sol"),
+            SearchCapabilityStatus::Unknown
+        );
+        assert_eq!(
+            quick_capability(&paths, "cpa/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"),
+            SearchCapabilityStatus::Unknown
+        );
+    }
+
+    #[test]
     fn profile_validation_rejects_bad_urls_before_any_switch() {
         let paths = paths();
         // Remote HTTP is rejected at save time by the endpoint shape check.

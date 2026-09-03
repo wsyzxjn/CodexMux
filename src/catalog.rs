@@ -221,6 +221,21 @@ fn advertise_ultra_all(catalog: &mut Value) -> Result<()> {
     Ok(())
 }
 
+/// Advertise search support for every model in a merged catalog so the shared
+/// `web_search` backend can serve models that do not expose native search.
+pub fn advertise_search_all(catalog: &mut Value) -> Result<()> {
+    for model in models_mut(catalog)? {
+        let object = model
+            .as_object_mut()
+            .context("catalog contains a non-object model")?;
+        object.insert("supports_search_tool".into(), json!(true));
+        object
+            .entry("web_search_tool_type")
+            .or_insert_with(|| json!("text_and_image"));
+    }
+    Ok(())
+}
+
 const ULTRA_REASONING_EFFORT: &str = "ultra";
 
 /// Append direct-route model declarations to an already-merged catalog so
@@ -482,6 +497,19 @@ mod tests {
                 .iter()
                 .any(|entry| entry["effort"] == "ultra");
             assert!(has_ultra, "{slug} did not advertise ultra");
+        }
+    }
+
+    #[test]
+    fn search_advertisement_flags_every_model() {
+        let mut catalog = json!({"models":[
+            {"slug":"custom-a", "supports_search_tool": false},
+            {"slug":"custom-b"}
+        ]});
+        advertise_search_all(&mut catalog).unwrap();
+        for model in catalog["models"].as_array().unwrap() {
+            assert_eq!(model["supports_search_tool"], true);
+            assert_eq!(model["web_search_tool_type"], "text_and_image");
         }
     }
 

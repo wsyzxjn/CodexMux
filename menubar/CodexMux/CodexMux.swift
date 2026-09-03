@@ -41,6 +41,19 @@ struct L10n {
     let advanced: String
     let reviewModel: String
     let reviewDefault: String
+    let searchBackend: String
+    let searchDefault: String
+    let searchDisabled: String
+    let searchSetFailed: String
+    let searchVerifiedOnly: String
+    let searchDetect: String
+    let searchDetectFailed: String
+    let searchDetectRunning: String
+    let searchVerified: String
+    let searchSupported: String
+    let searchUnsupported: String
+    let searchUnknown: String
+    let searchError: String
     let profileActiveSuffix: String
     let language: String
     let about: String
@@ -126,6 +139,19 @@ struct L10n {
         advanced: "Advanced",
         reviewModel: "Review Model",
         reviewDefault: "Default (official route)",
+        searchBackend: "Shared Web Search",
+        searchDefault: "Default (config.toml)",
+        searchDisabled: "Disable shared search",
+        searchSetFailed: "Failed to set the shared web search backend. See logs.",
+        searchVerifiedOnly: "Show verified only",
+        searchDetect: "Re-detect search backends…",
+        searchDetectFailed: "Failed to detect search backends. See logs.",
+        searchDetectRunning: "Detecting search backends…",
+        searchVerified: "verified",
+        searchSupported: "likely supported",
+        searchUnsupported: "unsupported",
+        searchUnknown: "not checked",
+        searchError: "probe error",
         profileActiveSuffix: "  ✓",
         language: "Language",
         about: "About CodexMux…",
@@ -212,6 +238,19 @@ struct L10n {
         advanced: "高级功能",
         reviewModel: "审批模型",
         reviewDefault: "默认（官方路由）",
+        searchBackend: "共享 Web 搜索",
+        searchDefault: "默认（config.toml）",
+        searchDisabled: "关闭共享搜索",
+        searchSetFailed: "设置共享 Web 搜索后端失败，请查看日志。",
+        searchVerifiedOnly: "仅显示已验证",
+        searchDetect: "重新检测搜索后端…",
+        searchDetectFailed: "检测搜索后端失败，请查看日志。",
+        searchDetectRunning: "正在检测搜索后端…",
+        searchVerified: "已验证",
+        searchSupported: "可能支持",
+        searchUnsupported: "不支持",
+        searchUnknown: "未检测",
+        searchError: "探测失败",
         profileActiveSuffix: "  ✓",
         language: "语言",
         about: "关于 CodexMux…",
@@ -351,6 +390,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var aboutWindowController: AboutWindowController?
     private var directWindowController: DirectEndpointWindowController?
     private var appUpdateInProgress = false
+    private var progressWindow: NSWindow?
+    private var progressIndicator: NSProgressIndicator?
+    private var searchDetectRunning = false
 
     /// Release builds are self-contained. Copy the bundled CLI to a stable
     /// private runtime path so LaunchAgents keep working if the App is moved.
@@ -408,6 +450,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var activeProfile: String?
     private var savedProfiles: [(name: String, baseURL: String)] = []
     private var reviewOverride: String?
+    private var searchBackendEnabled: Bool?
+    private var searchBackendModel: String?
+    private var searchCapabilities: [String: String] = [:]
+    private var searchShowVerifiedOnly = UserDefaults.standard.bool(forKey: "searchShowVerifiedOnly")
+    private var catalogModels: [String] = []
     private var cpaModels: [String] = []
     private var directRoutes: [(baseURL: String, models: [String])] = []
 
@@ -493,6 +540,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             group.leave()
         }
         group.enter()
+        loadSearchState { [weak self] enabled, model in
+            self?.searchBackendEnabled = enabled
+            self?.searchBackendModel = model
+            group.leave()
+        }
+        group.enter()
+        loadCatalogModels { [weak self] models in
+            self?.catalogModels = models
+            group.leave()
+        }
+        group.enter()
+        loadSearchCapabilities { [weak self] capabilities in
+            self?.searchCapabilities = capabilities
+            group.leave()
+        }
+        group.enter()
         loadDirectRoutes { [weak self] routes in
             self?.directRoutes = routes
             group.leave()
@@ -551,6 +614,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .split(whereSeparator: \.isNewline)
                 .map(String.init)
             DispatchQueue.main.async { completion(overrideSlug, models) }
+        }
+    }
+
+    /// Load the shared web search backend override (background queue only).
+    private func loadSearchState(
+        _ completion: @escaping (Bool?, String?) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let output = self.captureCodexMux(["cpa", "search-get"])
+            let line = output.split(separator: "\n").first {
+                $0.hasPrefix("shared search:")
+            }
+            var enabled: Bool?
+            var model: String?
+            if let line {
+                if line.hasPrefix("shared search: enabled: ") {
+                    enabled = true
+                    model = String(line.dropFirst("shared search: enabled: ".count))
+                } else if line.contains("disabled") {
+                    enabled = false
+                }
+            }
+            DispatchQueue.main.async { completion(enabled, model) }
+        }
+    }
+
+    /// Load every merged catalog slug for the search backend submenu.
+    private func loadCatalogModels(_ completion: @escaping ([String]) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let models = self.captureCodexMux(["catalog", "models"])
+                .split(whereSeparator: \.isNewline)
+                .map(String.init)
+            DispatchQueue.main.async { completion(models) }
+        }
+    }
+
+    /// Load cached search capability statuses from `search-capabilities.json`.
+    private func loadSearchCapabilities(_ completion: @escaping ([String: String]) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let output = self.captureCodexMux(["cpa", "search-capabilities"])
+            var capabilities: [String: String] = [:]
+            for line in output.split(whereSeparator: \.isNewline) {
+                let fields = line.split(separator: " ")
+                guard fields.count >= 2 else { continue }
+                capabilities[String(fields[0])] = String(fields[1])
+            }
+            DispatchQueue.main.async { completion(capabilities) }
         }
     }
 
@@ -898,6 +1008,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         reviewItem.submenu = reviewMenu
         menu.addItem(reviewItem)
+
+        // Shared web search backend: pick which model executes Responses web_search.
+        let searchItem = NSMenuItem(title: l10n.searchBackend, action: nil, keyEquivalent: "")
+        let searchMenu = NSMenu()
+        searchMenu.autoenablesItems = false
+
+        let searchDefaultItem = NSMenuItem(title: l10n.searchDefault,
+                                           action: #selector(selectSearchBackendDefault),
+                                           keyEquivalent: "")
+        searchDefaultItem.target = self
+        searchDefaultItem.state = searchBackendEnabled == nil ? .on : .off
+        searchMenu.addItem(searchDefaultItem)
+
+        let searchDisabledItem = NSMenuItem(title: l10n.searchDisabled,
+                                            action: #selector(selectSearchBackendDisabled),
+                                            keyEquivalent: "")
+        searchDisabledItem.target = self
+        searchDisabledItem.state = searchBackendEnabled == false ? .on : .off
+        searchMenu.addItem(searchDisabledItem)
+
+        let verifiedOnlyItem = NSMenuItem(title: l10n.searchVerifiedOnly,
+                                          action: #selector(toggleVerifiedOnly),
+                                          keyEquivalent: "")
+        verifiedOnlyItem.target = self
+        verifiedOnlyItem.state = searchShowVerifiedOnly ? .on : .off
+        searchMenu.addItem(verifiedOnlyItem)
+
+        let detectItem = NSMenuItem(title: l10n.searchDetect,
+                                    action: #selector(detectSearchBackends),
+                                    keyEquivalent: "")
+        detectItem.target = self
+        searchMenu.addItem(detectItem)
+        searchMenu.addItem(.separator())
+
+        let searchSlugs = catalogModels
+            .filter { $0 != "codex-auto-review" && !$0.hasSuffix("/codex-auto-review") }
+            .sorted()
+            .unique()
+        for slug in searchSlugs {
+            let status = searchCapabilities[slug] ?? "unknown"
+            if searchShowVerifiedOnly && !["verified", "supported"].contains(status) {
+                continue
+            }
+            let statusLabel: String
+            switch status {
+            case "verified": statusLabel = l10n.searchVerified
+            case "supported": statusLabel = l10n.searchSupported
+            case "unsupported": statusLabel = l10n.searchUnsupported
+            case "error": statusLabel = l10n.searchError
+            default: statusLabel = l10n.searchUnknown
+            }
+            let item = NSMenuItem(title: slug,
+                                  action: #selector(selectSearchBackendModel(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.title = "\(slug)  (\(statusLabel))"
+            item.representedObject = slug
+            item.state = searchBackendEnabled == true && searchBackendModel == slug ? .on : .off
+            item.toolTip = statusLabel
+            searchMenu.addItem(item)
+        }
+        searchItem.submenu = searchMenu
+        menu.addItem(searchItem)
 
         let logs = NSMenuItem(title: l10n.openLogs, action: #selector(openLogs),
                               keyEquivalent: "l")
@@ -1339,6 +1512,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func selectSearchBackendDefault(_ sender: NSMenuItem) {
+        runCodexMuxDetached(["cpa", "search-set", "default"]) { [weak self] ok in
+            if !ok {
+                self?.showAlert(self?.l10n.searchSetFailed ?? "")
+            }
+            self?.refreshStatus()
+        }
+    }
+
+    @objc private func selectSearchBackendDisabled(_ sender: NSMenuItem) {
+        runCodexMuxDetached(["cpa", "search-set", "off"]) { [weak self] ok in
+            if !ok {
+                self?.showAlert(self?.l10n.searchSetFailed ?? "")
+            }
+            self?.refreshStatus()
+        }
+    }
+
+    @objc private func selectSearchBackendModel(_ sender: NSMenuItem) {
+        guard let slug = sender.representedObject as? String else { return }
+        runCodexMuxDetached(["cpa", "search-set", slug]) { [weak self] ok in
+            if !ok {
+                self?.showAlert(self?.l10n.searchSetFailed ?? "")
+            }
+            self?.refreshStatus()
+        }
+    }
+
+    @objc private func toggleVerifiedOnly(_ sender: NSMenuItem) {
+        searchShowVerifiedOnly = sender.state != .on
+        UserDefaults.standard.set(searchShowVerifiedOnly, forKey: "searchShowVerifiedOnly")
+        rebuildMenu()
+    }
+
+    @objc private func detectSearchBackends() {
+        guard !searchDetectRunning else { return }
+        searchDetectRunning = true
+        runCodexMuxDetachedWithProgress(
+            ["cpa", "search-detect"],
+            progressText: l10n.searchDetectRunning
+        ) { [weak self] ok in
+            guard let self else { return }
+            self.searchDetectRunning = false
+            if !ok {
+                self.showAlert(self.l10n.searchDetectFailed)
+            }
+            self.refreshStatus()
+        }
+    }
+
     @objc private func switchProfile(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
         runCodexMuxDetached(["cpa", "profile-switch", name]) { [weak self] ok in
@@ -1467,6 +1690,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.refreshStatus()
             }
         }
+    }
+
+    /// Run a CLI action with a small floating progress window so long-running
+    /// work stays visible after the status menu collapses.
+    private func runCodexMuxDetachedWithProgress(
+        _ arguments: [String],
+        progressText: String,
+        environment: [String: String]? = nil,
+        completion: @escaping (Bool) -> Void
+    ) {
+        DispatchQueue.main.async { self.showProgress(progressText) }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = self.codexmuxURL
+            process.arguments = arguments
+            process.environment = environment ?? self.codexMuxEnvironment
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            do {
+                try process.run()
+            } catch {
+                DispatchQueue.main.async {
+                    self.hideProgress()
+                    completion(false)
+                }
+                return
+            }
+            _ = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            let ok = process.terminationStatus == 0
+            DispatchQueue.main.async {
+                self.hideProgress()
+                completion(ok)
+            }
+        }
+    }
+
+    private func showProgress(_ text: String) {
+        hideProgress()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 112),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = ""
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.center()
+        guard let content = window.contentView else { return }
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .centerX
+        root.spacing = 12
+        root.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            root.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+        ])
+        let indicator = NSProgressIndicator()
+        indicator.style = .spinning
+        indicator.controlSize = .regular
+        indicator.isIndeterminate = true
+        indicator.startAnimation(nil)
+        root.addArrangedSubview(indicator)
+        let label = NSTextField(labelWithString: text)
+        label.alignment = .center
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 2
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        root.addArrangedSubview(label)
+        window.orderFrontRegardless()
+        progressWindow = window
+        progressIndicator = indicator
+    }
+
+    private func hideProgress() {
+        progressIndicator?.stopAnimation(nil)
+        progressIndicator = nil
+        progressWindow?.orderOut(nil)
+        progressWindow = nil
     }
 
     private func showAlert(_ message: String) {

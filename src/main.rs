@@ -66,6 +66,8 @@ enum CatalogCommand {
         /// `true`/`false`: whether every model advertises `ultra`.
         enabled: String,
     },
+    /// List every model slug in the merged catalog.
+    Models,
 }
 
 #[derive(Subcommand)]
@@ -139,6 +141,25 @@ enum CpaCommand {
     },
     /// Show the review model override (None = official route).
     ReviewGet,
+    /// Show the shared Responses web search backend override.
+    SearchGet,
+    /// Select the shared web search backend. Use `default` to follow
+    /// `config.toml`, or an empty slug to disable the menu override.
+    SearchSet {
+        /// `default`, empty, or a merged catalog model slug.
+        value: String,
+    },
+    /// Print the cached shared web search capability status.
+    SearchCapabilities,
+    /// Probe catalog models for Responses `web_search` support and cache results.
+    SearchDetect {
+        /// Only probe this exact catalog slug.
+        #[arg(long)]
+        model: Option<String>,
+        /// Run a real minimal search instead of a schema-only probe.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Route `cpa/<slug>` requests directly to an upstream, bypassing CPA.
     DirectSet {
         /// Comma-separated cpa/ model slugs (without the cpa/ prefix).
@@ -309,6 +330,22 @@ fn catalog(paths: &Paths, command: CatalogCommand) -> Result<()> {
             settings.catalog.advertise_ultra = enabled;
             settings.save(&paths.settings)?;
             println!("ultra: {}", enabled);
+            Ok(())
+        }
+        CatalogCommand::Models => {
+            let store = codexmux::catalog::CatalogStore::load(paths.catalog.clone())?;
+            let catalog = store
+                .current()
+                .context("model catalog snapshot has not been built yet")?;
+            let models = catalog
+                .get("models")
+                .and_then(serde_json::Value::as_array)
+                .context("model catalog has no models array")?;
+            for model in models {
+                if let Some(slug) = model.get("slug").and_then(serde_json::Value::as_str) {
+                    println!("{slug}");
+                }
+            }
             Ok(())
         }
     }
@@ -843,6 +880,49 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             Some(slug) => println!("review override: {slug}"),
             None => println!("review override: (none; official route)"),
         },
+        CpaCommand::SearchGet => match codexmux::cpa::search_backend_setting(&paths.cpa_profiles) {
+            Some(setting) if setting.enabled => {
+                println!("shared search: enabled: {}", setting.backend_model);
+            }
+            Some(_) => println!("shared search: disabled (menu override)"),
+            None => println!("shared search: (using config.toml settings)"),
+        },
+        CpaCommand::SearchSet { value } => {
+            let value = value.trim();
+            let override_kind = if value.eq_ignore_ascii_case("default") {
+                None
+            } else if value.is_empty() || value.eq_ignore_ascii_case("off") {
+                Some(None)
+            } else {
+                Some(Some(value.to_owned()))
+            };
+            let message = match &override_kind {
+                None => "shared search override cleared; config.toml is authoritative".to_owned(),
+                Some(None) => "shared search disabled".to_owned(),
+                Some(Some(slug)) => format!("shared search backend: {slug}"),
+            };
+            codexmux::cpa::set_search_backend_setting(&paths.cpa_profiles, override_kind)?;
+            println!("{message}");
+        }
+        CpaCommand::SearchCapabilities => {
+            let store = codexmux::cpa::load_search_capabilities(&paths.search_capabilities)?;
+            for (slug, entry) in store.entries {
+                println!("{slug} {} {}", entry.status.label(), entry.checked_at);
+            }
+        }
+        CpaCommand::SearchDetect { model, verify } => {
+            let results =
+                codexmux::cpa::detect_search_capabilities(paths, model.as_deref(), verify)?;
+            let count = results.len();
+            for (slug, status) in &results {
+                println!("{slug} {}", status.label());
+            }
+            println!(
+                "cached {} results in {}",
+                count,
+                paths.search_capabilities.display()
+            );
+        }
         CpaCommand::DirectSet {
             models,
             base_url,

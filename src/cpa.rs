@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
+use serde_yaml;
 use tar::Archive;
 
 use crate::{
@@ -137,6 +138,7 @@ include!("cpa/managed_config.rs");
 include!("cpa/profiles.rs");
 include!("cpa/service.rs");
 include!("cpa/update.rs");
+include!("cpa/search.rs");
 
 #[cfg(test)]
 include!("cpa/tests.rs");

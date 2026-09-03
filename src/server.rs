@@ -35,11 +35,14 @@ use crate::{
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SEARCH_CONTEXT_BYTES: usize = 256 * 1024;
 const PROXY_TOKEN_HEADER: &str = "x-codexmux-token";
 const PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CPA_CATALOG_FRESH_FOR: Duration = Duration::from_secs(20);
 const CPA_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const CPA_SYNC_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
+const CODEX_SERVER_OVERLOADED_MESSAGE: &str =
+    "Selected model is at capacity. Please try a different model.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Route {
@@ -139,6 +142,21 @@ impl AppState {
         self.activity.send_replace(Instant::now());
     }
 
+    /// Resolve the effective shared web search backend. Menu-bar overrides
+    /// set in `cpa-profiles.toml` take precedence over `config.toml`, and an
+    /// explicit disabled override wins even when config enables the feature.
+    fn shared_search_backend(&self) -> Option<String> {
+        use crate::cpa::search_backend_setting;
+        match search_backend_setting(&self.cpa_profiles_path) {
+            Some(setting) if setting.enabled => Some(setting.backend_model),
+            Some(_) => None,
+            None if self.settings.web_search.enabled => {
+                Some(self.settings.web_search.backend_model.clone())
+            }
+            None => None,
+        }
+    }
+
     fn cached_cpa_catalog(&self, max_age: Duration) -> Option<Value> {
         self.cpa_catalog
             .read()
@@ -194,6 +212,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(handle_models))
         .route("/v1/responses", post(handle_responses))
         .route("/v1/responses/compact", post(handle_responses))
+        .route("/v1/alpha/search", post(handle_alpha_search))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -248,16 +267,25 @@ async fn handle_models(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ProxyError> {
     match refresh_catalog(&state, &headers, &query.client_version).await {
-        Ok(catalog) => Ok(Json(catalog)),
+        Ok(catalog) => Ok(Json(advertise_search_support(catalog)?)),
         Err(error) => {
             if let Some(catalog) = state.catalog.current() {
                 tracing::warn!(%error.message, "model catalog refresh failed; serving saved snapshot");
-                Ok(Json(catalog))
+                Ok(Json(advertise_search_support(catalog)?))
             } else {
                 Err(error)
             }
         }
     }
+}
+
+/// Custom models advertise search support even when the shared backend is
+/// disabled or unavailable; a backend failure surfaces as a failed search
+/// request instead of hiding the feature from the Codex client.
+fn advertise_search_support(mut catalog: Value) -> Result<Value, ProxyError> {
+    catalog::advertise_search_all(&mut catalog)
+        .map_err(|error| ProxyError::bad_gateway("catalog", error.to_string()))?;
+    Ok(catalog)
 }
 
 async fn refresh_catalog(
@@ -279,6 +307,33 @@ async fn refresh_catalog(
         }
     );
     merge_catalog_results(state, official, cpa)
+}
+
+/// Forward Codex Alpha Search requests to CPA unchanged. The payload is
+/// already CPA-compatible search format, so no protocol translation applies;
+/// CPA owns model and credential selection for this endpoint.
+async fn handle_alpha_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ProxyError> {
+    let upstream_headers = router::cpa_headers(&headers, &state.credentials.cpa_token)
+        .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?;
+    let target = target_url(
+        &state.settings,
+        &state.official_base_url,
+        &Route::Cpa,
+        "alpha/search",
+    );
+    let upstream = state
+        .client
+        .post(target)
+        .headers(upstream_headers)
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| ProxyError::bad_gateway("upstream", error.to_string()))?;
+    Ok(passthrough_response(upstream))
 }
 
 async fn fetch_cpa_catalog(state: &AppState, client_version: &str) -> Result<Value, ProxyError> {
@@ -490,13 +545,21 @@ async fn handle_responses(
         }
     };
     let turn_input = portable_input_items(request.get("input"));
-    let request = ResponseRequest {
+    let mut request = ResponseRequest {
         body,
         value: request,
         model,
         parent,
         turn_input,
     };
+
+    if let Some(backend_model) = state.shared_search_backend()
+        && wants_web_search(&request.value)
+    {
+        let search_context =
+            shared_search_backend(&state, &headers, "responses", &request, &backend_model).await?;
+        inject_shared_search(&mut request, &search_context)?;
+    }
 
     let catalog_route = match state.catalog.resolve_with_direct(
         &request.model,
@@ -612,6 +675,220 @@ async fn handle_responses(
     }
 }
 
+fn wants_web_search(request: &Value) -> bool {
+    request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(is_web_search_tool))
+}
+
+fn is_web_search_tool(tool: &Value) -> bool {
+    matches!(
+        tool.get("type").and_then(Value::as_str),
+        Some("web_search" | "web_search_preview")
+    )
+}
+
+/// Run one shared Responses API `web_search` call and return a compact
+/// context block that can be injected into the original model request.
+async fn shared_search_backend(
+    state: &AppState,
+    headers: &HeaderMap,
+    endpoint: &str,
+    request: &ResponseRequest,
+    backend_model: &str,
+) -> Result<String, ProxyError> {
+    let backend_model = backend_model.trim();
+    let direct = crate::cpa::declared_direct_models(&state.cpa_profiles_path);
+    let catalog_route = state
+        .catalog
+        .resolve_with_direct(backend_model, &direct)
+        .map_err(|error| {
+            ProxyError::bad_request(
+                "search_backend",
+                format!("shared web search backend {backend_model}: {error}"),
+            )
+        })?;
+    let (route, upstream_model) = match catalog_route {
+        CatalogRoute::Official => (Route::Official, backend_model.to_owned()),
+        CatalogRoute::Cpa { upstream_model } => {
+            let (route, upstream_model) = cpa_route(state, &upstream_model)?;
+            (route, upstream_model)
+        }
+        CatalogRoute::AutoReview => {
+            return Err(ProxyError::bad_request(
+                "search_backend",
+                "codex-auto-review cannot be the shared web search backend",
+            ));
+        }
+    };
+    let input = request
+        .value
+        .get("input")
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    let backend = json!({
+        "model": upstream_model,
+        "input": input,
+        "tools": [{"type": "web_search"}],
+        "tool_choice": "required",
+        "stream": false,
+    });
+    let body = Bytes::from(
+        serde_json::to_vec(&backend)
+            .map_err(|error| ProxyError::bad_request("search_backend_json", error.to_string()))?,
+    );
+    let upstream = send_upstream(state, headers, endpoint, &route, body).await?;
+    let response = read_backend_response(upstream).await?;
+    search_context_from_response(&response)
+}
+
+async fn read_backend_response(upstream: reqwest::Response) -> Result<Value, ProxyError> {
+    let status = upstream.status();
+    let is_sse = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
+    let bytes = upstream
+        .bytes()
+        .await
+        .map_err(|error| ProxyError::bad_gateway("search_backend", error.to_string()))?;
+    if !status.is_success() {
+        return Err(ProxyError::bad_gateway(
+            "search_backend",
+            format!("HTTP {status}: {}", String::from_utf8_lossy(&bytes)),
+        ));
+    }
+    if is_sse {
+        let mut buffer = Vec::new();
+        let mut completed = None;
+        for frame in sse::frames(&mut buffer, &bytes) {
+            if let Some(response) = completed_response(&frame) {
+                completed = Some(response);
+            }
+        }
+        return completed.ok_or_else(|| {
+            ProxyError::bad_gateway("search_backend", "no completed search response")
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ProxyError::bad_gateway("search_backend", error.to_string()))
+}
+
+fn search_context_from_response(response: &Value) -> Result<String, ProxyError> {
+    if response.get("status").and_then(Value::as_str) != Some("completed") {
+        return Err(ProxyError::bad_gateway(
+            "search_backend",
+            "search backend response is not completed",
+        ));
+    }
+    let mut text = String::new();
+    let mut sources = Vec::new();
+    if let Some(output) = response.get("output").and_then(Value::as_array) {
+        for item in output {
+            if item.get("type").and_then(Value::as_str) != Some("message") {
+                continue;
+            }
+            let Some(content) = item.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for part in content {
+                if part.get("type").and_then(Value::as_str) != Some("output_text") {
+                    continue;
+                }
+                if let Some(value) = part.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(value);
+                }
+                if let Some(annotations) = part.get("annotations").and_then(Value::as_array) {
+                    for annotation in annotations {
+                        let url = annotation.get("url").and_then(Value::as_str);
+                        let title = annotation.get("title").and_then(Value::as_str).or(url);
+                        if let (Some(title), Some(url)) = (title, url) {
+                            sources.push(format!("- {title}: {url}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let text = text.trim();
+    if text.is_empty() && sources.is_empty() {
+        return Err(ProxyError::bad_gateway(
+            "search_backend",
+            "search backend returned no usable results",
+        ));
+    }
+    let mut context = String::from("Web search results:\n\n");
+    if !text.is_empty() {
+        context.push_str(text);
+    }
+    if !sources.is_empty() {
+        context.push_str("\n\nSources:\n");
+        for source in sources {
+            context.push_str(&source);
+            context.push('\n');
+        }
+    }
+    if context.len() > MAX_SEARCH_CONTEXT_BYTES {
+        let mut end = MAX_SEARCH_CONTEXT_BYTES;
+        while !context.is_char_boundary(end) {
+            end -= 1;
+        }
+        context.truncate(end);
+    }
+    Ok(context)
+}
+
+fn inject_shared_search(
+    request: &mut ResponseRequest,
+    search_context: &str,
+) -> Result<(), ProxyError> {
+    {
+        let object = request
+            .value
+            .as_object_mut()
+            .ok_or_else(|| ProxyError::bad_request("invalid_json", "request must be an object"))?;
+        let input = object
+            .remove("input")
+            .unwrap_or_else(|| Value::String(String::new()));
+        let mut items = match input {
+            Value::String(text) => vec![json!({
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}]
+            })],
+            Value::Array(items) => items,
+            _ => Vec::new(),
+        };
+        items.push(json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": search_context}]
+        }));
+        object.insert("input".into(), Value::Array(items));
+        if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
+            tools.retain(|tool| !is_web_search_tool(tool));
+            if tools.is_empty() {
+                object.remove("tools");
+            }
+        }
+        object.remove("tool_choice");
+    }
+    request.turn_input = portable_input_items(request.value.get("input"));
+    request.body = Bytes::from(
+        serde_json::to_vec(&request.value)
+            .map_err(|error| ProxyError::bad_request("json", error.to_string()))?,
+    );
+    Ok(())
+}
+
 fn cpa_route(state: &AppState, upstream_model: &str) -> Result<(Route, String), ProxyError> {
     let direct = crate::cpa::direct_route_for(&state.cpa_profiles_path, upstream_model)
         .map_err(|error| ProxyError::bad_gateway("direct_route", error.to_string()))?;
@@ -679,6 +956,13 @@ async fn forward_response_inner(
         &state.continuity,
     )?;
     let upstream = send_upstream(state, headers, endpoint, route, outgoing).await?;
+    if matches!(route, Route::Cpa)
+        && state.settings.map_capacity_errors
+        && matches!(upstream.status().as_u16(), 429 | 502 | 503)
+        && !upstream.headers().contains_key(header::CONTENT_ENCODING)
+    {
+        return cpa_capacity_error_response(upstream).await;
+    }
     finish_response(
         upstream,
         request.parent.clone(),
@@ -690,6 +974,85 @@ async fn forward_response_inner(
     .await
 }
 
+async fn cpa_capacity_error_response(
+    upstream: reqwest::Response,
+) -> Result<Response<Body>, ProxyError> {
+    let status = upstream.status();
+    let content_type = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+    let content_encoding = upstream.headers().get(header::CONTENT_ENCODING).cloned();
+    let bytes = upstream
+        .bytes()
+        .await
+        .map_err(|error| ProxyError::bad_gateway("upstream_body", error.to_string()))?;
+    if let Ok(response) = serde_json::from_slice::<Value>(&bytes)
+        && is_cpa_capacity_error(status, &response)
+    {
+        tracing::info!(
+            upstream_status = %status,
+            "CPA capacity error mapped to Codex server_is_overloaded"
+        );
+        return Ok(codex_server_overloaded_response());
+    }
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type);
+    if let Some(content_encoding) = content_encoding {
+        builder = builder.header(header::CONTENT_ENCODING, content_encoding);
+    }
+    builder.body(Body::from(bytes)).map_err(|error| {
+        ProxyError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response",
+            error.to_string(),
+        )
+    })
+}
+
+fn is_cpa_capacity_error(status: StatusCode, response: &Value) -> bool {
+    let Some(error) = response.get("error").and_then(Value::as_object) else {
+        return false;
+    };
+    let code = error.get("code").and_then(Value::as_str).unwrap_or("");
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(code, "server_is_overloaded" | "slow_down") {
+        return false;
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS && code == "model_cooldown" {
+        return true;
+    }
+    code == "unavailable"
+        || message.contains("temporarily unavailable")
+        || message.contains("auth unavailable")
+        || message.contains("no auth available")
+        || message.contains("cooldown")
+        || message.contains("cloudflare challenge")
+}
+
+fn codex_server_overloaded_response() -> Response<Body> {
+    let body = serde_json::to_vec(&json!({
+        "error": {
+            "message": CODEX_SERVER_OVERLOADED_MESSAGE,
+            "type": "server_is_overloaded",
+            "code": "server_is_overloaded",
+            "param": Value::Null,
+        }
+    }))
+    .expect("server overloaded response is valid JSON");
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("server overloaded response is a valid HTTP response")
+}
+
 fn log_forward_result(
     request: &ResponseRequest,
     route: &Route,
@@ -699,6 +1062,7 @@ fn log_forward_result(
     result: &Result<Response<Body>, ProxyError>,
 ) {
     let latency_ms = started.elapsed().as_millis() as u64;
+    let summary = request_log_summary(request);
     let stream = request
         .value
         .get("stream")
@@ -731,6 +1095,24 @@ fn log_forward_result(
                 stream,
                 has_parent = request.parent.is_some(),
                 input_items = request.turn_input.len(),
+                input_types = ?summary.input_types,
+                top_level_keys = ?summary.top_level_keys,
+                request_bytes = summary.request_bytes,
+                tools_count = summary.tools_count,
+                instructions_bytes = ?summary.instructions_bytes,
+                has_metadata = summary.has_metadata,
+                store = ?summary.store,
+                tool_choice = ?summary.tool_choice,
+                include = ?summary.include,
+                text_keys = ?summary.text_keys,
+                prompt_cache_key_bytes = ?summary.prompt_cache_key_bytes,
+                client_metadata_keys = ?summary.client_metadata_keys,
+                reasoning_keys = ?summary.reasoning_keys,
+                reasoning_effort = ?summary.reasoning_effort,
+                client_metadata = ?request.value.get("client_metadata"),
+                prompt_cache_key = ?request.value.get("prompt_cache_key"),
+                text = ?request.value.get("text"),
+                reasoning = ?request.value.get("reasoning"),
                 latency_ms,
                 "response forwarded"
             );
@@ -748,10 +1130,136 @@ fn log_forward_result(
                 stream,
                 has_parent = request.parent.is_some(),
                 input_items = request.turn_input.len(),
+                input_types = ?summary.input_types,
+                top_level_keys = ?summary.top_level_keys,
+                request_bytes = summary.request_bytes,
+                tools_count = summary.tools_count,
+                instructions_bytes = ?summary.instructions_bytes,
+                has_metadata = summary.has_metadata,
+                store = ?summary.store,
+                tool_choice = ?summary.tool_choice,
+                include = ?summary.include,
+                text_keys = ?summary.text_keys,
+                prompt_cache_key_bytes = ?summary.prompt_cache_key_bytes,
+                client_metadata_keys = ?summary.client_metadata_keys,
+                reasoning_keys = ?summary.reasoning_keys,
+                reasoning_effort = ?summary.reasoning_effort,
+                client_metadata = ?request.value.get("client_metadata"),
+                prompt_cache_key = ?request.value.get("prompt_cache_key"),
+                text = ?request.value.get("text"),
+                reasoning = ?request.value.get("reasoning"),
                 latency_ms,
                 "response forwarding failed"
             );
         }
+    }
+}
+
+struct RequestLogSummary {
+    request_bytes: usize,
+    tools_count: usize,
+    input_types: Vec<String>,
+    top_level_keys: Vec<String>,
+    has_metadata: bool,
+    instructions_bytes: Option<usize>,
+    store: Option<bool>,
+    tool_choice: Option<String>,
+    include: Option<Vec<String>>,
+    text_keys: Vec<String>,
+    prompt_cache_key_bytes: Option<usize>,
+    client_metadata_keys: Vec<String>,
+    reasoning_keys: Vec<String>,
+    reasoning_effort: Option<String>,
+}
+
+fn request_log_summary(request: &ResponseRequest) -> RequestLogSummary {
+    let top_level_keys = request
+        .value
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    let input_types = request
+        .turn_input
+        .iter()
+        .filter_map(|item| item.get("type").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let tools_count = request
+        .value
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let instructions_bytes = request
+        .value
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::len);
+    let has_metadata = request
+        .value
+        .get("metadata")
+        .is_some_and(|value| !value.is_null());
+    let store = request.value.get("store").and_then(Value::as_bool);
+    let tool_choice = request
+        .value
+        .get("tool_choice")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let include = request
+        .value
+        .get("include")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        });
+    let text_keys = request
+        .value
+        .get("text")
+        .and_then(Value::as_object)
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    let prompt_cache_key_bytes = request
+        .value
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::len);
+    let client_metadata_keys = request
+        .value
+        .get("client_metadata")
+        .and_then(Value::as_object)
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    let reasoning_keys = request
+        .value
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    let reasoning_effort = request
+        .value
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("effort"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    RequestLogSummary {
+        request_bytes: request.body.len(),
+        tools_count,
+        input_types,
+        top_level_keys,
+        has_metadata,
+        instructions_bytes,
+        store,
+        tool_choice,
+        include,
+        text_keys,
+        prompt_cache_key_bytes,
+        client_metadata_keys,
+        reasoning_keys,
+        reasoning_effort,
     }
 }
 
@@ -1934,5 +2442,66 @@ mod tests {
             .unwrap()
         );
         assert!(switched.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn shared_search_context_truncates_on_char_boundary() {
+        let response = json!({
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "汉".repeat(200_000)
+                }]
+            }]
+        });
+        let context = search_context_from_response(&response).unwrap();
+        assert!(context.len() <= MAX_SEARCH_CONTEXT_BYTES);
+        assert!(context.is_char_boundary(context.len()));
+    }
+
+    #[test]
+    fn catalog_always_advertises_search_support() {
+        let catalog = advertise_search_support(json!({"models":[
+            {"slug":"custom-model", "supports_search_tool": false}
+        ]}))
+        .unwrap();
+        let model = &catalog["models"][0];
+        assert_eq!(model["supports_search_tool"], true);
+        assert_eq!(model["web_search_tool_type"], "text_and_image");
+    }
+
+    #[test]
+    fn menu_search_backend_override_precedes_config() {
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.web_search.enabled = true;
+        settings.web_search.backend_model = "config-model".into();
+        let state = AppState::new(
+            settings,
+            Credentials {
+                proxy_token: "proxy".into(),
+                cpa_token: "cpa".into(),
+                cpa_management_key: "management".into(),
+            },
+            root.path().join("catalog.json"),
+            root.path().join("cpa-profiles.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            state.shared_search_backend().as_deref(),
+            Some("config-model")
+        );
+
+        crate::cpa::set_search_backend_setting(
+            &state.cpa_profiles_path,
+            Some(Some("menu-model".into())),
+        )
+        .unwrap();
+        assert_eq!(state.shared_search_backend().as_deref(), Some("menu-model"));
+
+        crate::cpa::set_search_backend_setting(&state.cpa_profiles_path, Some(None)).unwrap();
+        assert!(state.shared_search_backend().is_none());
     }
 }

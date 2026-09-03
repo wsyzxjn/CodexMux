@@ -25,6 +25,7 @@ pub struct Paths {
     pub state: PathBuf,
     pub backups: PathBuf,
     pub cpa_profiles: PathBuf,
+    pub search_capabilities: PathBuf,
 }
 
 impl Paths {
@@ -45,6 +46,7 @@ impl Paths {
             state: root.join("state/codex-config.json"),
             backups: root.join("backups"),
             cpa_profiles: root.join("cpa-profiles.toml"),
+            search_capabilities: root.join("search-capabilities.json"),
             root,
         }
     }
@@ -73,6 +75,12 @@ pub struct Settings {
     pub listen: SocketAddr,
     pub cpa: Cpa,
     pub catalog: Catalog,
+    pub web_search: WebSearch,
+    /// Translate selected transient CPA failures into Codex's
+    /// `server_is_overloaded` response so the desktop UI can show its
+    /// automatic capacity retry countdown.
+    #[serde(default = "default_true")]
+    pub map_capacity_errors: bool,
 }
 
 impl Default for Settings {
@@ -81,8 +89,14 @@ impl Default for Settings {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_PORT),
             cpa: Cpa::default(),
             catalog: Catalog::default(),
+            web_search: WebSearch::default(),
+            map_capacity_errors: default_true(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Settings {
@@ -102,7 +116,11 @@ impl Settings {
         if !self.listen.ip().is_loopback() {
             bail!("listen address must be loopback");
         }
-        self.cpa.validate()
+        self.cpa.validate()?;
+        if self.web_search.enabled && self.web_search.backend_model.trim().is_empty() {
+            bail!("web_search.enabled requires a nonempty backend_model");
+        }
+        Ok(())
     }
 }
 
@@ -113,6 +131,17 @@ pub struct Catalog {
     /// maps `ultra` to a real model-supported effort before sending requests,
     /// so this only changes catalog metadata exposed to the Codex client.
     pub advertise_ultra: bool,
+}
+
+/// Shared Responses API `web_search` backend. When enabled, CodexMux runs
+/// search through this model, injects the results into the original request,
+/// and forwards that request to the user-selected model.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebSearch {
+    pub enabled: bool,
+    /// Catalog slug of the search-capable backend model.
+    pub backend_model: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -324,5 +353,14 @@ mod tests {
             remote.management_connect_url("mgmt-key").unwrap().as_str(),
             "https://cpa.example.com/management.html"
         );
+    }
+
+    #[test]
+    fn shared_search_requires_a_backend_when_enabled() {
+        let mut settings = Settings::default();
+        settings.web_search.enabled = true;
+        assert!(settings.validate().is_err());
+        settings.web_search.backend_model = "gpt-5.6-sol".into();
+        assert!(settings.validate().is_ok());
     }
 }

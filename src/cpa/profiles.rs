@@ -22,6 +22,18 @@ struct ProfileStore {
         skip_serializing_if = "Option::is_none"
     )]
     review_override: Option<String>,
+    /// Shared Responses `web_search` backend selected from the menu bar.
+    /// `None` means the process-level `config.toml` setting is authoritative.
+    #[serde(rename = "search_backend", default, skip_serializing_if = "Option::is_none")]
+    search_backend: Option<String>,
+    /// Menu override for the shared search feature. `None` follows
+    /// `config.toml`; `Some(false)` disables it even when config enables it.
+    #[serde(
+        rename = "search_backend_enabled",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    search_backend_enabled: Option<bool>,
     /// Direct routes: model slugs CodexMux proxies straight to an upstream,
     /// bypassing CPA entirely (used to sidestep CPA executor bugs).
     #[serde(
@@ -142,6 +154,65 @@ pub fn set_review_override(profiles_path: &Path, slug: Option<String>) -> Result
         store.review_override = Some(slug.trim().to_owned());
     } else {
         store.review_override = None;
+    }
+    save_profile_store_to(profiles_path, &store)
+}
+
+/// A menu bar search-backend override. `None` means use `config.toml`.
+#[derive(Clone, Debug)]
+pub struct SearchBackendSetting {
+    pub enabled: bool,
+    pub backend_model: String,
+}
+
+/// Read the menu bar shared search override, if one has been persisted.
+pub fn search_backend_setting(profiles_path: &Path) -> Option<SearchBackendSetting> {
+    let store = load_profile_store_from(profiles_path);
+    let enabled = store.search_backend_enabled?;
+    let backend_model = store
+        .search_backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_default();
+    if !enabled {
+        return Some(SearchBackendSetting {
+            enabled: false,
+            backend_model: String::new(),
+        });
+    }
+    if backend_model.is_empty() {
+        return None;
+    }
+    Some(SearchBackendSetting {
+        enabled: true,
+        backend_model,
+    })
+}
+
+/// Enable (`Some(slug)`), disable (`None`), or clear the menu override
+/// (`default`) for the shared Responses web search backend.
+pub fn set_search_backend_setting(
+    profiles_path: &Path,
+    override_kind: Option<Option<String>>,
+) -> Result<()> {
+    let mut store = load_profile_store_from(profiles_path);
+    match override_kind {
+        Some(Some(slug)) => {
+            let slug = slug.trim().to_owned();
+            anyhow::ensure!(!slug.is_empty(), "search backend slug must not be empty");
+            store.search_backend = Some(slug);
+            store.search_backend_enabled = Some(true);
+        }
+        Some(None) => {
+            store.search_backend = None;
+            store.search_backend_enabled = Some(false);
+        }
+        None => {
+            store.search_backend = None;
+            store.search_backend_enabled = None;
+        }
     }
     save_profile_store_to(profiles_path, &store)
 }
