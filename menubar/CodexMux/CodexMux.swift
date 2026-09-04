@@ -301,6 +301,26 @@ struct L10n {
     /// True when this is the Chinese localization.
     var isChinese: Bool { quit == "退出 CodexMux" }
 
+    var directRemoveItem: String {
+        isChinese ? "移除此端点…" : "Remove This Endpoint…"
+    }
+
+    var directRouteNoModels: String {
+        isChinese ? "（无模型）" : "(no models)"
+    }
+
+    var directRemoveDialogTitle: String {
+        isChinese ? "移除这个直连端点？" : "Remove this direct endpoint?"
+    }
+
+    func directRemoveDialogBody(endpoint: String, models: [String]) -> String {
+        let list = models.isEmpty ? "—" : models.map { "cpa/\($0)" }.joined(separator: ", ")
+        if isChinese {
+            return "将移除 \(endpoint)。它的 \(models.count) 个模型会改回经 CPA 路由：\(list)。\n此操作不可撤销，重新添加需要再次填写 Token。"
+        }
+        return "Removes \(endpoint). Its \(models.count) model(s) fall back to the CPA route: \(list).\nThis cannot be undone; re-adding it requires the token again."
+    }
+
     func cpaUpdateAvailable(_ version: String) -> String {
         isChinese ? "可用更新：\(version)" : "Update available: \(version)"
     }
@@ -953,12 +973,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let pathLabel = path.hasSuffix("/v1") ? String(path.dropLast(3)) : path
                 let endpoint = pathLabel.isEmpty ? host : "\(host)/\(pathLabel)"
                 let title = "\(endpoint) (\(route.models.count))"
-                let item = NSMenuItem(title: title,
-                                      action: #selector(removeDirectRoute(_:)),
-                                      keyEquivalent: "")
-                item.target = self
-                item.representedObject = route.baseURL
+                // Selecting an endpoint only opens its submenu: browsing the
+                // list must never be destructive. Removal lives behind its own
+                // item plus a confirmation dialog.
+                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                 item.toolTip = "\(route.models.joined(separator: ", ")) → \(route.baseURL)"
+                let routeMenu = NSMenu()
+                routeMenu.autoenablesItems = false
+                let urlRow = NSMenuItem(title: route.baseURL, action: nil, keyEquivalent: "")
+                urlRow.isEnabled = false
+                routeMenu.addItem(urlRow)
+                if route.models.isEmpty {
+                    let noModels = NSMenuItem(title: l10n.directRouteNoModels, action: nil, keyEquivalent: "")
+                    noModels.isEnabled = false
+                    routeMenu.addItem(noModels)
+                } else {
+                    for model in route.models {
+                        let modelRow = NSMenuItem(title: "cpa/\(model)", action: nil, keyEquivalent: "")
+                        modelRow.isEnabled = false
+                        routeMenu.addItem(modelRow)
+                    }
+                }
+                routeMenu.addItem(.separator())
+                let remove = NSMenuItem(title: l10n.directRemoveItem,
+                                        action: #selector(removeDirectRoute(_:)),
+                                        keyEquivalent: "")
+                remove.target = self
+                remove.representedObject = route.baseURL
+                routeMenu.addItem(remove)
+                item.submenu = routeMenu
                 directMenu.addItem(item)
             }
         }
@@ -1492,6 +1535,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func removeDirectRoute(_ sender: NSMenuItem) {
         guard let baseURL = sender.representedObject as? String else { return }
+        // Removing a direct endpoint silently reroutes all of its models
+        // through CPA, so it always requires an explicit confirmation.
+        let models = directRoutes.first { $0.baseURL == baseURL }?.models ?? []
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = l10n.directRemoveDialogTitle
+        alert.informativeText = l10n.directRemoveDialogBody(endpoint: baseURL, models: models)
+        alert.addButton(withTitle: l10n.directRemove)
+        alert.addButton(withTitle: l10n.quitDialogCancel)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
         runCodexMuxDetached(
             ["cpa", "direct-remove", "--base-url", baseURL]
         ) { [weak self] ok in
