@@ -238,6 +238,29 @@ pub fn advertise_search_all(catalog: &mut Value) -> Result<()> {
 
 const ULTRA_REASONING_EFFORT: &str = "ultra";
 
+/// Metadata template for a synthesized direct-route entry.
+///
+/// Codex deserializes the whole model list into one strict struct, so a single
+/// entry missing a required field (`shell_type`, for example) makes the client
+/// discard the entire catalog and fall back to its built-in models. A declared
+/// model therefore copies a real upstream entry and overrides only identity,
+/// which also keeps it valid as the upstream schema grows.
+fn direct_template(models: &[Value], upstream_model: &str) -> Option<Value> {
+    let same_slug = models
+        .iter()
+        .find(|model| model_slug(model) == Some(upstream_model));
+    let listed_official = || {
+        models.iter().find(|model| {
+            model_slug(model).is_some_and(|slug| !slug.starts_with(CPA_MODEL_PREFIX))
+                && model.get("visibility").and_then(Value::as_str) != Some("hide")
+        })
+    };
+    same_slug
+        .or_else(listed_official)
+        .or_else(|| models.first())
+        .cloned()
+}
+
 /// Append direct-route model declarations to an already-merged catalog so
 /// declared models stay routable even when CPA's catalog omits them.
 fn merge_declared_direct(catalog: &mut Value, direct: &[DirectModel]) -> Result<()> {
@@ -274,18 +297,24 @@ fn merge_declared_direct(catalog: &mut Value, direct: &[DirectModel]) -> Result<
         if !known.insert(local.clone()) {
             continue;
         }
-        let mut declared = json!({
-            "slug": local,
-            "display_name": format!("{} · Direct", model.upstream_model),
-            "priority": next_priority,
-        });
+        let mut declared =
+            direct_template(output_models, &model.upstream_model).unwrap_or_else(|| json!({}));
+        let object = declared
+            .as_object_mut()
+            .context("catalog contains a non-object model")?;
+        object.insert("slug".into(), json!(local));
+        object.insert(
+            "display_name".into(),
+            json!(format!("{} · Direct", model.upstream_model)),
+        );
+        object.insert("priority".into(), json!(next_priority));
+        let visibility = if model.upstream_model == AUTO_REVIEW_MODEL {
+            "hide"
+        } else {
+            "list"
+        };
+        object.insert("visibility".into(), json!(visibility));
         next_priority = next_priority.saturating_add(1);
-        if model.upstream_model == AUTO_REVIEW_MODEL {
-            declared
-                .as_object_mut()
-                .expect("declared direct model is an object")
-                .insert("visibility".into(), json!("hide"));
-        }
         output_models.push(declared);
     }
     Ok(())
@@ -622,6 +651,109 @@ mod tests {
             .unwrap();
         assert_eq!(from_cpa["display_name"], "gpt-5.6-sol · Direct");
         assert_eq!(from_cpa["context_window"], 200_000);
+    }
+
+    /// Codex parses the model list into one strict struct: an entry missing a
+    /// required field makes the client discard the whole catalog and show only
+    /// its built-in models. Declared direct models must therefore carry every
+    /// field of the entry they were modelled on.
+    #[test]
+    fn synthesized_direct_models_keep_every_template_field() {
+        let official = json!({"models":[{
+            "slug":"gpt-5.6", "display_name":"5.6", "priority":3,
+            "shell_type":"shell_command", "context_window":400_000,
+            "base_instructions":"official instructions", "visibility":"list",
+            "model_messages":{"limit":"stop"}, "truncation_policy":"auto"
+        }]});
+        let direct = [DirectModel {
+            upstream_model: "sol-only-on-direct".into(),
+            base_url: "https://direct.example/v1".into(),
+        }];
+
+        for merged in [
+            merge_official_direct(&official, &direct).unwrap(),
+            merge(&official, &json!({"models":[]}))
+                .map(|mut catalog| {
+                    merge_declared_direct(&mut catalog, &direct).unwrap();
+                    catalog
+                })
+                .unwrap(),
+        ] {
+            let models = merged["models"].as_array().unwrap();
+            let template = models
+                .iter()
+                .find(|model| model["slug"] == "gpt-5.6")
+                .unwrap();
+            let declared = models
+                .iter()
+                .find(|model| model["slug"] == "cpa/sol-only-on-direct")
+                .unwrap();
+            for field in template.as_object().unwrap().keys() {
+                assert!(
+                    declared.get(field).is_some(),
+                    "declared direct model dropped {field}"
+                );
+            }
+            assert_eq!(declared["shell_type"], "shell_command");
+            assert_eq!(declared["context_window"], 400_000);
+            assert_eq!(declared["display_name"], "sol-only-on-direct · Direct");
+            assert_eq!(declared["visibility"], "list");
+            assert_eq!(declared["priority"], 103);
+        }
+    }
+
+    #[test]
+    fn synthesized_direct_models_prefer_the_matching_official_metadata() {
+        let official = json!({"models":[
+            {"slug":"gpt-reserve", "visibility":"hide", "shell_type":"shell_command",
+             "context_window":100, "priority":1},
+            {"slug":"gpt-5.6-sol", "visibility":"list", "shell_type":"local_shell",
+             "context_window":999_999, "description":"Sol", "priority":2}
+        ]});
+        let direct = [DirectModel {
+            upstream_model: "gpt-5.6-sol".into(),
+            base_url: "https://direct.example/v1".into(),
+        }];
+
+        let merged = merge_official_direct(&official, &direct).unwrap();
+        let declared = merged["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "cpa/gpt-5.6-sol")
+            .unwrap();
+        // The same-named official entry wins over the first visible model, so a
+        // direct route advertises the metadata of the model it actually proxies.
+        assert_eq!(declared["shell_type"], "local_shell");
+        assert_eq!(declared["context_window"], 999_999);
+        assert_eq!(declared["description"], "Sol");
+    }
+
+    /// A hidden template must not hide the declared model, and a declared
+    /// auto-review override stays hidden from the picker.
+    #[test]
+    fn synthesized_direct_models_normalize_visibility() {
+        let official = json!({"models":[
+            {"slug":"gpt-reserve", "visibility":"hide", "shell_type":"shell_command"}
+        ]});
+        let direct = [
+            DirectModel {
+                upstream_model: "custom".into(),
+                base_url: "https://direct.example/v1".into(),
+            },
+            DirectModel {
+                upstream_model: AUTO_REVIEW_MODEL.into(),
+                base_url: "https://direct.example/v1".into(),
+            },
+        ];
+
+        let merged = merge_official_direct(&official, &direct).unwrap();
+        let models = merged["models"].as_array().unwrap();
+        let visibility = |slug: &str| {
+            models.iter().find(|model| model["slug"] == slug).unwrap()["visibility"].clone()
+        };
+        assert_eq!(visibility("cpa/custom"), "list");
+        assert_eq!(visibility(&format!("cpa/{AUTO_REVIEW_MODEL}")), "hide");
     }
 
     #[test]
