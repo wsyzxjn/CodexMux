@@ -345,6 +345,35 @@ async fn fetch_cpa_catalog(state: &AppState, client_version: &str) -> Result<Val
     Ok(catalog)
 }
 
+/// How long a cold start waits for a CPA instance it just launched.
+pub const CPA_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(8);
+const CPA_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Prime the CPA catalog cache before the first Codex request is answered.
+///
+/// `launchctl bootstrap` returns before CPA binds its port, so a model refresh
+/// arriving in that window merges without a single `cpa/` model, and the client
+/// keeps that degraded list until its next refresh. Waiting delays only a cold
+/// start that just launched CPA; a CPA that never answers still falls through
+/// to the degraded view.
+pub async fn wait_for_cpa_catalog(state: &AppState, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Err(error) = fetch_cpa_catalog(state, "").await else {
+            return;
+        };
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                %error.message,
+                timeout_seconds = timeout.as_secs(),
+                "CPA did not become ready during startup; serving without CPA models"
+            );
+            return;
+        }
+        tokio::time::sleep(CPA_STARTUP_POLL_INTERVAL).await;
+    }
+}
+
 async fn synchronize_cpa_catalog(state: AppState) {
     let mut retry = Duration::from_secs(5);
     loop {
@@ -1714,6 +1743,55 @@ mod tests {
         .unwrap();
         state.official_base_url = format!("http://{official_address}/v1");
         state
+    }
+
+    /// A cold start must not answer the queued Codex model refresh until the
+    /// CPA instance it just launched is reachable, or the client caches a
+    /// catalog with no `cpa/` models for the rest of its session.
+    #[tokio::test]
+    async fn startup_wait_primes_the_catalog_once_cpa_finishes_binding() {
+        let root = tempfile::tempdir().unwrap();
+        // Reserve the port first so the state points at an endpoint that only
+        // starts answering later, exactly like a CPA still binding its socket.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let cpa_address = listener.local_addr().unwrap();
+        drop(listener);
+        let state = auto_review_state(root.path(), cpa_address, cpa_address);
+        assert!(state.cached_cpa_catalog(CPA_CATALOG_FRESH_FOR).is_none());
+
+        let late_start = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let app = Router::new().route(
+                "/v1/models",
+                get(|| async { Json(json!({"models":[{"slug":"glm-5.3-flash"}]})) }),
+            );
+            let listener = tokio::net::TcpListener::bind(cpa_address).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        wait_for_cpa_catalog(&state, Duration::from_secs(10)).await;
+        let cached = state.cached_cpa_catalog(CPA_CATALOG_FRESH_FOR).unwrap();
+        assert_eq!(cached["models"][0]["slug"], "glm-5.3-flash");
+        late_start.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_wait_gives_up_when_cpa_never_answers() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let dead_address = listener.local_addr().unwrap();
+        drop(listener);
+        let state = auto_review_state(root.path(), dead_address, dead_address);
+
+        let started = Instant::now();
+        wait_for_cpa_catalog(&state, Duration::from_millis(600)).await;
+        // Bounded: an absent CPA degrades instead of blocking the listener.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(state.cached_cpa_catalog(CPA_CATALOG_FRESH_FOR).is_none());
     }
 
     #[tokio::test]

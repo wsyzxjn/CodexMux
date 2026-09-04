@@ -405,9 +405,11 @@ async fn serve(paths: &Paths, no_codex_config: bool, launchd_socket: bool) -> Re
     };
     let lifecycle_manages_cpa =
         launchd_socket && codexmux::cpa::cpa_autostart(&paths.cpa_profiles) == Some(true);
+    let mut launched_cpa = false;
     if lifecycle_manages_cpa && !codexmux::cpa::is_loaded()? {
         codexmux::cpa::start(paths, &settings.cpa, &credentials.cpa_token)?;
         tracing::info!("CPA started for active Codex client");
+        launched_cpa = true;
     }
     let state = AppState::new(
         settings.clone(),
@@ -415,6 +417,12 @@ async fn serve(paths: &Paths, no_codex_config: bool, launchd_socket: bool) -> Re
         paths.catalog.clone(),
         paths.cpa_profiles.clone(),
     )?;
+    // The Codex request that socket-activated this process is already queued,
+    // so let the CPA instance we just launched finish binding before answering
+    // it; otherwise the first model refresh sees no CPA models at all.
+    if launched_cpa {
+        server::wait_for_cpa_catalog(&state, server::CPA_STARTUP_READY_TIMEOUT).await;
+    }
     let shutdown = shutdown_signal()?;
     let lease = if no_codex_config {
         None
