@@ -19,6 +19,8 @@ struct L10n {
     let cpaAutostart: String
     let advertiseUltra: String
     let advertiseUltraFailed: String
+    let unifyCompHash: String
+    let unifyCompHashFailed: String
     let cpaUpdate: String
     let cpaVersionUnknown: String
     let cpaCheckUpdate: String
@@ -117,6 +119,8 @@ struct L10n {
         cpaAutostart: "Start CPA with CodexMux",
         advertiseUltra: "Advertise Ultra for All Models",
         advertiseUltraFailed: "Failed to save the Ultra catalog setting. See logs.",
+        unifyCompHash: "Share One Compaction Hash",
+        unifyCompHashFailed: "Failed to save the compaction hash setting. See logs.",
         cpaUpdate: "CPA Update",
         cpaVersionUnknown: "Version: unknown",
         cpaCheckUpdate: "Check for CPA Updates…",
@@ -216,6 +220,8 @@ struct L10n {
         cpaAutostart: "随 CodexMux 启动 CPA",
         advertiseUltra: "为所有模型声明 Ultra",
         advertiseUltraFailed: "保存 Ultra 目录设置失败，请查看日志。",
+        unifyCompHash: "统一压缩兼容哈希",
+        unifyCompHashFailed: "保存压缩哈希设置失败，请查看日志。",
         cpaUpdate: "CPA 更新",
         cpaVersionUnknown: "版本：未知",
         cpaCheckUpdate: "检查 CPA 更新…",
@@ -461,6 +467,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cpaInstalling = false
     private var cpaAutostart: Bool?
     private var advertiseUltra = false
+    private var unifyCompHash = true
     private var cpaInstalledVersion: String?
     private var cpaLatestVersion: String?
     private var cpaUpdateAvailable = false
@@ -545,6 +552,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         group.enter()
         loadUltraState { [weak self] enabled in
             self?.advertiseUltra = enabled
+            group.leave()
+        }
+        group.enter()
+        loadCompHashState { [weak self] enabled in
+            self?.unifyCompHash = enabled
             group.leave()
         }
         group.enter()
@@ -691,6 +703,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let enabled = output
                 .split(separator: "\n")
                 .contains("ultra: true")
+            DispatchQueue.main.async { completion(enabled) }
+        }
+    }
+
+    /// Load whether CodexMux serves one shared `comp_hash` for every model.
+    private func loadCompHashState(_ completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let output = self.captureCodexMux(["catalog", "comp-hash-get"])
+            let enabled = output
+                .split(separator: "\n")
+                .contains("unify-comp-hash: true")
             DispatchQueue.main.async { completion(enabled) }
         }
     }
@@ -1024,6 +1047,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ultraItem.target = self
         ultraItem.state = advertiseUltra ? .on : .off
         advancedMenu.addItem(ultraItem)
+        let compHashItem = NSMenuItem(title: l10n.unifyCompHash,
+                                      action: #selector(toggleUnifyCompHash),
+                                      keyEquivalent: "")
+        compHashItem.target = self
+        compHashItem.state = unifyCompHash ? .on : .off
+        advancedMenu.addItem(compHashItem)
         advancedItem.submenu = advancedMenu
         menu.addItem(advancedItem)
 
@@ -1376,6 +1405,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runCodexMuxDetached(["catalog", "ultra-set", enabled ? "true" : "false"]) { [weak self] ok in
             if !ok {
                 self?.showAlert(self?.l10n.advertiseUltraFailed ?? "")
+            } else {
+                self?.restartProxy()
+            }
+        }
+    }
+
+    @objc private func toggleUnifyCompHash(_ sender: NSMenuItem) {
+        let enabled = sender.state != .on
+        runCodexMuxDetached(["catalog", "comp-hash-set", enabled ? "true" : "false"]) { [weak self] ok in
+            if !ok {
+                self?.showAlert(self?.l10n.unifyCompHashFailed ?? "")
             } else {
                 self?.restartProxy()
             }

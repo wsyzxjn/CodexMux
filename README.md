@@ -31,6 +31,7 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
    - **CPA**：统一管理安装/启停、随 CodexMux 启动（默认开启）、更新/回滚、配置方案切换、Web 管理入口与管理密钥；
    - **直连端点（Direct Endpoints）**：在弹窗中快速添加/移除原生 Responses 端点与模型映射；
    - **高级功能 ▸ 为所有模型声明 Ultra**：开启后在模型目录中为每个模型显示 Codex 侧的 `ultra` 预设；Codex 会把该预设映射到模型支持的实际档位。
+   - **高级功能 ▸ 统一压缩兼容哈希**（默认开启）：Codex 在两轮的 `comp_hash` 不一致时，会在采样前用**上一个模型**强制压缩一次；官方 5.6 家族与其余官方/CPA 模型的取值本就不同，因此会话中途换模型会把压缩请求送回你正要离开的模型，遇到限额时对话直接卡死。开启后 CodexMux 只在下发给 Codex 的目录里统一该值（取官方默认模型当前的取值），磁盘快照仍保留上游原值；官方真的更换压缩格式时所有模型会一起变更，Codex 仍会正常重压缩一次。
    - **审批模型**：为 `codex-auto-review` 指定走特定的 CPA 模型；
    - **关于与 App 更新**：查看 App/内置 CLI 版本及源码仓库；可检查 GitHub 最新稳定版，下载后校验 `SHA256SUMS`、Bundle 标识、版本和代码签名，再备份当前 App、替换并重新启动；
    - **查看日志与状态**：一键打开日志目录或查看服务运行状态。
@@ -55,6 +56,8 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
 | `codexmux cpa search-get` / `search-set` | 查询或设置共享 Web 搜索后端（模型、`off` 或 `default`） |
 | `codexmux cpa search-detect [--model <slug>] [--verify]` | 本地识别并缓存搜索能力；`--verify` 需配 `--model`，只验证一个后端 |
 | `codexmux cpa search-capabilities` | 打印缓存的搜索能力检测结果 |
+| `codexmux catalog ultra-get` / `ultra-set <bool>` | 查询或设置是否为所有模型声明 `ultra` 预设 |
+| `codexmux catalog comp-hash-get` / `comp-hash-set <bool>` | 查询或设置是否为所有模型统一压缩兼容哈希（默认开启） |
 | `codexmux install` | （无菜单栏时）注册并启动后台 LaunchAgent 并接管配置 |
 | `codexmux uninstall` | 停止后台 LaunchAgent 并还原 Codex 配置 |
 

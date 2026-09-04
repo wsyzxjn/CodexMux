@@ -237,6 +237,70 @@ pub fn advertise_search_all(catalog: &mut Value) -> Result<()> {
 }
 
 const ULTRA_REASONING_EFFORT: &str = "ultra";
+const COMP_HASH_FIELD: &str = "comp_hash";
+
+/// Serve one shared compaction-compatibility hash across the merged catalog.
+///
+/// Codex runs a pre-sampling compaction whenever two consecutive turns
+/// advertise different `comp_hash` values, and it sends that compaction to the
+/// *previous* model. Upstream metadata mixes hashes across families (the 5.6
+/// family and the CPA catalog disagree today), so switching model
+/// mid-conversation asks the model being left behind to compact first. When
+/// that model is the exhausted one the user is trying to escape, the
+/// conversation cannot continue at all.
+///
+/// The shared value tracks the official catalog rather than a constant: when
+/// upstream really does change its compaction format, every model rotates
+/// together and Codex still recompacts exactly once. A merged catalog without
+/// any official hash drops the field, which Codex reads as "no information"
+/// and never compacts on.
+pub fn unify_comp_hash_all(catalog: &mut Value) -> Result<()> {
+    let reference = default_official_comp_hash(catalog)?;
+    for model in models_mut(catalog)? {
+        let object = model
+            .as_object_mut()
+            .context("catalog contains a non-object model")?;
+        match reference.as_deref() {
+            Some(hash) => object.insert(COMP_HASH_FIELD.into(), json!(hash)),
+            None => object.remove(COMP_HASH_FIELD),
+        };
+    }
+    Ok(())
+}
+
+/// The hash Codex already applies to its default official model: the listed
+/// official entry with the strongest display precedence. Hidden entries are a
+/// last resort, and catalog order breaks ties so the choice stays stable
+/// across refreshes.
+fn default_official_comp_hash(catalog: &Value) -> Result<Option<String>> {
+    let mut best: Option<((bool, i64), &str)> = None;
+    for model in models(catalog)? {
+        let Some(slug) = model_slug(model) else {
+            continue;
+        };
+        if slug.starts_with(CPA_MODEL_PREFIX) {
+            continue;
+        }
+        let Some(hash) = model
+            .get(COMP_HASH_FIELD)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|hash| !hash.is_empty())
+        else {
+            continue;
+        };
+        let hidden = model.get("visibility").and_then(Value::as_str) == Some("hide");
+        let priority = model
+            .get("priority")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MAX);
+        let rank = (hidden, priority);
+        if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+            best = Some((rank, hash));
+        }
+    }
+    Ok(best.map(|(_, hash)| hash.to_owned()))
+}
 
 /// Metadata template for a synthesized direct-route entry.
 ///
@@ -526,6 +590,51 @@ mod tests {
                 .iter()
                 .any(|entry| entry["effort"] == "ultra");
             assert!(has_ultra, "{slug} did not advertise ultra");
+        }
+    }
+
+    /// Codex compacts on the *previous* model whenever consecutive turns
+    /// disagree about `comp_hash`, so every route must report the value Codex
+    /// already uses for its default official model.
+    #[test]
+    fn comp_hash_unification_adopts_the_default_official_hash() {
+        let mut catalog = json!({"models":[
+            {"slug":"gpt-reserve", "priority":3, "visibility":"hide", "comp_hash":"4200"},
+            {"slug":"gpt-5.6-sol", "priority":6, "comp_hash":"3000"},
+            {"slug":"gpt-5.5", "priority":12, "comp_hash":"2911"},
+            {"slug":"cpa/claude-opus-5", "priority":143, "display_name":"Opus · CPA", "comp_hash":"2911"},
+            {"slug":"cpa/glm-5.3-flash", "priority":151}
+        ]});
+        unify_comp_hash_all(&mut catalog).unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        for model in models {
+            assert_eq!(
+                model["comp_hash"], "3000",
+                "{} kept a mismatched comp_hash",
+                model["slug"]
+            );
+        }
+        // Identity and ordering metadata stay exactly as merged.
+        assert_eq!(models[3]["slug"], "cpa/claude-opus-5");
+        assert_eq!(models[3]["display_name"], "Opus · CPA");
+        assert_eq!(models[3]["priority"], 143);
+    }
+
+    /// A missing hash is "no information" to Codex, so a catalog without any
+    /// official hash drops the field instead of inventing one.
+    #[test]
+    fn comp_hash_unification_drops_the_field_without_an_official_hash() {
+        let mut catalog = json!({"models":[
+            {"slug":"gpt-5.6-sol", "priority":6},
+            {"slug":"cpa/claude-opus-5", "priority":143, "comp_hash":"2911"}
+        ]});
+        unify_comp_hash_all(&mut catalog).unwrap();
+        for model in catalog["models"].as_array().unwrap() {
+            assert!(
+                model.get("comp_hash").is_none(),
+                "{} still advertises a comp_hash",
+                model["slug"]
+            );
         }
     }
 

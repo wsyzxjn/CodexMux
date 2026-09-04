@@ -15,8 +15,15 @@ value.
   route a `cpa/` slug to one native Responses endpoint (a direct route); direct
   routes declare their models and work with or without CPA installed. This is a
   narrow per-model override, not automatic failover or a general gateway.
-- Aggregate the official and CPA native Codex catalogs dynamically. Preserve
-  upstream model metadata; only namespace CPA slugs and adjust display ordering.
+- Aggregate the official and CPA native Codex catalogs dynamically. The
+  persisted snapshot preserves upstream model metadata; only namespace CPA slugs
+  and adjust display ordering.
+- The served catalog view may carry narrow, reversible client-side adjustments
+  that the snapshot does not: advertised search support, the optional `ultra`
+  preset, and one shared compaction-compatibility hash. The shared `comp_hash`
+  keeps Codex from forcing a pre-turn compaction onto the model a user is
+  switching away from, and it tracks the default official model so a genuine
+  upstream format change still rotates every model together.
 - When CPA is unreachable, serve the official catalog merged with declared
   direct-route models. This degraded view is memory-only; the persisted
   snapshot still requires both upstream catalogs to validate.

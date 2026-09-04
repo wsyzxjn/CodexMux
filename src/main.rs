@@ -66,6 +66,13 @@ enum CatalogCommand {
         /// `true`/`false`: whether every model advertises `ultra`.
         enabled: String,
     },
+    /// Show whether every model is served with one shared `comp_hash`.
+    CompHashGet,
+    /// Enable or disable serving one shared `comp_hash` for every model.
+    CompHashSet {
+        /// `true`/`false`: whether every model shares one `comp_hash`.
+        enabled: String,
+    },
     /// List every model slug in the merged catalog.
     Models,
 }
@@ -330,6 +337,19 @@ fn catalog(paths: &Paths, command: CatalogCommand) -> Result<()> {
             settings.catalog.advertise_ultra = enabled;
             settings.save(&paths.settings)?;
             println!("ultra: {}", enabled);
+            Ok(())
+        }
+        CatalogCommand::CompHashGet => {
+            println!("unify-comp-hash: {}", settings.catalog.unify_comp_hash);
+            Ok(())
+        }
+        CatalogCommand::CompHashSet { enabled } => {
+            let enabled = enabled
+                .parse::<bool>()
+                .context("enabled must be true or false")?;
+            settings.catalog.unify_comp_hash = enabled;
+            settings.save(&paths.settings)?;
+            println!("unify-comp-hash: {}", enabled);
             Ok(())
         }
         CatalogCommand::Models => {

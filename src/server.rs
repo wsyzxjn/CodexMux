@@ -267,16 +267,28 @@ async fn handle_models(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ProxyError> {
     match refresh_catalog(&state, &headers, &query.client_version).await {
-        Ok(catalog) => Ok(Json(advertise_search_support(catalog)?)),
+        Ok(catalog) => Ok(Json(served_catalog(&state, catalog)?)),
         Err(error) => {
             if let Some(catalog) = state.catalog.current() {
                 tracing::warn!(%error.message, "model catalog refresh failed; serving saved snapshot");
-                Ok(Json(advertise_search_support(catalog)?))
+                Ok(Json(served_catalog(&state, catalog)?))
             } else {
                 Err(error)
             }
         }
     }
+}
+
+/// Build the catalog view handed to the Codex client. Serve-time adjustments
+/// stay out of the persisted snapshot, so they apply to a fresh merge, a saved
+/// snapshot, and the CPA-unavailable degraded view alike, and disabling one
+/// restores the upstream metadata on the next model refresh.
+fn served_catalog(state: &AppState, mut catalog: Value) -> Result<Value, ProxyError> {
+    if state.settings.catalog.unify_comp_hash {
+        catalog::unify_comp_hash_all(&mut catalog)
+            .map_err(|error| ProxyError::bad_gateway("catalog", error.to_string()))?;
+    }
+    advertise_search_support(catalog)
 }
 
 /// Custom models advertise search support even when the shared backend is
@@ -2548,6 +2560,77 @@ mod tests {
         let model = &catalog["models"][0];
         assert_eq!(model["supports_search_tool"], true);
         assert_eq!(model["web_search_tool_type"], "text_and_image");
+    }
+
+    fn comp_hash_state(root: &std::path::Path, unify: bool) -> AppState {
+        let catalog_path = root.join("catalog.json");
+        let store = CatalogStore::load(catalog_path.clone()).unwrap();
+        store
+            .replace(
+                &json!({"models":[
+                    {"slug":"gpt-5.6-sol", "priority":6, "comp_hash":"3000"},
+                    {"slug":"gpt-5.5", "priority":12, "comp_hash":"2911"}
+                ]}),
+                &json!({"models":[{"slug":"claude-opus-5", "priority":1, "comp_hash":"2911"}]}),
+                &[],
+            )
+            .unwrap();
+        drop(store);
+        let mut settings = Settings::default();
+        settings.catalog.unify_comp_hash = unify;
+        AppState::new(
+            settings,
+            Credentials {
+                proxy_token: "proxy".into(),
+                cpa_token: "cpa".into(),
+                cpa_management_key: "management".into(),
+            },
+            catalog_path,
+            root.join("cpa-profiles.toml"),
+        )
+        .unwrap()
+    }
+
+    /// The served view unifies `comp_hash` so switching model mid-conversation
+    /// never asks the model being left behind to compact first, while the
+    /// persisted snapshot keeps upstream metadata.
+    #[test]
+    fn served_catalog_unifies_comp_hash_and_leaves_the_snapshot_upstream() {
+        let root = tempfile::tempdir().unwrap();
+        let state = comp_hash_state(root.path(), true);
+        let snapshot = state.catalog.current().unwrap();
+        let served = served_catalog(&state, snapshot.clone()).unwrap();
+
+        let served_hashes: Vec<&str> = served["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["comp_hash"].as_str().unwrap())
+            .collect();
+        assert_eq!(served_hashes, ["3000", "3000", "3000"]);
+        assert_eq!(served["models"][2]["slug"], "cpa/claude-opus-5");
+
+        let stored_hashes: Vec<&str> = snapshot["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["comp_hash"].as_str().unwrap())
+            .collect();
+        assert_eq!(stored_hashes, ["3000", "2911", "2911"]);
+    }
+
+    #[test]
+    fn served_catalog_keeps_upstream_comp_hash_when_unification_is_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let state = comp_hash_state(root.path(), false);
+        let served = served_catalog(&state, state.catalog.current().unwrap()).unwrap();
+        let hashes: Vec<&str> = served["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["comp_hash"].as_str().unwrap())
+            .collect();
+        assert_eq!(hashes, ["3000", "2911", "2911"]);
     }
 
     #[test]

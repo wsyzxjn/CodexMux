@@ -124,13 +124,28 @@ impl Settings {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Catalog {
     /// Advertise the Codex-side `ultra` preset for every merged model. Codex
     /// maps `ultra` to a real model-supported effort before sending requests,
     /// so this only changes catalog metadata exposed to the Codex client.
     pub advertise_ultra: bool,
+    /// Serve one shared compaction-compatibility hash for every merged model.
+    /// Codex compacts before sampling whenever two consecutive turns advertise
+    /// different `comp_hash` values, and it runs that compaction on the
+    /// previous model, so a mid-conversation switch away from an exhausted
+    /// model would otherwise deadlock on the model being left behind.
+    pub unify_comp_hash: bool,
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self {
+            advertise_ultra: false,
+            unify_comp_hash: default_true(),
+        }
+    }
 }
 
 /// Shared Responses API `web_search` backend. When enabled, CodexMux runs
