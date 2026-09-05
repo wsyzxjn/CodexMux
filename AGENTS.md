@@ -29,6 +29,19 @@ value.
   snapshot still requires both upstream catalogs to validate.
 - CodexMux never translates Chat Completions or Anthropic Messages; CPA owns
   external-provider conversion.
+- Codex's built-in image tool posts to `/v1/images/generations` and
+  `/v1/images/edits`. These carry a `gpt-image-*` model that no catalog lists
+  and that is unrelated to the conversation model, so they are not routed by
+  slug. They are byte-preserving passthrough to the fixed official endpoint
+  unless a user explicitly pins an image model, exactly like `codex-auto-review`.
+  Only the `model` field of a parsed JSON body is rewritten when pinned;
+  upstream failure never triggers an automatic route change.
+- The two image upstreams disagree about `model`, so never assume it selects
+  anything. The official endpoint ignores it entirely — it requires only
+  `prompt` and generates even when `model` is absent, bogus, or paired with a
+  bogus `size` or `input_fidelity`, and it echoes no model back. CPA does
+  dispatch on it and rejects a model it cannot serve. That asymmetry is why the
+  slug is rewritten only when a pin moves a request off the official route.
 - Native Responses traffic is byte-preserving except when continuity requires
   `previous_response_id` to be replaced with replayable public history, or a CPA
   or direct request's local `cpa/` model slug must be restored to its upstream
@@ -40,14 +53,20 @@ value.
 - `codex-auto-review` may be explicitly pinned to a CPA model. Without an
   explicit override it stays on the official route; upstream failure never
   triggers an automatic route change.
+- Image models are user-declared, not catalog-derived: CPA serves image models
+  its `/v1/models` never lists, and neither catalog exposes any image model. A
+  pinned image slug is validated by the upstream that receives it, and its
+  error is returned unchanged. Any list CodexMux shows for the picker is
+  best-effort UI metadata, never routing truth, and it describes the CPA route
+  only; pinning cannot change what the official endpoint generates.
 
 ## Security boundaries
 
 - Bind loopback only and require the configured proxy token on every request.
 - The CodexMux listener must be loopback-only; remote CPA and direct endpoints
   must use HTTPS. Plain HTTP is allowed only for loopback endpoints.
-- Official ChatGPT OAuth may pass only to the fixed official Responses and model
-  catalog endpoints.
+- Official ChatGPT OAuth may pass only to the fixed official Responses, model
+  catalog, and image generation/edit endpoints.
 - Persisted catalog state changes only after both upstream catalogs validate;
   persist the complete merged snapshot atomically and never install a partial
   refresh. The CPA-unavailable degraded view (official + declared direct

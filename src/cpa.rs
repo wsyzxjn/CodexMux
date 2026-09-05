@@ -121,7 +121,64 @@ fn model_slugs_from_value(value: &serde_json::Value) -> Result<Vec<String>> {
     Ok(slugs)
 }
 
-/// Fetch model ids from a direct Responses endpoint without persisting them.
+/// Best-effort discovery of the image models a CPA instance will accept.
+///
+/// CPA serves `/v1/images/*` but never lists image models in `/v1/models`, and
+/// exposes no endpoint that enumerates them. The only machine-reachable source
+/// is the rejection CPA returns for an unknown image model, which names the
+/// ones it supports. This drives the menu bar picker only: routing accepts any
+/// declared slug, so an empty or stale result never blocks a selection.
+pub fn image_model_slugs(cpa: &Cpa, token: &str) -> Result<Vec<String>> {
+    cpa.validate()?;
+    let url = format!("{}/images/generations", cpa.base_url.trim_end_matches('/'));
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()?
+        .post(&url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .json(&serde_json::json!({"model": IMAGE_PROBE_MODEL}))
+        .send()
+        .with_context(|| format!("CPA endpoint {url} is unreachable"))?;
+    let value: serde_json::Value = response.json().context("CPA returned invalid image JSON")?;
+    let message = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(|message| message.as_str())
+        .unwrap_or_default();
+    Ok(image_slugs_from_message(message))
+}
+
+/// Sentinel model used only to make CPA name the image models it accepts.
+const IMAGE_PROBE_MODEL: &str = "codexmux-image-probe";
+
+/// Pull image model slugs out of CPA's rejection message. Deliberately
+/// tolerant: an unrecognized message yields an empty list rather than an
+/// error, because this only populates a menu.
+fn image_slugs_from_message(message: &str) -> Vec<String> {
+    let Some((_, listed)) = message.split_once("Use ") else {
+        return Vec::new();
+    };
+    let mut slugs = listed
+        .split(',')
+        .flat_map(|part| part.split(" or "))
+        .map(|part| part.trim().trim_end_matches('.').trim())
+        .filter(|part| {
+            !part.is_empty()
+                && part.len() <= 64
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || ".-_".contains(c))
+                && (part.contains("image") || part.contains("imagine"))
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    slugs.sort();
+    slugs.dedup();
+    slugs
+}
+
+/// Fetch model ids from a direct Responses endpoint without persisting them./// Fetch model ids from a direct Responses endpoint without persisting them.
 pub fn direct_model_slugs(base_url: &str, token: &str) -> Result<Vec<String>> {
     model_slugs(
         &Cpa {

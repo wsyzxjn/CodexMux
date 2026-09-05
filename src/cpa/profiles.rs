@@ -22,6 +22,16 @@ struct ProfileStore {
         skip_serializing_if = "Option::is_none"
     )]
     review_override: Option<String>,
+    /// Image route override: when set, Codex's built-in image requests go to
+    /// this CPA image model instead of the official route. Image models are
+    /// not part of any catalog, so this slug is user-declared and validated
+    /// only by the upstream that receives it.
+    #[serde(
+        rename = "image_override",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    image_override: Option<String>,
     /// Shared Responses `web_search` backend selected from the menu bar.
     /// `None` means the process-level `config.toml` setting is authoritative.
     #[serde(rename = "search_backend", default, skip_serializing_if = "Option::is_none")]
@@ -158,7 +168,40 @@ pub fn set_review_override(profiles_path: &Path, slug: Option<String>) -> Result
     save_profile_store_to(profiles_path, &store)
 }
 
-/// A menu bar search-backend override. `None` means use `config.toml`.
+/// Read the current image route override (None = the official route).
+/// Read per request so menu-bar switches apply without a proxy restart.
+pub fn image_override(profiles_path: &Path) -> Option<String> {
+    load_profile_store_from(profiles_path)
+        .image_override
+        .map(|slug| slug.trim().to_owned())
+        .filter(|slug| !slug.is_empty())
+}
+
+/// Set or clear (`None`) the image route override and persist it.
+///
+/// Unlike the review override there is no catalog to check the slug against:
+/// CPA serves image models that its `/v1/models` response never lists. The
+/// slug is therefore stored as declared and validated by the upstream, whose
+/// error is passed back to Codex unchanged.
+pub fn set_image_override(profiles_path: &Path, slug: Option<String>) -> Result<()> {
+    let mut store = load_profile_store_from(profiles_path);
+    if let Some(slug) = &slug {
+        anyhow::ensure!(
+            !slug.trim().is_empty(),
+            "image override slug must not be empty"
+        );
+        anyhow::ensure!(
+            !slug.trim().starts_with(crate::config::CPA_MODEL_PREFIX),
+            "image override uses the upstream slug without the cpa/ prefix"
+        );
+        store.image_override = Some(slug.trim().to_owned());
+    } else {
+        store.image_override = None;
+    }
+    save_profile_store_to(profiles_path, &store)
+}
+
+/// A menu bar search-backend override. `None` means use `config.toml`./// A menu bar search-backend override. `None` means use `config.toml`.
 #[derive(Clone, Debug)]
 pub struct SearchBackendSetting {
     pub enabled: bool,

@@ -43,6 +43,9 @@ struct L10n {
     let advanced: String
     let reviewModel: String
     let reviewDefault: String
+    let imageModel: String
+    let imageDefault: String
+    let imageNoModels: String
     let searchBackend: String
     let searchDefault: String
     let searchDisabled: String
@@ -77,6 +80,7 @@ struct L10n {
     let openCpaManagementFailed: String
     let copyCpaManagementKeyFailed: String
     let reviewSetFailed: String
+    let imageSetFailed: String
     let directSetFailed: String
     let quitDialogTitle: String
     let quitDialogBody: String
@@ -143,6 +147,9 @@ struct L10n {
         advanced: "Advanced",
         reviewModel: "Review Model",
         reviewDefault: "Default (official route)",
+        imageModel: "Image Generation",
+        imageDefault: "Default (official route)",
+        imageNoModels: "No CPA image models detected",
         searchBackend: "Shared Web Search",
         searchDefault: "Default (config.toml)",
         searchDisabled: "Disable shared search",
@@ -177,6 +184,7 @@ struct L10n {
         openCpaManagementFailed: "Failed to open CPA Web Management. Check the CPA endpoint.",
         copyCpaManagementKeyFailed: "Failed to copy the CPA management key. Update CodexMux and try again.",
         reviewSetFailed: "Failed to set the review model. See logs.",
+        imageSetFailed: "Failed to set the image model. See logs.",
         directSetFailed: "Failed to save the direct endpoint. See logs.",
         quitDialogTitle: "Quit CodexMux?",
         quitDialogBody: "This stops the CodexMux proxy and the CPA service, and restores the Codex configuration.",
@@ -244,6 +252,9 @@ struct L10n {
         advanced: "高级功能",
         reviewModel: "审批模型",
         reviewDefault: "默认（官方路由）",
+        imageModel: "图像生成",
+        imageDefault: "默认（官方路由）",
+        imageNoModels: "（未检测到 CPA 图像模型）",
         searchBackend: "共享 Web 搜索",
         searchDefault: "默认（config.toml）",
         searchDisabled: "关闭共享搜索",
@@ -278,6 +289,7 @@ struct L10n {
         openCpaManagementFailed: "打开 CPA Web 管理失败，请检查 CPA 地址。",
         copyCpaManagementKeyFailed: "复制 CPA 管理密钥失败，请更新 CodexMux 后重试。",
         reviewSetFailed: "设置审批模型失败，请查看日志。",
+        imageSetFailed: "设置图像模型失败，请查看日志。",
         directSetFailed: "保存直连端点失败，请查看日志。",
         quitDialogTitle: "退出 CodexMux？",
         quitDialogBody: "将停止 CodexMux 代理与 CPA 服务，并还原 Codex 配置。",
@@ -477,6 +489,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var activeProfile: String?
     private var savedProfiles: [(name: String, baseURL: String)] = []
     private var reviewOverride: String?
+    private var imageOverride: String?
+    private var imageModels: [String] = []
     private var searchBackendEnabled: Bool?
     private var searchBackendModel: String?
     private var searchCapabilities: [String: String] = [:]
@@ -572,6 +586,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             group.leave()
         }
         group.enter()
+        loadImageState { [weak self] overrideSlug, models in
+            self?.imageOverride = overrideSlug
+            self?.imageModels = models
+            group.leave()
+        }
+        group.enter()
         loadSearchState { [weak self] enabled, model in
             self?.searchBackendEnabled = enabled
             self?.searchBackendModel = model
@@ -643,6 +663,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return value.hasPrefix("(none") ? nil : String(value)
             }()
             let models = self.captureCodexMux(["cpa", "model-list"])
+                .split(whereSeparator: \.isNewline)
+                .map(String.init)
+            DispatchQueue.main.async { completion(overrideSlug, models) }
+        }
+    }
+
+    /// Load the image route override and the CPA image model list.
+    ///
+    /// CPA does not advertise image models in its catalog, so the list comes
+    /// from a probe and may legitimately be empty; the picker still offers the
+    /// official default and whatever slug is currently pinned.
+    private func loadImageState(
+        _ completion: @escaping (String?, [String]) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let overrideOutput = self.captureCodexMux(["cpa", "image-get"])
+            let overrideSlug: String? = {
+                let line = overrideOutput.split(separator: "\n").first { $0.hasPrefix("image override: ") }
+                guard let line else { return nil }
+                let value = line.dropFirst("image override: ".count)
+                return value.hasPrefix("(none") ? nil : String(value)
+            }()
+            let models = self.captureCodexMux(["cpa", "image-model-list"])
                 .split(whereSeparator: \.isNewline)
                 .map(String.init)
             DispatchQueue.main.async { completion(overrideSlug, models) }
@@ -1080,6 +1123,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         reviewItem.submenu = reviewMenu
         menu.addItem(reviewItem)
+
+        // Image generation submenu: official by default, or pin a CPA image
+        // model. A pinned slug that CPA no longer serves fails on the request
+        // itself; the route is never changed automatically.
+        let imageItem = NSMenuItem(title: l10n.imageModel, action: nil, keyEquivalent: "")
+        let imageMenu = NSMenu()
+        imageMenu.autoenablesItems = false
+
+        let imageDefaultItem = NSMenuItem(title: l10n.imageDefault,
+                                          action: #selector(selectImageModel(_:)),
+                                          keyEquivalent: "")
+        imageDefaultItem.target = self
+        imageDefaultItem.representedObject = ""
+        imageDefaultItem.state = imageOverride == nil ? .on : .off
+        imageMenu.addItem(imageDefaultItem)
+
+        // Keep a pinned slug visible even when the probe returns nothing.
+        let imageSlugs = (imageModels + [imageOverride].compactMap { $0 }).sorted().unique()
+        if imageSlugs.isEmpty {
+            let empty = NSMenuItem(title: l10n.imageNoModels, action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            imageMenu.addItem(empty)
+        }
+        for slug in imageSlugs {
+            let item = NSMenuItem(title: slug,
+                                  action: #selector(selectImageModel(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = slug
+            item.state = imageOverride == slug ? .on : .off
+            imageMenu.addItem(item)
+        }
+        imageItem.submenu = imageMenu
+        menu.addItem(imageItem)
 
         // Shared web search backend: pick which model executes Responses web_search.
         let searchItem = NSMenuItem(title: l10n.searchBackend, action: nil, keyEquivalent: "")
@@ -1600,6 +1677,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runCodexMuxDetached(["cpa", "review-set", slug]) { [weak self] ok in
             if !ok {
                 self?.showAlert(self?.l10n.reviewSetFailed ?? "")
+            }
+            self?.refreshStatus()
+        }
+    }
+
+    @objc private func selectImageModel(_ sender: NSMenuItem) {
+        guard let slug = sender.representedObject as? String else { return }
+        runCodexMuxDetached(["cpa", "image-set", slug]) { [weak self] ok in
+            if !ok {
+                self?.showAlert(self?.l10n.imageSetFailed ?? "")
             }
             self?.refreshStatus()
         }

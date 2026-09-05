@@ -10,6 +10,7 @@ const OFFICIAL_PASSTHROUGH_HEADERS: &[&str] = &[
     "openai-beta",
     "x-codex-turn-metadata",
     "x-openai-internal-codex-responses-lite",
+    "x-codex-imagegen-request-id",
 ];
 const CPA_PASSTHROUGH_HEADERS: &[&str] = &["accept", "user-agent"];
 
@@ -30,6 +31,31 @@ pub fn official_headers(incoming: &HeaderMap) -> Result<HeaderMap> {
         }
     }
     Ok(output)
+}
+
+/// Headers for the fixed official image endpoints. Credential handling is
+/// identical to `official_headers`; only the caller's `content-type` is
+/// preserved, because an image edit may arrive as `multipart/form-data` and
+/// its body is forwarded byte for byte.
+pub fn official_image_headers(incoming: &HeaderMap) -> Result<HeaderMap> {
+    Ok(preserve_content_type(official_headers(incoming)?, incoming))
+}
+
+/// Same as `cpa_headers` for an image request pinned to a CPA or direct
+/// upstream: the caller's `content-type` is preserved and only that route's
+/// own token is attached.
+pub fn cpa_image_headers(incoming: &HeaderMap, token: &str) -> Result<HeaderMap> {
+    Ok(preserve_content_type(
+        cpa_headers(incoming, token)?,
+        incoming,
+    ))
+}
+
+fn preserve_content_type(mut output: HeaderMap, incoming: &HeaderMap) -> HeaderMap {
+    if let Some(content_type) = incoming.get(header::CONTENT_TYPE) {
+        output.insert(header::CONTENT_TYPE, content_type.clone());
+    }
+    output
 }
 
 pub fn cpa_headers(incoming: &HeaderMap, cpa_token: &str) -> Result<HeaderMap> {
@@ -90,6 +116,52 @@ mod tests {
         assert!(!output.contains_key("x-api-key"));
         assert!(!output.contains_key("x-amz-security-token"));
         assert!(!output.contains_key("chatgpt-account-id"));
+    }
+
+    #[test]
+    fn official_image_headers_preserve_content_type_without_leaking_credentials() {
+        let incoming = HeaderMap::from_iter([
+            (
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer oauth"),
+            ),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("multipart/form-data; boundary=abc"),
+            ),
+            (
+                HeaderName::from_static("x-codex-imagegen-request-id"),
+                HeaderValue::from_static("req-1"),
+            ),
+            (header::COOKIE, HeaderValue::from_static("session=private")),
+            (
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_static("provider-secret"),
+            ),
+        ]);
+        let output = official_image_headers(&incoming).unwrap();
+        assert_eq!(output[header::AUTHORIZATION], "Bearer oauth");
+        assert_eq!(
+            output[header::CONTENT_TYPE],
+            "multipart/form-data; boundary=abc"
+        );
+        assert_eq!(output["x-codex-imagegen-request-id"], "req-1");
+        assert!(!output.contains_key(header::COOKIE));
+        assert!(!output.contains_key("x-api-key"));
+    }
+
+    /// A JSON image request keeps the default content type, and a request with
+    /// no official OAuth header fails closed instead of being sent anonymously.
+    #[test]
+    fn official_image_headers_default_to_json_and_require_oauth() {
+        let json_only = HeaderMap::from_iter([(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer oauth"),
+        )]);
+        let output = official_image_headers(&json_only).unwrap();
+        assert_eq!(output[header::CONTENT_TYPE], "application/json");
+
+        assert!(official_image_headers(&HeaderMap::new()).is_err());
     }
 
     #[test]

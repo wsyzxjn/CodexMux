@@ -148,6 +148,10 @@ enum CpaCommand {
     },
     /// Show the review model override (None = official route).
     ReviewGet,
+    /// Show the image route override (None = official route).
+    ImageGet,
+    /// List image model slugs the configured CPA endpoint reports.
+    ImageModelList,
     /// Show the shared Responses web search backend override.
     SearchGet,
     /// Select the shared web search backend. Use `default` to follow
@@ -229,6 +233,11 @@ enum CpaCommand {
     /// Route `codex-auto-review` straight to a CPA model (empty to clear).
     ReviewSet {
         /// Upstream CPA model slug; empty string clears the override.
+        slug: String,
+    },
+    /// Route Codex image generation to a CPA image model (empty to clear).
+    ImageSet {
+        /// Upstream CPA image model slug; empty string clears the override.
         slug: String,
     },
     /// Validate a saved endpoint and switch to it; rolls back on failure.
@@ -908,6 +917,16 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             Some(slug) => println!("review override: {slug}"),
             None => println!("review override: (none; official route)"),
         },
+        CpaCommand::ImageGet => match codexmux::cpa::image_override(&paths.cpa_profiles) {
+            Some(slug) => println!("image override: {slug}"),
+            None => println!("image override: (none; official route)"),
+        },
+        CpaCommand::ImageModelList => {
+            let credentials = secrets::load(&paths.credentials)?;
+            for slug in codexmux::cpa::image_model_slugs(&settings.cpa, &credentials.cpa_token)? {
+                println!("{slug}");
+            }
+        }
         CpaCommand::SearchGet => match codexmux::cpa::search_backend_setting(&paths.cpa_profiles) {
             Some(setting) if setting.enabled => {
                 println!("shared search: enabled: {}", setting.backend_model);
@@ -1091,6 +1110,16 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             } else {
                 codexmux::cpa::set_review_override(&paths.cpa_profiles, Some(slug.clone()))?;
                 println!("codex-auto-review now routes directly to {slug}");
+            }
+        }
+        CpaCommand::ImageSet { slug } => {
+            let slug = slug.trim().to_owned();
+            if slug.is_empty() {
+                codexmux::cpa::set_image_override(&paths.cpa_profiles, None)?;
+                println!("image override cleared");
+            } else {
+                codexmux::cpa::set_image_override(&paths.cpa_profiles, Some(slug.clone()))?;
+                println!("image generation now routes to {slug}");
             }
         }
     }

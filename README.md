@@ -33,6 +33,7 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
    - **高级功能 ▸ 为所有模型声明 Ultra**：开启后在模型目录中为每个模型显示 Codex 侧的 `ultra` 预设；Codex 会把该预设映射到模型支持的实际档位。
    - **高级功能 ▸ 统一压缩兼容哈希**（默认开启）：Codex 在两轮的 `comp_hash` 不一致时，会在采样前用**上一个模型**强制压缩一次；官方 5.6 家族与其余官方/CPA 模型的取值本就不同，因此会话中途换模型会把压缩请求送回你正要离开的模型，遇到限额时对话直接卡死。开启后 CodexMux 只在下发给 Codex 的目录里统一该值（取官方默认模型当前的取值），磁盘快照仍保留上游原值；官方真的更换压缩格式时所有模型会一起变更，Codex 仍会正常重压缩一次。
    - **审批模型**：为 `codex-auto-review` 指定走特定的 CPA 模型；
+   - **图像生成**：选择 Codex 内置图像工具走哪条路 —— 默认走官方端点，也可以固定到某个 CPA 图像模型（如 `grok-imagine-image`）。菜单里的候选**只对 CPA 路线有意义**：官方端点不接受模型选择（只认 `prompt`，`model` 传什么都忽略），所以候选列表描述的是 CPA 能分发的型号。CPA 的 `/v1/models` 不上报图像模型，候选是向 CPA 探测得到的；探测不到时仍可用 CLI 指定任意 slug，选错的 slug 由上游报错，CodexMux 不会自动改道；
    - **关于与 App 更新**：查看 App/内置 CLI 版本及源码仓库；可检查 GitHub 最新稳定版，下载后校验 `SHA256SUMS`、Bundle 标识、版本和代码签名，再备份当前 App、替换并重新启动；
    - **查看日志与状态**：一键打开日志目录或查看服务运行状态。
 3. CodexMux 会在启动时为 Codex Desktop 准备代理令牌；若 Desktop 正在运行会自动重启它。随后打开模型选择器即可看到官方模型与 Direct/CPA 模型。
@@ -56,6 +57,8 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
 | `codexmux cpa search-get` / `search-set` | 查询或设置共享 Web 搜索后端（模型、`off` 或 `default`） |
 | `codexmux cpa search-detect [--model <slug>] [--verify]` | 本地识别并缓存搜索能力；`--verify` 需配 `--model`，只验证一个后端 |
 | `codexmux cpa search-capabilities` | 打印缓存的搜索能力检测结果 |
+| `codexmux cpa image-get` / `image-set <slug>` | 查询或设置图像生成走的模型（空字符串恢复官方路由） |
+| `codexmux cpa image-model-list` | 列出 CPA 报告的可用图像模型（官方路线不适用） |
 | `codexmux catalog ultra-get` / `ultra-set <bool>` | 查询或设置是否为所有模型声明 `ultra` 预设 |
 | `codexmux catalog comp-hash-get` / `comp-hash-set <bool>` | 查询或设置是否为所有模型统一压缩兼容哈希（默认开启） |
 | `codexmux install` | （无菜单栏时）注册并启动后台 LaunchAgent 并接管配置 |
@@ -138,5 +141,6 @@ cargo test --all-targets
 
 - **本地回环与凭据隔离**：CodexMux 仅监听 `127.0.0.1` 并校验代理令牌；官方 ChatGPT OAuth 仅转发至官方端点，CPA 令牌与直连令牌绝不跨路由泄露。
 - **Codex Alpha Search 透传**：`/v1/alpha/search` 原样转发给 CPA，由 CPA 完成搜索模型与凭据选择；CodexMux 不翻译该搜索协议。
+- **图像生成透传**：Codex 内置 `image_gen` 工具请求的 `/v1/images/generations` 与 `/v1/images/edits` 按字节原样转发。默认走官方端点、只携带官方 OAuth；在菜单里指定图像模型后改走 CPA/直连，并只改写 JSON body 里的 `model` 字段。这两个请求里的 `gpt-image-*` 不在任何目录中（官方与 CPA 目录都不上报图像模型），因此不参与按 slug 路由。注意两侧对 `model` 的语义不同：官方端点完全忽略它（缺失或乱填也照样出图，且不回显 model），CPA 则按它分发并拒绝无法服务的型号 —— 这正是只在固定模型时才改写该字段的原因。
 - **对话历史安全回放**：跨不同提供商或模型切换时，移除 `previous_response_id`，仅在内存中回放公开安全消息与工具调用历史，拒绝传递私有状态或加密字段。
 - **安全配置接管**：通过托管标记块管理配置，启动时自动备份，退出时安全恢复，遇到冲突主动拒绝覆盖以保护用户原有配置。

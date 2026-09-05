@@ -129,6 +129,60 @@ mod tests {
     }
 
     #[test]
+    fn image_override_roundtrips_and_rejects_prefixed_or_empty_slugs() {
+        let paths = paths();
+        assert!(image_override(&paths.cpa_profiles).is_none());
+
+        set_image_override(&paths.cpa_profiles, Some("grok-imagine-image".into())).unwrap();
+        assert_eq!(
+            image_override(&paths.cpa_profiles).as_deref(),
+            Some("grok-imagine-image")
+        );
+
+        // The override must not disturb a neighbouring setting.
+        set_review_override(&paths.cpa_profiles, Some("glm-5.3-flash".into())).unwrap();
+        assert_eq!(
+            image_override(&paths.cpa_profiles).as_deref(),
+            Some("grok-imagine-image")
+        );
+        assert_eq!(
+            review_override(&paths.cpa_profiles).as_deref(),
+            Some("glm-5.3-flash")
+        );
+
+        assert!(set_image_override(&paths.cpa_profiles, Some("cpa/gpt-image-2".into())).is_err());
+        assert!(set_image_override(&paths.cpa_profiles, Some("   ".into())).is_err());
+
+        set_image_override(&paths.cpa_profiles, None).unwrap();
+        assert!(image_override(&paths.cpa_profiles).is_none());
+    }
+
+    /// CPA names its image models only when it rejects an unknown one, so the
+    /// picker parses that message. An unrecognized message yields no models
+    /// rather than an error, because routing never depends on this list.
+    #[test]
+    fn image_model_discovery_parses_cpa_rejection_and_tolerates_anything_else() {
+        let message = "Model gpt-image-1 is not supported on /v1/images/generations or \
+             /v1/images/edits. Use gpt-image-1.5, gpt-image-2, grok-imagine-image, \
+             grok-imagine-image-quality, grok-imagine-image-2.0, or a configured \
+             openai-compatibility image model.";
+        assert_eq!(
+            image_slugs_from_message(message),
+            vec![
+                "gpt-image-1.5",
+                "gpt-image-2",
+                "grok-imagine-image",
+                "grok-imagine-image-2.0",
+                "grok-imagine-image-quality",
+            ]
+        );
+
+        assert!(image_slugs_from_message("").is_empty());
+        assert!(image_slugs_from_message("Invalid request: prompt is required").is_empty());
+        assert!(image_slugs_from_message("Use the force.").is_empty());
+    }
+
+    #[test]
     fn direct_routes_add_and_remove_single_entries() {
         let paths = paths();
         add_direct_route(
