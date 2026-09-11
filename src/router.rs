@@ -6,9 +6,19 @@ const OFFICIAL_PASSTHROUGH_HEADERS: &[&str] = &[
     "user-agent",
     "originator",
     "session_id",
+    "session-id",
     "conversation_id",
+    "thread-id",
     "openai-beta",
+    "x-client-request-id",
+    "x-codex-beta-features",
+    "x-codex-installation-id",
+    "x-codex-parent-thread-id",
+    "x-codex-window-id",
+    "x-openai-subagent",
+    "x-oai-attestation",
     "x-codex-turn-metadata",
+    "x-codex-turn-state",
     "x-openai-internal-codex-responses-lite",
     "x-codex-imagegen-request-id",
 ];
@@ -184,5 +194,71 @@ mod tests {
         assert_eq!(output[header::AUTHORIZATION], "Bearer oauth");
         assert_eq!(output["originator"], "codex_cli_rs");
         assert!(!output.contains_key("x-provider-token"));
+    }
+
+    #[test]
+    fn official_headers_forward_guardian_session_headers() {
+        let incoming = HeaderMap::from_iter([
+            (
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer oauth"),
+            ),
+            (
+                HeaderName::from_static("x-openai-subagent"),
+                HeaderValue::from_static("guardian"),
+            ),
+            (
+                HeaderName::from_static("session-id"),
+                HeaderValue::from_static("sess"),
+            ),
+            (
+                HeaderName::from_static("thread-id"),
+                HeaderValue::from_static("thread"),
+            ),
+            (
+                HeaderName::from_static("x-client-request-id"),
+                HeaderValue::from_static("req"),
+            ),
+            (
+                HeaderName::from_static("x-codex-turn-state"),
+                HeaderValue::from_static("state"),
+            ),
+            (
+                HeaderName::from_static("x-codex-installation-id"),
+                HeaderValue::from_static("install"),
+            ),
+            (
+                HeaderName::from_static("x-codex-window-id"),
+                HeaderValue::from_static("window"),
+            ),
+            (
+                HeaderName::from_static("x-codex-parent-thread-id"),
+                HeaderValue::from_static("parent"),
+            ),
+            (
+                HeaderName::from_static("x-codex-beta-features"),
+                HeaderValue::from_static("feature"),
+            ),
+            (
+                HeaderName::from_static("x-oai-attestation"),
+                HeaderValue::from_static("attestation"),
+            ),
+            (
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_static("provider-secret"),
+            ),
+        ]);
+        let output = official_headers(&incoming).unwrap();
+        assert_eq!(output["x-openai-subagent"], "guardian");
+        assert_eq!(output["session-id"], "sess");
+        assert_eq!(output["thread-id"], "thread");
+        assert_eq!(output["x-client-request-id"], "req");
+        assert_eq!(output["x-codex-turn-state"], "state");
+        assert_eq!(output["x-codex-installation-id"], "install");
+        assert_eq!(output["x-codex-window-id"], "window");
+        assert_eq!(output["x-codex-parent-thread-id"], "parent");
+        assert_eq!(output["x-codex-beta-features"], "feature");
+        assert_eq!(output["x-oai-attestation"], "attestation");
+        assert!(!output.contains_key("x-api-key"));
     }
 }

@@ -4,7 +4,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -27,6 +27,8 @@ pub const CPA_DARWIN_AARCH64_SHA256: &str =
     "4ac1db83b00591265ebb93a3277d812aaf6e45e8b21bb3b4786598520afdf4be";
 const CPA_BINARY_NAME: &str = "cli-proxy-api";
 const CPA_AGENT_LABEL: &str = "dev.codexmux.cpa";
+const CPA_MODEL_VALIDATION_TIMEOUT: Duration = Duration::from_secs(8);
+const CPA_MODEL_VALIDATION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub fn agent_label() -> &'static str {
     CPA_AGENT_LABEL
@@ -98,6 +100,39 @@ pub fn model_slugs(cpa: &Cpa, token: &str) -> Result<Vec<String>> {
     );
     let value: serde_json::Value = response.json().context("CPA returned invalid model JSON")?;
     model_slugs_from_value(&value)
+}
+
+fn wait_for_model_slugs(cpa: &Cpa, token: &str) -> Result<Vec<String>> {
+    wait_for_model_slugs_with(
+        || model_slugs(cpa, token),
+        CPA_MODEL_VALIDATION_TIMEOUT,
+        CPA_MODEL_VALIDATION_POLL_INTERVAL,
+    )
+}
+
+fn wait_for_model_slugs_with<F>(
+    mut fetch: F,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<Vec<String>>
+where
+    F: FnMut() -> Result<Vec<String>>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fetch() {
+            Ok(slugs) => return Ok(slugs),
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(error).context(format!(
+                        "CPA did not become ready within {} ms",
+                        timeout.as_millis()
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(poll_interval);
+    }
 }
 
 fn model_slugs_from_value(value: &serde_json::Value) -> Result<Vec<String>> {

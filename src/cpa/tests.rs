@@ -68,6 +68,39 @@ mod tests {
     }
 
     #[test]
+    fn model_validation_waits_for_cpa_startup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = AtomicUsize::new(0);
+        let slugs = wait_for_model_slugs_with(
+            || {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(anyhow::anyhow!("connection refused"))
+                } else {
+                    Ok(vec!["model-a".into()])
+                }
+            },
+            Duration::from_millis(200),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        assert_eq!(slugs, vec!["model-a".to_string()]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn model_validation_fails_after_timeout() {
+        let result = wait_for_model_slugs_with(
+            || Err(anyhow::anyhow!("connection refused")),
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn direct_routes_validate_endpoint_models_and_token_isolation() {
         let paths = paths();
         let route = DirectRoute {
@@ -75,6 +108,7 @@ mod tests {
             token: "direct-token".into(),
             models: vec!["model-a".into()],
             model_aliases: BTreeMap::new(),
+            model_metadata: BTreeMap::new(),
         };
         set_direct_routes(&paths, vec![route]).unwrap();
         let direct = direct_route_for(&paths.cpa_profiles, "model-a")
@@ -99,7 +133,10 @@ mod tests {
         assert!(
             declared_direct_models(&paths.cpa_profiles)
                 .iter()
-                .any(|model| model.upstream_model == "local-alias")
+                .any(|model| {
+                    model.upstream_model == "local-alias"
+                        && model.native_model == "provider/native-model"
+                })
         );
 
         let remote_http = DirectRoute {
@@ -107,6 +144,7 @@ mod tests {
             token: "other-direct-token".into(),
             models: vec!["model-b".into()],
             model_aliases: BTreeMap::new(),
+            model_metadata: BTreeMap::new(),
         };
         assert!(set_direct_routes(&paths, vec![remote_http]).is_err());
 
@@ -115,6 +153,7 @@ mod tests {
             token: "cpa-token".into(),
             models: vec!["model-b".into()],
             model_aliases: BTreeMap::new(),
+            model_metadata: BTreeMap::new(),
         };
         assert!(set_direct_routes(&paths, vec![shared_token]).is_err());
 
@@ -123,6 +162,7 @@ mod tests {
             token: "other-direct-token".into(),
             models: vec!["cpa/model-b".into()],
             model_aliases: BTreeMap::new(),
+            model_metadata: BTreeMap::new(),
         };
         assert!(set_direct_routes(&paths, vec![prefixed_model]).is_err());
         assert!(set_review_override(&paths.cpa_profiles, Some("cpa/model-b".into())).is_err());
@@ -237,6 +277,44 @@ mod tests {
         )
         .unwrap();
         remove_direct_routes(&paths, "http://127.0.0.1:9001/v1", &[]).unwrap();
+        assert!(direct_routes(&paths).is_empty());
+    }
+
+    #[test]
+    fn direct_route_metadata_round_trips_and_is_dropped_with_the_model() {
+        let paths = paths();
+        add_direct_route(
+            &paths,
+            "http://127.0.0.1:9000/v1".into(),
+            "direct-token".into(),
+            vec!["deepseek-v4-flash-vision-exp".into()],
+        )
+        .unwrap();
+        set_direct_model_metadata(
+            &paths,
+            "deepseek-v4-flash-vision-exp",
+            DirectModelMetadata {
+                context_window: Some(1_000_000),
+                max_context_window: Some(1_000_000),
+                display_name: Some("DeepSeek V4 Flash".into()),
+            },
+        )
+        .unwrap();
+        let declared = declared_direct_models(&paths.cpa_profiles);
+        let model = declared
+            .iter()
+            .find(|model| model.upstream_model == "deepseek-v4-flash-vision-exp")
+            .unwrap();
+        assert_eq!(model.context_window, Some(1_000_000));
+        assert_eq!(model.max_context_window, Some(1_000_000));
+        assert_eq!(model.display_name.as_deref(), Some("DeepSeek V4 Flash"));
+
+        remove_direct_routes(
+            &paths,
+            "http://127.0.0.1:9000/v1",
+            &["deepseek-v4-flash-vision-exp".into()],
+        )
+        .unwrap();
         assert!(direct_routes(&paths).is_empty());
     }
 

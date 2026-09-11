@@ -22,7 +22,7 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
 
 ### 2. 直接路由：打开即可体验
 
-首次启动不安装 CPA 也可以使用官方模型和 Direct Endpoint。点击菜单栏的“直连端点”，填入原生 Responses API 的地址、令牌和模型列表，CodexMux 会把对应的 `cpa/<slug>` 模型直接路由到该端点。令牌只保存在本机权限为 `0600` 的私有配置中。
+首次启动不安装 CPA 也可以使用官方模型和 Direct Endpoint。点击菜单栏的“直连端点”，填入原生 Responses API 的地址、令牌和模型列表，CodexMux 会把对应的 `cpa/<slug>` 模型直接路由到该端点。令牌只保存在本机权限为 `0600` 的私有配置中。非官方 slug 的目录字段默认从官方模型模板复制，上下文窗口等元信息可在 `cpa-profiles.toml` 里按模型覆盖。
 
 ### 3. 启动与日常使用
 
@@ -128,6 +128,23 @@ codexmux serve
 # 或在前台运行但不接管 Codex 配置
 codexmux serve --no-codex-config
 ```
+
+请求体上限默认为 128 MiB，可在 `~/Library/Application Support/CodexMux/config.toml` 中调整后重启服务：
+
+```toml
+[server]
+max_request_mib = 128
+```
+
+非官方 Direct 模型没有上游目录可抄，会复用一份官方模型模板（因此上下文窗口可能不对）。可在 `~/Library/Application Support/CodexMux/cpa-profiles.toml` 里按本地 slug 覆盖：
+
+```toml
+[direct-route.model_metadata."deepseek-v4-flash-vision-exp"]
+context_window = 1000000
+max_context_window = 1000000
+```
+
+或在添加直连时带上 `--context-window` / `--max-context-window`。覆盖后需刷新 Codex 模型列表。
 
 ### 4. 代码质量与测试
 

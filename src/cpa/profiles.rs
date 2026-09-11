@@ -76,6 +76,33 @@ pub struct DirectRoute {
     /// Local CPA aliases mapped to a different native Responses model id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_aliases: BTreeMap<String, String>,
+    /// Optional catalog metadata for local slugs that are not official models.
+    /// Unmatched direct models otherwise inherit an official template, including
+    /// its context window.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_metadata: BTreeMap<String, DirectModelMetadata>,
+}
+
+/// User-declared catalog fields for a direct-route model.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DirectModelMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+impl DirectModelMetadata {
+    fn is_empty(&self) -> bool {
+        self.context_window.is_none()
+            && self.max_context_window.is_none()
+            && self
+                .display_name
+                .as_ref()
+                .is_none_or(|name| name.trim().is_empty())
+    }
 }
 
 fn load_profile_store(paths: &Paths) -> ProfileStore {
@@ -392,6 +419,7 @@ pub fn add_direct_route(
             token,
             models,
             model_aliases: BTreeMap::new(),
+            model_metadata: BTreeMap::new(),
         });
     }
     set_direct_routes(paths, routes)
@@ -416,6 +444,7 @@ pub fn add_direct_route_mapping(
             token,
             models: Vec::new(),
             model_aliases: BTreeMap::from([(local_model, upstream_model)]),
+            model_metadata: BTreeMap::new(),
         });
     }
     set_direct_routes(paths, routes)
@@ -432,15 +461,41 @@ pub fn remove_direct_routes(paths: &Paths, base_url: &str, models: &[String]) ->
         if models.is_empty() {
             route.models.clear();
             route.model_aliases.clear();
+            route.model_metadata.clear();
         } else {
             route.models.retain(|model| !models.contains(model));
             route
                 .model_aliases
                 .retain(|local, _| !models.contains(local));
+            route
+                .model_metadata
+                .retain(|local, _| !models.contains(local));
         }
     }
     routes.retain(|route| !route.models.is_empty() || !route.model_aliases.is_empty());
     set_direct_routes(paths, routes)
+}
+
+/// Set or clear catalog metadata for one already-declared direct-route model.
+pub fn set_direct_model_metadata(
+    paths: &Paths,
+    local_model: &str,
+    metadata: DirectModelMetadata,
+) -> Result<()> {
+    let mut store = load_profile_store(paths);
+    let Some(route) = store.direct_routes.iter_mut().find(|route| {
+        direct_model_mappings(route).any(|(local, _)| local == local_model)
+    }) else {
+        anyhow::bail!("direct route model {local_model} is not configured");
+    };
+    if metadata.is_empty() {
+        route.model_metadata.remove(local_model);
+    } else {
+        route
+            .model_metadata
+            .insert(local_model.to_owned(), metadata);
+    }
+    save_profile_store(paths, &store)
 }
 
 /// Read the persisted CPA autostart preference. When no explicit choice has
@@ -464,9 +519,15 @@ pub fn declared_direct_models(profiles_path: &Path) -> Vec<crate::catalog::Direc
         .direct_routes
         .iter()
         .flat_map(|route| {
-            direct_model_mappings(route).map(|(local, _)| crate::catalog::DirectModel {
-                upstream_model: local.to_owned(),
-                base_url: route.base_url.clone(),
+            direct_model_mappings(route).map(|(local, native)| {
+                let mut model = crate::catalog::DirectModel::new(local, route.base_url.clone());
+                model.native_model = native.to_owned();
+                if let Some(metadata) = route.model_metadata.get(local) {
+                    model.context_window = metadata.context_window;
+                    model.max_context_window = metadata.max_context_window;
+                    model.display_name = metadata.display_name.clone();
+                }
+                model
             })
         })
         .collect()

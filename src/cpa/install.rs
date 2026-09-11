@@ -11,7 +11,7 @@ pub fn install(paths: &Paths, cpa: &Cpa, token: &str) -> Result<()> {
     if !is_loaded()? {
         start(paths, cpa, token)?;
     }
-    model_slugs(cpa, token)?;
+    wait_for_model_slugs(cpa, token)?;
     Ok(())
 }
 
@@ -63,7 +63,7 @@ pub fn install_from_archive(
         }
         return Err(error);
     }
-    start(paths, cpa, token)
+    start(paths, cpa, token).and_then(|_| wait_for_model_slugs(cpa, token).map(|_| ()))
 }
 
 fn set_executable(path: &Path) -> Result<()> {

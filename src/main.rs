@@ -185,6 +185,12 @@ enum CpaCommand {
         /// Requires exactly one local model.
         #[arg(long)]
         upstream_model: Option<String>,
+        /// Catalog context window for these local slugs.
+        #[arg(long)]
+        context_window: Option<u64>,
+        /// Catalog max context window for these local slugs.
+        #[arg(long)]
+        max_context_window: Option<u64>,
     },
     /// Add models to a direct upstream, merging with an existing route.
     DirectAdd {
@@ -200,6 +206,12 @@ enum CpaCommand {
         /// Requires exactly one local model.
         #[arg(long)]
         upstream_model: Option<String>,
+        /// Catalog context window for these local slugs.
+        #[arg(long)]
+        context_window: Option<u64>,
+        /// Catalog max context window for these local slugs.
+        #[arg(long)]
+        max_context_window: Option<u64>,
     },
     /// Remove models (or a whole route) from direct upstreams.
     DirectRemove {
@@ -212,6 +224,17 @@ enum CpaCommand {
     },
     /// List direct routes without printing their tokens.
     DirectList,
+    /// Set catalog metadata for an existing direct-route model.
+    DirectMetadataSet {
+        /// cpa/ model slug (without the cpa/ prefix).
+        model: String,
+        /// Catalog context window.
+        #[arg(long)]
+        context_window: Option<u64>,
+        /// Catalog max context window.
+        #[arg(long)]
+        max_context_window: Option<u64>,
+    },
     /// Remove all direct routes (everything goes through CPA again).
     DirectClear,
     /// List model ids exposed by a direct Responses endpoint.
@@ -675,6 +698,29 @@ fn config_manager(paths: &Paths) -> Result<ConfigManager> {
     ))
 }
 
+fn apply_direct_context_metadata(
+    paths: &Paths,
+    slugs: &[String],
+    context_window: Option<u64>,
+    max_context_window: Option<u64>,
+) -> Result<()> {
+    if context_window.is_none() && max_context_window.is_none() {
+        return Ok(());
+    }
+    for slug in slugs {
+        codexmux::cpa::set_direct_model_metadata(
+            paths,
+            slug,
+            codexmux::cpa::DirectModelMetadata {
+                context_window,
+                max_context_window,
+                display_name: None,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
     let settings = Settings::load(&paths.settings)?;
     match command {
@@ -975,6 +1021,8 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             base_url,
             token_env,
             upstream_model,
+            context_window,
+            max_context_window,
         } => {
             let token = std::env::var(&token_env)
                 .with_context(|| format!("{token_env} must contain the direct route token"))?;
@@ -997,7 +1045,7 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
                         std::collections::BTreeMap::from([(slugs[0].clone(), upstream)]),
                     )
                 }
-                None => (slugs, std::collections::BTreeMap::new()),
+                None => (slugs.clone(), std::collections::BTreeMap::new()),
             };
             codexmux::cpa::set_direct_routes(
                 paths,
@@ -1006,8 +1054,10 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
                     token,
                     models,
                     model_aliases,
+                    model_metadata: Default::default(),
                 }],
             )?;
+            apply_direct_context_metadata(paths, &slugs, context_window, max_context_window)?;
             println!("direct route configured for {configured_models}");
         }
         CpaCommand::DirectAdd {
@@ -1015,6 +1065,8 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             base_url,
             token_env,
             upstream_model,
+            context_window,
+            max_context_window,
         } => {
             let token = std::env::var(&token_env)
                 .with_context(|| format!("{token_env} must contain the direct route token"))?;
@@ -1040,6 +1092,7 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             } else {
                 codexmux::cpa::add_direct_route(paths, base_url, token, slugs.clone())?;
             }
+            apply_direct_context_metadata(paths, &slugs, context_window, max_context_window)?;
             println!("direct route updated for {}", slugs.join(", "));
         }
         CpaCommand::DirectRemove { base_url, models } => {
@@ -1069,7 +1122,34 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
                     .chain(route.model_aliases.keys().map(String::as_str))
                     .collect();
                 println!("{} -> {}", models.join(", "), route.base_url);
+                for (slug, metadata) in &route.model_metadata {
+                    let context = metadata
+                        .context_window
+                        .map(|window| format!("context_window={window}"))
+                        .unwrap_or_else(|| "context_window=default".into());
+                    let max_context = metadata
+                        .max_context_window
+                        .map(|window| format!("max_context_window={window}"))
+                        .unwrap_or_else(|| "max_context_window=default".into());
+                    println!("  {slug}: {context} {max_context}");
+                }
             }
+        }
+        CpaCommand::DirectMetadataSet {
+            model,
+            context_window,
+            max_context_window,
+        } => {
+            codexmux::cpa::set_direct_model_metadata(
+                paths,
+                &model,
+                codexmux::cpa::DirectModelMetadata {
+                    context_window,
+                    max_context_window,
+                    display_name: None,
+                },
+            )?;
+            println!("direct model metadata updated for {model}");
         }
         CpaCommand::DirectClear => {
             codexmux::cpa::set_direct_routes(paths, Vec::new())?;

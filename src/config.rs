@@ -11,6 +11,8 @@ use crate::fsutil::atomic_write;
 
 pub const DEFAULT_PORT: u16 = 48682;
 pub const DEFAULT_CPA_BASE_URL: &str = "http://127.0.0.1:8317/v1";
+pub const DEFAULT_MAX_REQUEST_MIB: usize = 128;
+pub const MAX_MAX_REQUEST_MIB: usize = 1024;
 pub const OFFICIAL_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const CPA_MODEL_PREFIX: &str = "cpa/";
 pub const HOME_ENV: &str = "CODEXMUX_HOME";
@@ -73,6 +75,7 @@ fn default_root(data_dir: &Path) -> PathBuf {
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub listen: SocketAddr,
+    pub server: Server,
     pub cpa: Cpa,
     pub catalog: Catalog,
     pub web_search: WebSearch,
@@ -87,6 +90,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_PORT),
+            server: Server::default(),
             cpa: Cpa::default(),
             catalog: Catalog::default(),
             web_search: WebSearch::default(),
@@ -116,11 +120,29 @@ impl Settings {
         if !self.listen.ip().is_loopback() {
             bail!("listen address must be loopback");
         }
+        if self.server.max_request_mib == 0 || self.server.max_request_mib > MAX_MAX_REQUEST_MIB {
+            bail!("server.max_request_mib must be between 1 and {MAX_MAX_REQUEST_MIB}");
+        }
         self.cpa.validate()?;
         if self.web_search.enabled && self.web_search.backend_model.trim().is_empty() {
             bail!("web_search.enabled requires a nonempty backend_model");
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Server {
+    /// Maximum request body CodexMux buffers before routing it upstream.
+    pub max_request_mib: usize,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self {
+            max_request_mib: DEFAULT_MAX_REQUEST_MIB,
+        }
     }
 }
 
@@ -304,6 +326,22 @@ mod tests {
     fn default_data_root_is_codexmux() {
         let data = tempdir().unwrap();
         assert_eq!(default_root(data.path()), data.path().join(DATA_DIR_NAME));
+    }
+
+    #[test]
+    fn max_request_mib_defaults_to_128_and_is_range_checked() {
+        let settings = Settings::default();
+        assert_eq!(settings.server.max_request_mib, DEFAULT_MAX_REQUEST_MIB);
+
+        let mut settings = Settings::default();
+        settings.server.max_request_mib = 0;
+        assert!(settings.validate().is_err());
+
+        settings.server.max_request_mib = MAX_MAX_REQUEST_MIB + 1;
+        assert!(settings.validate().is_err());
+
+        settings.server.max_request_mib = MAX_MAX_REQUEST_MIB;
+        assert!(settings.validate().is_ok());
     }
 
     #[test]

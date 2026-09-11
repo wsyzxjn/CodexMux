@@ -10,8 +10,8 @@ use std::{
 use async_stream::stream;
 use axum::{
     Router,
-    body::{Body, Bytes},
-    extract::{DefaultBodyLimit, OriginalUri, Query, Request, State},
+    body::{self, Body, Bytes},
+    extract::{FromRequest, OriginalUri, Query, Request, State},
     http::{HeaderMap, HeaderValue, Response, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Json},
@@ -33,12 +33,12 @@ use crate::{
     router,
 };
 
-const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SEARCH_CONTEXT_BYTES: usize = 256 * 1024;
 const PROXY_TOKEN_HEADER: &str = "x-codexmux-token";
 const PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CPA_CATALOG_FRESH_FOR: Duration = Duration::from_secs(20);
+const CPA_SYNC_INITIAL: Duration = Duration::from_secs(1);
 const CPA_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const CPA_SYNC_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const CODEX_SERVER_OVERLOADED_MESSAGE: &str =
@@ -142,6 +142,10 @@ impl AppState {
         self.activity.send_replace(Instant::now());
     }
 
+    fn request_body_limit_bytes(&self) -> usize {
+        self.settings.server.max_request_mib * 1024 * 1024
+    }
+
     /// Resolve the effective shared web search backend. Menu-bar overrides
     /// set in `cpa-profiles.toml` take precedence over `config.toml`, and an
     /// explicit disabled override wins even when config enables the feature.
@@ -166,6 +170,14 @@ impl AppState {
             .map(|cached| cached.value.clone())
     }
 
+    fn current_cpa_catalog(&self) -> Option<Value> {
+        self.cpa_catalog
+            .read()
+            .expect("CPA catalog cache lock poisoned")
+            .as_ref()
+            .map(|cached| cached.value.clone())
+    }
+
     fn store_cpa_catalog(&self, value: Value) {
         let mut cache = self
             .cpa_catalog
@@ -183,6 +195,12 @@ impl AppState {
         if changed {
             tracing::info!(generation, "CPA model catalog synchronized");
         }
+    }
+
+    fn apply_cpa_catalog_to_memory(&self, cpa: &Value) -> anyhow::Result<()> {
+        let direct = crate::cpa::declared_direct_models(&self.cpa_profiles_path);
+        self.catalog.replace_memory_from_cpa(cpa, &direct)?;
+        Ok(())
     }
 }
 
@@ -215,12 +233,45 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/alpha/search", post(handle_alpha_search))
         .route("/v1/images/generations", post(handle_image_generations))
         .route("/v1/images/edits", post(handle_image_edits))
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_proxy_token,
         ))
         .with_state(state)
+}
+
+struct RequestBody(Bytes);
+
+impl FromRequest<AppState> for RequestBody {
+    type Rejection = ProxyError;
+
+    async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+        let limit = state.request_body_limit_bytes();
+        let method = req.method().clone();
+        let path = req.uri().path().to_owned();
+        let content_length = req
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = body::to_bytes(req.into_body(), limit)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    %method,
+                    %path,
+                    max_request_mib = state.settings.server.max_request_mib,
+                    content_length = content_length.as_deref().unwrap_or("unknown"),
+                    %error,
+                    "request body exceeded configured limit"
+                );
+                ProxyError::payload_too_large(format!(
+                    "request body exceeds server.max_request_mib={}",
+                    state.settings.server.max_request_mib
+                ))
+            })?;
+        Ok(Self(bytes))
+    }
 }
 
 async fn require_proxy_token(
@@ -329,7 +380,7 @@ async fn refresh_catalog(
 async fn handle_alpha_search(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: RequestBody,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_headers = router::cpa_headers(&headers, &state.credentials.cpa_token)
         .map_err(|error| ProxyError::unauthorized("credential", error.to_string()))?;
@@ -343,7 +394,7 @@ async fn handle_alpha_search(
         .client
         .post(target)
         .headers(upstream_headers)
-        .body(body)
+        .body(body.0)
         .send()
         .await
         .map_err(|error| ProxyError::bad_gateway("upstream", error.to_string()))?;
@@ -365,17 +416,17 @@ async fn handle_alpha_search(
 async fn handle_image_generations(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: RequestBody,
 ) -> Result<Response<Body>, ProxyError> {
-    forward_image(&state, &headers, "images/generations", body).await
+    forward_image(&state, &headers, "images/generations", body.0).await
 }
 
 async fn handle_image_edits(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: RequestBody,
 ) -> Result<Response<Body>, ProxyError> {
-    forward_image(&state, &headers, "images/edits", body).await
+    forward_image(&state, &headers, "images/edits", body.0).await
 }
 
 /// Byte-preserving passthrough to the selected image endpoint. Only the model
@@ -461,24 +512,33 @@ const CPA_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Prime the CPA catalog cache before the first Codex request is answered.
 ///
-/// `launchctl bootstrap` returns before CPA binds its port, so a model refresh
-/// arriving in that window merges without a single `cpa/` model, and the client
-/// keeps that degraded list until its next refresh. Waiting delays only a cold
-/// start that just launched CPA; a CPA that never answers still falls through
-/// to the degraded view.
+/// `launchctl bootstrap` returns before CPA binds its port, and CPA may keep
+/// re-registering provider models for a few seconds after that. A model refresh
+/// arriving in that window merges without a single `cpa/` model, so keep polling
+/// through the startup settle period before answering. A CPA that never answers
+/// still falls through to the persisted snapshot.
 pub async fn wait_for_cpa_catalog(state: &AppState, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let Err(error) = fetch_cpa_catalog(state, "").await else {
+        let now = Instant::now();
+        if now >= deadline {
+            if let Some(catalog) = state.current_cpa_catalog() {
+                if let Err(error) = state.apply_cpa_catalog_to_memory(&catalog) {
+                    tracing::warn!(%error, "failed to apply the settled CPA catalog");
+                }
+            } else {
+                tracing::warn!(
+                    timeout_seconds = timeout.as_secs(),
+                    "CPA did not become ready during startup; serving the persisted snapshot"
+                );
+            }
             return;
-        };
-        if Instant::now() >= deadline {
-            tracing::warn!(
+        }
+        if let Err(error) = fetch_cpa_catalog(state, "").await {
+            tracing::debug!(
                 %error.message,
-                timeout_seconds = timeout.as_secs(),
-                "CPA did not become ready during startup; serving without CPA models"
+                "CPA not ready during startup"
             );
-            return;
         }
         tokio::time::sleep(CPA_STARTUP_POLL_INTERVAL).await;
     }
@@ -486,11 +546,31 @@ pub async fn wait_for_cpa_catalog(state: &AppState, timeout: Duration) {
 
 async fn synchronize_cpa_catalog(state: AppState) {
     let mut retry = Duration::from_secs(5);
+    let mut delay = CPA_SYNC_INITIAL;
     loop {
-        let delay = match fetch_cpa_catalog(&state, "").await {
+        let previous = state.current_cpa_catalog();
+        delay = match fetch_cpa_catalog(&state, "").await {
             Ok(_) => {
                 retry = Duration::from_secs(5);
-                CPA_SYNC_INTERVAL
+                if let Some(cpa) = state.current_cpa_catalog() {
+                    if state.catalog.has_validated_official() {
+                        if let Err(error) = state.apply_cpa_catalog_to_memory(&cpa) {
+                            tracing::warn!(%error, "failed to apply CPA catalog to in-memory model list");
+                        } else {
+                            tracing::debug!("CPA catalog applied to in-memory model list");
+                        }
+                    } else {
+                        tracing::debug!(
+                            "CPA catalog cached; waiting for an official catalog refresh"
+                        );
+                    }
+                }
+                let changed = previous.as_ref() != state.current_cpa_catalog().as_ref();
+                if changed {
+                    CPA_SYNC_INITIAL
+                } else {
+                    delay.saturating_mul(2).min(CPA_SYNC_INTERVAL)
+                }
             }
             Err(error) => {
                 tracing::warn!(%error.message, retry_seconds = retry.as_secs(), "CPA catalog synchronization failed");
@@ -541,6 +621,10 @@ fn merge_catalog_results(
         // snapshot still requires both upstream catalogs to validate.
         (Ok(official), Err(cpa_error)) => {
             tracing::warn!(%cpa_error.message, "CPA catalog unavailable; merging direct routes only");
+            state
+                .catalog
+                .store_official(&official)
+                .map_err(|error| ProxyError::bad_gateway("catalog", error.to_string()))?;
             let direct = crate::cpa::declared_direct_models(&state.cpa_profiles_path);
             catalog::merge_official_direct_with_ultra(&official, &direct)
                 .map_err(|error| ProxyError::bad_gateway("catalog", error.to_string()))
@@ -658,13 +742,14 @@ async fn handle_responses(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    body: Bytes,
+    body: RequestBody,
 ) -> Result<Response<Body>, ProxyError> {
     let endpoint = if uri.path().ends_with("/responses/compact") {
         "responses/compact"
     } else {
         "responses"
     };
+    let body = body.0;
     let UniqueObject(object) = serde_json::from_slice(&body)
         .map_err(|error| ProxyError::bad_request("invalid_json", error.to_string()))?;
     let request = Value::Object(object);
@@ -1780,6 +1865,10 @@ impl ProxyError {
     fn bad_gateway(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, code, message)
     }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", message)
+    }
 }
 
 impl IntoResponse for ProxyError {
@@ -1855,6 +1944,54 @@ mod tests {
         state
     }
 
+    #[tokio::test]
+    async fn request_body_limit_is_configurable_and_reports_payload_too_large() {
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.server.max_request_mib = 1;
+        let state = AppState::new(
+            settings,
+            Credentials {
+                proxy_token: "proxy".into(),
+                cpa_token: "cpa".into(),
+                cpa_management_key: "management".into(),
+            },
+            root.path().join("catalog.json"),
+            root.path().join("cpa-profiles.toml"),
+        )
+        .unwrap();
+        let (proxy_address, proxy_handle) = spawn_test_app(router(state)).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .header("x-codexmux-token", "proxy")
+            .body(vec![b'x'; 1024 * 1024])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value: Value = response.json().await.unwrap();
+        assert_eq!(value["error"]["code"], "invalid_json");
+
+        let response = client
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .header("x-codexmux-token", "proxy")
+            .body(vec![b'x'; 1024 * 1024 + 1])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let value: Value = response.json().await.unwrap();
+        assert_eq!(value["error"]["code"], "payload_too_large");
+        assert_eq!(
+            value["error"]["message"],
+            "request body exceeds server.max_request_mib=1"
+        );
+
+        proxy_handle.abort();
+    }
+
     /// A cold start must not answer the queued Codex model refresh until the
     /// CPA instance it just launched is reachable, or the client caches a
     /// catalog with no `cpa/` models for the rest of its session.
@@ -1881,7 +2018,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        wait_for_cpa_catalog(&state, Duration::from_secs(10)).await;
+        wait_for_cpa_catalog(&state, Duration::from_millis(800)).await;
         let cached = state.cached_cpa_catalog(CPA_CATALOG_FRESH_FOR).unwrap();
         assert_eq!(cached["models"][0]["slug"], "glm-5.3-flash");
         late_start.abort();
@@ -1902,6 +2039,83 @@ mod tests {
         // Bounded: an absent CPA degrades instead of blocking the listener.
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(state.cached_cpa_catalog(CPA_CATALOG_FRESH_FOR).is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_wait_waits_for_cpa_catalog_changes_to_stabilize() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get(|State(counter): State<Arc<AtomicUsize>>| async move {
+                    let value = counter.fetch_add(1, Ordering::SeqCst);
+                    if value == 0 {
+                        Json(json!({"models":[{"slug":"glm-5.3-flash"}]}))
+                    } else {
+                        Json(json!({"models":[
+                            {"slug":"glm-5.3-flash"},
+                            {"slug":"gemini"}
+                        ]}))
+                    }
+                }),
+            )
+            .with_state(counter);
+        let (address, handle) = spawn_test_app(app).await;
+        let root = tempfile::tempdir().unwrap();
+        let state = auto_review_state(root.path(), address, address);
+
+        wait_for_cpa_catalog(&state, Duration::from_millis(1200)).await;
+        assert_eq!(
+            state.catalog.resolve("cpa/gemini").unwrap(),
+            CatalogRoute::Cpa {
+                upstream_model: "gemini".into()
+            }
+        );
+
+        handle.abort();
+    }
+
+    #[test]
+    fn cpa_sync_updates_memory_routes_without_persisting_until_full_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog_path = root.path().join("catalog.json");
+        {
+            let store = CatalogStore::load(catalog_path.clone()).unwrap();
+            store
+                .replace(
+                    &json!({"models":[{"slug":"gpt-5.6"}]}),
+                    &json!({"models":[{"slug":"claude"}]}),
+                    &[],
+                )
+                .unwrap();
+        }
+        let persisted = std::fs::read(&catalog_path).unwrap();
+        let state = AppState::new(
+            Settings::default(),
+            Credentials {
+                proxy_token: "proxy".into(),
+                cpa_token: "cpa-secret".into(),
+                cpa_management_key: "management-secret".into(),
+            },
+            catalog_path.clone(),
+            root.path().join("cpa-profiles.toml"),
+        )
+        .unwrap();
+        let cpa = json!({"models":[{"slug":"claude"},{"slug":"gemini"}]});
+
+        state.store_cpa_catalog(cpa.clone());
+        assert!(state.catalog.has_validated_official());
+        state.apply_cpa_catalog_to_memory(&cpa).unwrap();
+
+        assert_eq!(
+            state.catalog.resolve("cpa/gemini").unwrap(),
+            CatalogRoute::Cpa {
+                upstream_model: "gemini".into()
+            }
+        );
+        assert_eq!(std::fs::read(&catalog_path).unwrap(), persisted);
     }
 
     #[tokio::test]
@@ -1944,6 +2158,9 @@ mod tests {
             .header("x-codexmux-token", "proxy")
             .header(header::AUTHORIZATION, "Bearer oauth")
             .header("chatgpt-account-id", "account")
+            .header("x-openai-subagent", "guardian")
+            .header("session-id", "sess")
+            .header("thread-id", "thread")
             .json(&json!({
                 "model":catalog::AUTO_REVIEW_MODEL, "input":"review", "stream":false
             }))
@@ -1957,6 +2174,9 @@ mod tests {
         let captured = official_capture.0.lock().await;
         assert_eq!(captured[0].0[header::AUTHORIZATION], "Bearer oauth");
         assert_eq!(captured[0].0["chatgpt-account-id"], "account");
+        assert_eq!(captured[0].0["x-openai-subagent"], "guardian");
+        assert_eq!(captured[0].0["session-id"], "sess");
+        assert_eq!(captured[0].0["thread-id"], "thread");
         assert_eq!(captured[0].1["model"], catalog::AUTO_REVIEW_MODEL);
 
         proxy_handle.abort();
@@ -2167,6 +2387,7 @@ mod tests {
                     "mapped-model".into(),
                     "provider/native-model".into(),
                 )]),
+                model_metadata: Default::default(),
             }],
         )
         .unwrap();

@@ -212,7 +212,7 @@ fn write_rollback(
     atomic_write(&version_path(paths), version_json)?;
     if was_loaded {
         start_service(paths, cpa, token)?;
-        model_slugs(cpa, token)?;
+        wait_for_model_slugs(cpa, token)?;
     }
     Ok(())
 }
@@ -455,7 +455,7 @@ fn install_verified_archive(
 
     if was_loaded {
         let validation = start_service(paths, cpa, token).and_then(|_| {
-            model_slugs(cpa, token).map(|_| ())
+            wait_for_model_slugs(cpa, token).map(|_| ())
         });
         if let Err(error) = validation {
             restore_previous(paths)?;
