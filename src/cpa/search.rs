@@ -1,9 +1,12 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchCapabilityStatus {
-    /// A real `web_search` call produced a search call.
+    /// A real `web_search` probe produced a search call, or the model runs
+    /// on the official route where `web_search` is a native platform
+    /// feature and the CLI holds no credentials to probe.
     Verified,
-    /// The backend accepted the `web_search` tool schema without running it.
+    /// The provider family is expected to accept `web_search`, or a real
+    /// probe succeeded without producing search-call evidence.
     Supported,
     Unsupported,
     Unknown,
@@ -39,6 +42,25 @@ impl SearchCapabilityStore {
     pub fn status(&self, slug: &str) -> Option<SearchCapabilityStatus> {
         self.entries.get(slug).map(|entry| entry.status)
     }
+
+    /// Record one detection result. A failed probe carries no capability
+    /// information, so it never replaces earlier verified, supported, or
+    /// unsupported knowledge; it lands only on empty, unknown, or
+    /// already-failed entries.
+    pub fn apply(&mut self, slug: &str, status: SearchCapabilityStatus, checked_at: i64) {
+        if status == SearchCapabilityStatus::Error
+            && self.entries.get(slug).is_some_and(|entry| {
+                !matches!(
+                    entry.status,
+                    SearchCapabilityStatus::Error | SearchCapabilityStatus::Unknown
+                )
+            })
+        {
+            return;
+        }
+        self.entries
+            .insert(slug.to_owned(), SearchCapability { status, checked_at });
+    }
 }
 
 pub fn load_search_capabilities(path: &Path) -> Result<SearchCapabilityStore> {
@@ -65,12 +87,10 @@ pub fn record_search_capability(
     status: SearchCapabilityStatus,
 ) -> Result<()> {
     let mut store = load_search_capabilities(path)?;
-    store.entries.insert(
-        slug.to_owned(),
-        SearchCapability {
-            status,
-            checked_at: time::OffsetDateTime::now_utc().unix_timestamp(),
-        },
+    store.apply(
+        slug,
+        status,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
     );
     save_search_capabilities(path, &store)
 }
@@ -100,6 +120,20 @@ pub fn detect_search_capabilities(
         !verify || only.is_some(),
         "--verify requires --model to avoid probing every provider"
     );
+    enum Detector {
+        Verify(crate::config::Settings, crate::config::Credentials),
+        Quick(QuickDetect),
+    }
+    let detector = if verify {
+        Detector::Verify(
+            crate::config::Settings::load(&paths.settings)?,
+            crate::secrets::load(&paths.credentials)?,
+        )
+    } else {
+        Detector::Quick(QuickDetect::load(paths))
+    };
+    let mut store = load_search_capabilities(&paths.search_capabilities)?;
+    let checked_at = time::OffsetDateTime::now_utc().unix_timestamp();
     let mut results = Vec::new();
     for slug in catalog_slugs(paths)? {
         if let Some(only) = only
@@ -107,16 +141,16 @@ pub fn detect_search_capabilities(
         {
             continue;
         }
-        let status = if verify {
-            let settings = crate::config::Settings::load(&paths.settings)?;
-            let credentials = crate::secrets::load(&paths.credentials)?;
-            verify_one(paths, &settings, &credentials, &slug)
-        } else {
-            quick_capability(paths, &slug)
+        let status = match &detector {
+            Detector::Verify(settings, credentials) => {
+                verify_one(paths, settings, credentials, &slug)
+            }
+            Detector::Quick(quick) => quick.capability(&slug),
         };
-        record_search_capability(&paths.search_capabilities, &slug, status)?;
+        store.apply(&slug, status, checked_at);
         results.push((slug, status));
     }
+    save_search_capabilities(&paths.search_capabilities, &store)?;
     Ok(results)
 }
 
@@ -126,49 +160,86 @@ fn verify_one(
     credentials: &crate::config::Credentials,
     slug: &str,
 ) -> SearchCapabilityStatus {
+    if slug == crate::catalog::AUTO_REVIEW_MODEL {
+        // The proxy refuses codex-auto-review as a shared search backend.
+        return SearchCapabilityStatus::Unsupported;
+    }
     let Some(upstream) = slug.strip_prefix(crate::config::CPA_MODEL_PREFIX) else {
+        // Official models search natively on the official route; the CLI
+        // holds no ChatGPT OAuth, so there is nothing it could probe.
         return SearchCapabilityStatus::Verified;
     };
     let direct = crate::cpa::direct_route_for(&paths.cpa_profiles, upstream);
     if direct.ok().flatten().is_some() {
         return SearchCapabilityStatus::Unknown;
     }
-    match probe_via_cpa(settings, credentials, upstream, true) {
+    match probe_via_cpa(settings, credentials, upstream) {
         Ok(status) => status,
         Err(_) => SearchCapabilityStatus::Error,
     }
 }
 
-fn quick_capability(paths: &Paths, slug: &str) -> SearchCapabilityStatus {
-    if !slug.starts_with(crate::config::CPA_MODEL_PREFIX) {
-        return SearchCapabilityStatus::Verified;
+/// Inputs for quick capability detection, loaded once per detection run
+/// instead of once per catalog slug.
+struct QuickDetect {
+    direct_models: HashSet<String>,
+    config: Option<CpaConfig>,
+}
+
+impl QuickDetect {
+    fn load(paths: &Paths) -> Self {
+        let direct_models = crate::cpa::declared_direct_models(&paths.cpa_profiles)
+            .into_iter()
+            .map(|model| model.upstream_model)
+            .collect();
+        let config = fs::read_to_string(crate::cpa::config_path(paths))
+            .ok()
+            .and_then(|text| serde_yaml::from_str::<CpaConfig>(&text).ok());
+        Self {
+            direct_models,
+            config,
+        }
     }
-    let Some(upstream) = slug.strip_prefix(crate::config::CPA_MODEL_PREFIX) else {
-        return SearchCapabilityStatus::Unknown;
-    };
-    let direct = crate::cpa::direct_route_for(&paths.cpa_profiles, upstream);
-    if direct.ok().flatten().is_some() {
-        return SearchCapabilityStatus::Unknown;
+
+    /// Local heuristic only, with no network traffic. `Supported` means the
+    /// provider family is expected to accept `web_search`; run
+    /// `search-detect --model <slug> --verify` for real confirmation.
+    fn capability(&self, slug: &str) -> SearchCapabilityStatus {
+        if slug == crate::catalog::AUTO_REVIEW_MODEL {
+            // The proxy refuses codex-auto-review as a shared search backend.
+            return SearchCapabilityStatus::Unsupported;
+        }
+        let Some(upstream) = slug.strip_prefix(crate::config::CPA_MODEL_PREFIX) else {
+            return SearchCapabilityStatus::Verified;
+        };
+        if self.direct_models.contains(upstream) {
+            return SearchCapabilityStatus::Unknown;
+        }
+        let lower = upstream.to_lowercase();
+        if lower.starts_with("claude-") || lower.contains("gemini") || lower.starts_with("grok") {
+            return SearchCapabilityStatus::Supported;
+        }
+        let Some(config) = &self.config else {
+            return SearchCapabilityStatus::Unknown;
+        };
+        if config
+            .claude
+            .iter()
+            .any(|provider| provider.has_model(upstream))
+            || config.xai.iter().any(|provider| provider.has_model(upstream))
+            || config
+                .gemini
+                .iter()
+                .any(|provider| provider.has_model(upstream))
+            || config
+                .antigravity
+                .iter()
+                .any(|provider| provider.has_model(upstream))
+        {
+            return SearchCapabilityStatus::Supported;
+        }
+        SearchCapabilityStatus::Unknown
     }
-    let lower = upstream.to_lowercase();
-    if lower.starts_with("claude-") || lower.contains("gemini") || lower.starts_with("grok") {
-        return SearchCapabilityStatus::Supported;
-    }
-    let config_path = crate::cpa::config_path(paths);
-    let Ok(text) = fs::read_to_string(config_path) else {
-        return SearchCapabilityStatus::Unknown;
-    };
-    let Ok(config) = serde_yaml::from_str::<CpaConfig>(&text) else {
-        return SearchCapabilityStatus::Unknown;
-    };
-    if config.claude.iter().any(|provider| provider.has_model(upstream))
-        || config.xai.iter().any(|provider| provider.has_model(upstream))
-        || config.gemini.iter().any(|provider| provider.has_model(upstream))
-        || config.antigravity.iter().any(|provider| provider.has_model(upstream))
-    {
-        return SearchCapabilityStatus::Supported;
-    }
-    SearchCapabilityStatus::Unknown
 }
 
 #[derive(Default, Deserialize)]
@@ -209,28 +280,20 @@ fn probe_via_cpa(
     settings: &crate::config::Settings,
     credentials: &crate::config::Credentials,
     upstream_model: &str,
-    verify: bool,
 ) -> Result<SearchCapabilityStatus> {
     let url = format!("{}/responses", settings.cpa.base_url.trim_end_matches('/'));
-    let payload = if verify {
-        serde_json::json!({
-            "model": upstream_model,
-            "input": "Search for codexmux-probe-unique-20260904",
-            "tools": [{"type": "web_search"}],
-            "tool_choice": "required",
-            "stream": false
-        })
-    } else {
-        serde_json::json!({
-            "model": upstream_model,
-            "input": "probe",
-            "tools": [{"type": "web_search"}],
-            "tool_choice": {"type": "none"},
-            "stream": false
-        })
-    };
+    let payload = serde_json::json!({
+        "model": upstream_model,
+        "input": "Search for codexmux-probe-unique-20260904",
+        "tools": [{"type": "web_search"}],
+        "tool_choice": "required",
+        "stream": false
+    });
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
+        // A forced real search can run several search rounds plus reasoning;
+        // grok-4.6 was observed at ~30s. Verify probes are single-model and
+        // user-initiated, so a generous budget beats a false `error`.
+        .timeout(Duration::from_secs(90))
         .build()?;
     let response = client
         .post(&url)
@@ -240,31 +303,28 @@ fn probe_via_cpa(
         .with_context(|| format!("search probe for {upstream_model} failed"))?;
     let status = response.status();
     let body = response.text().unwrap_or_default();
-    Ok(classify_search_probe(status.as_u16(), &body, verify))
+    Ok(classify_search_probe(status.as_u16(), &body))
 }
 
-fn classify_search_probe(
-    http_status: u16,
-    body: &str,
-    verify: bool,
-) -> SearchCapabilityStatus {
+/// Classify one real `web_search` probe. `Unsupported` requires the error to
+/// actually reject the tool; unrelated 4xx bodies that merely contain a word
+/// like "unsupported" stay `Error`.
+fn classify_search_probe(http_status: u16, body: &str) -> SearchCapabilityStatus {
     if (200..300).contains(&http_status) {
-        if verify && body.contains("web_search_call") {
+        if body.contains("web_search_call") {
             return SearchCapabilityStatus::Verified;
         }
         return SearchCapabilityStatus::Supported;
     }
     let lower = body.to_lowercase();
-    if matches!(http_status, 400 | 404 | 422)
-        && (lower.contains("web_search")
-            || lower.contains("unsupported")
-            || lower.contains("unknown tool")
-            || lower.contains("tool not"))
-    {
+    let rejects_tool = lower.contains("web_search")
+        || (lower.contains("tool")
+            && (lower.contains("unsupported")
+                || lower.contains("not supported")
+                || lower.contains("unknown")
+                || lower.contains("not available")));
+    if matches!(http_status, 400 | 404 | 422) && rejects_tool {
         return SearchCapabilityStatus::Unsupported;
-    }
-    if http_status == 401 || http_status == 403 {
-        return SearchCapabilityStatus::Error;
     }
     SearchCapabilityStatus::Error
 }

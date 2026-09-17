@@ -162,12 +162,14 @@ enum CpaCommand {
     },
     /// Print the cached shared web search capability status.
     SearchCapabilities,
-    /// Probe catalog models for Responses `web_search` support and cache results.
+    /// Detect Responses `web_search` support for catalog models and cache
+    /// the results. The default pass is local heuristics only; `--verify`
+    /// runs one real search.
     SearchDetect {
-        /// Only probe this exact catalog slug.
+        /// Only detect this exact catalog slug.
         #[arg(long)]
         model: Option<String>,
-        /// Run a real minimal search instead of a schema-only probe.
+        /// Run one real search against the selected model (requires --model).
         #[arg(long)]
         verify: bool,
     },

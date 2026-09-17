@@ -657,41 +657,82 @@ max_context_window = 1000000
     #[test]
     fn search_probe_classification() {
         assert_eq!(
-            classify_search_probe(200, r#"{"output":[{"type":"web_search_call"}]}"#, true),
+            classify_search_probe(200, r#"{"output":[{"type":"web_search_call"}]}"#),
             SearchCapabilityStatus::Verified
         );
         assert_eq!(
-            classify_search_probe(200, "{}", false),
+            classify_search_probe(200, "{}"),
             SearchCapabilityStatus::Supported
         );
         assert_eq!(
-            classify_search_probe(400, r#"unsupported web_search"#, false),
+            classify_search_probe(400, "unsupported web_search"),
             SearchCapabilityStatus::Unsupported
         );
         assert_eq!(
-            classify_search_probe(401, "auth", false),
+            classify_search_probe(400, "tool type not supported"),
+            SearchCapabilityStatus::Unsupported
+        );
+        // A 4xx that merely mentions an unsupported parameter is not a tool
+        // rejection.
+        assert_eq!(
+            classify_search_probe(400, "Unsupported parameter: 'stream'"),
+            SearchCapabilityStatus::Error
+        );
+        assert_eq!(
+            classify_search_probe(401, "auth"),
             SearchCapabilityStatus::Error
         );
     }
 
     #[test]
+    fn failed_probes_never_erase_prior_capability_knowledge() {
+        let mut store = SearchCapabilityStore::default();
+        store.apply("model", SearchCapabilityStatus::Supported, 1);
+        store.apply("model", SearchCapabilityStatus::Error, 2);
+        let entry = store.entries.get("model").unwrap();
+        assert_eq!(entry.status, SearchCapabilityStatus::Supported);
+        assert_eq!(entry.checked_at, 1);
+
+        // Real knowledge changes still overwrite.
+        store.apply("model", SearchCapabilityStatus::Unsupported, 3);
+        assert_eq!(
+            store.status("model"),
+            Some(SearchCapabilityStatus::Unsupported)
+        );
+
+        // Errors land on empty, unknown, or already-failed entries.
+        store.apply("fresh", SearchCapabilityStatus::Error, 4);
+        assert_eq!(store.status("fresh"), Some(SearchCapabilityStatus::Error));
+        store.apply("unknown", SearchCapabilityStatus::Unknown, 5);
+        store.apply("unknown", SearchCapabilityStatus::Error, 6);
+        assert_eq!(store.status("unknown"), Some(SearchCapabilityStatus::Error));
+    }
+
+    #[test]
     fn quick_search_capability_is_local_and_non_aborting() {
         let paths = paths();
+        let quick = QuickDetect::load(&paths);
         assert_eq!(
-            quick_capability(&paths, "gpt-5.6-sol"),
+            quick.capability("gpt-5.6-sol"),
             SearchCapabilityStatus::Verified
         );
         assert_eq!(
-            quick_capability(&paths, "cpa/claude-opus-5"),
+            quick.capability("cpa/claude-opus-5"),
             SearchCapabilityStatus::Supported
         );
         assert_eq!(
-            quick_capability(&paths, "cpa/gpt-5.6-sol"),
+            quick.capability("cpa/gpt-5.6-sol"),
             SearchCapabilityStatus::Unknown
         );
         assert_eq!(
-            quick_capability(&paths, "cpa/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"),
+            quick.capability("cpa/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"),
             SearchCapabilityStatus::Unknown
+        );
+        // The proxy refuses codex-auto-review as a shared search backend, so
+        // detection must not advertise it.
+        assert_eq!(
+            quick.capability(crate::catalog::AUTO_REVIEW_MODEL),
+            SearchCapabilityStatus::Unsupported
         );
     }
 
