@@ -45,7 +45,10 @@ value.
 - Native Responses traffic is byte-preserving except when continuity requires
   `previous_response_id` to be replaced with replayable public history, or a CPA
   or direct request's local `cpa/` model slug must be restored to its upstream
-  model id.
+  model id, or the opt-in shared web search backend injects search results and
+  removes the `web_search` tool it owns. Shared search runs only for turns
+  that end with new user text; the backend receives just that text, and the
+  injected context stays out of recorded replay history.
 - Route by exact model slug from the last complete catalog snapshot, falling
   back to declared direct-route models when no snapshot exists. Official slugs
   are unchanged; CPA slugs use `cpa/`. Direct overrides apply only after that

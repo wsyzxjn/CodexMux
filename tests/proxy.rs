@@ -311,7 +311,9 @@ async fn shared_web_search_runs_backend_and_injects_results_into_custom_model() 
         custom["tools"],
         json!([{"type": "function", "name": "apply_patch"}])
     );
-    assert!(custom.get("tool_choice").is_none());
+    // The choice did not target the web search tool and other tools remain,
+    // so the client's selection survives the strip.
+    assert_eq!(custom["tool_choice"], json!({"type": "auto"}));
     let items = custom["input"].as_array().unwrap();
     assert_eq!(items.len(), 2);
     assert_eq!(
@@ -321,6 +323,284 @@ async fn shared_web_search_runs_backend_and_injects_results_into_custom_model() 
     let injected = items[1]["content"][0]["text"].as_str().unwrap();
     assert!(injected.contains("Search: first result"));
     assert!(injected.contains("Example: https://example.com"));
+    drop(captured);
+
+    proxy_handle.abort();
+    cpa_handle.abort();
+}
+
+#[tokio::test]
+async fn shared_web_search_skips_continuation_turns_and_keeps_replay_clean() {
+    async fn upstream(
+        State(capture): State<RawCapture>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        capture
+            .0
+            .lock()
+            .await
+            .push((headers, Bytes::from(serde_json::to_vec(&body).unwrap())));
+        if body["model"] == "shared-search" {
+            Json(json!({
+                "id": "resp_search",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Search: release notes"}]
+                }]
+            }))
+        } else {
+            Json(json!({
+                "id": "resp_custom",
+                "object": "response",
+                "status": "completed",
+                "model": body["model"],
+                "output": []
+            }))
+        }
+    }
+
+    let capture = RawCapture::default();
+    let (cpa_address, cpa_handle) = spawn(
+        Router::new()
+            .route("/v1/responses", post(upstream))
+            .with_state(capture.clone()),
+    )
+    .await;
+    let (proxy_address, proxy_handle) = spawn_codexmux_with_shared_search(
+        format!("http://{cpa_address}/v1"),
+        &[],
+        &["custom-model", "shared-search"],
+        "cpa/shared-search",
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let first = client
+        .post(format!("http://{proxy_address}/v1/responses"))
+        .header("x-codexmux-token", "proxy-token")
+        .json(&json!({
+            "model": "cpa/custom-model",
+            "input": "What is the latest Codex release?",
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "apply_patch"}
+            ],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.json::<Value>().await.unwrap()["id"], "resp_custom");
+
+    let second = client
+        .post(format!("http://{proxy_address}/v1/responses"))
+        .header("x-codexmux-token", "proxy-token")
+        .json(&json!({
+            "model": "cpa/custom-model",
+            "previous_response_id": "resp_custom",
+            "input": [
+                {"type": "function_call_output", "call_id": "call_1", "output": "file listing"}
+            ],
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "apply_patch"}
+            ],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+
+    let captured = capture.0.lock().await;
+    // Backend search ran once for the user question; the continuation turn
+    // reached only the custom model.
+    assert_eq!(captured.len(), 3);
+    let continuation: Value = serde_json::from_slice(&captured[2].1).unwrap();
+    assert_eq!(continuation["model"], "custom-model");
+    assert!(continuation.get("previous_response_id").is_none());
+    assert_eq!(
+        continuation["tools"],
+        json!([{"type": "function", "name": "apply_patch"}])
+    );
+    let items = continuation["input"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0]["content"][0]["text"],
+        "What is the latest Codex release?"
+    );
+    assert_eq!(items[1]["type"], "function_call_output");
+    // The injected search block from turn one never enters replayed history.
+    let replayed = serde_json::to_string(&continuation["input"]).unwrap();
+    assert!(!replayed.contains("Web search results"));
+    drop(captured);
+
+    proxy_handle.abort();
+    cpa_handle.abort();
+}
+
+#[tokio::test]
+async fn shared_web_search_backend_receives_only_trailing_user_text() {
+    async fn upstream(
+        State(capture): State<RawCapture>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        capture
+            .0
+            .lock()
+            .await
+            .push((headers, Bytes::from(serde_json::to_vec(&body).unwrap())));
+        if body["model"] == "shared-search" {
+            Json(json!({
+                "id": "resp_search",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Search: docs found"}]
+                }]
+            }))
+        } else {
+            Json(json!({
+                "id": "resp_custom",
+                "object": "response",
+                "status": "completed",
+                "model": body["model"],
+                "output": []
+            }))
+        }
+    }
+
+    let capture = RawCapture::default();
+    let (cpa_address, cpa_handle) = spawn(
+        Router::new()
+            .route("/v1/responses", post(upstream))
+            .with_state(capture.clone()),
+    )
+    .await;
+    let (proxy_address, proxy_handle) = spawn_codexmux_with_shared_search(
+        format!("http://{cpa_address}/v1"),
+        &[],
+        &["custom-model", "shared-search"],
+        "cpa/shared-search",
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_address}/v1/responses"))
+        .header("x-codexmux-token", "proxy-token")
+        .json(&json!({
+            "model": "cpa/custom-model",
+            "input": [
+                {"type": "function_call_output", "call_id": "call_9", "output": "ls output"},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "find docs"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                ]}
+            ],
+            "tools": [{"type": "web_search"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let captured = capture.0.lock().await;
+    assert_eq!(captured.len(), 2);
+    let backend: Value = serde_json::from_slice(&captured[0].1).unwrap();
+    // Only the trailing user text reaches the backend: no tool results and
+    // no image parts.
+    assert_eq!(
+        backend["input"],
+        json!([{
+            "role": "user",
+            "content": [{"type": "input_text", "text": "find docs"}]
+        }])
+    );
+
+    let custom: Value = serde_json::from_slice(&captured[1].1).unwrap();
+    let items = custom["input"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["type"], "function_call_output");
+    assert_eq!(items[1]["content"][1]["type"], "input_image");
+    assert!(
+        items[2]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Search: docs found")
+    );
+    assert!(custom.get("tools").is_none());
+    drop(captured);
+
+    proxy_handle.abort();
+    cpa_handle.abort();
+}
+
+#[tokio::test]
+async fn shared_web_search_never_runs_for_compaction_requests() {
+    async fn upstream(
+        State(capture): State<RawCapture>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        capture
+            .0
+            .lock()
+            .await
+            .push((headers, Bytes::from(serde_json::to_vec(&body).unwrap())));
+        Json(json!({
+            "id": "resp_compact",
+            "object": "response",
+            "status": "completed",
+            "output": []
+        }))
+    }
+
+    let capture = RawCapture::default();
+    let (cpa_address, cpa_handle) = spawn(
+        Router::new()
+            .route("/v1/responses/compact", post(upstream))
+            .with_state(capture.clone()),
+    )
+    .await;
+    let (proxy_address, proxy_handle) = spawn_codexmux_with_shared_search(
+        format!("http://{cpa_address}/v1"),
+        &[],
+        &["custom-model", "shared-search"],
+        "cpa/shared-search",
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_address}/v1/responses/compact"))
+        .header("x-codexmux-token", "proxy-token")
+        .json(&json!({
+            "model": "cpa/custom-model",
+            "input": "summarize this conversation",
+            "tools": [{"type": "web_search"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let captured = capture.0.lock().await;
+    // No backend search call: the compaction request went straight through
+    // with the advertised tool removed.
+    assert_eq!(captured.len(), 1);
+    let forwarded: Value = serde_json::from_slice(&captured[0].1).unwrap();
+    assert_eq!(forwarded["model"], "custom-model");
+    assert_eq!(forwarded["input"], "summarize this conversation");
+    assert!(forwarded.get("tools").is_none());
     drop(captured);
 
     proxy_handle.abort();

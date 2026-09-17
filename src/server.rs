@@ -35,6 +35,10 @@ use crate::{
 
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SEARCH_CONTEXT_BYTES: usize = 256 * 1024;
+/// Total budget for one shared web search backend call. The call blocks the
+/// user's request before any response bytes reach the client, so it must not
+/// inherit the unbounded lifetime that streaming proxying requires.
+const SEARCH_BACKEND_TIMEOUT: Duration = Duration::from_secs(120);
 const PROXY_TOKEN_HEADER: &str = "x-codexmux-token";
 const PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CPA_CATALOG_FRESH_FOR: Duration = Duration::from_secs(20);
@@ -738,7 +742,14 @@ struct ResponseRequest {
     value: Value,
     model: String,
     parent: Option<String>,
+    /// Portable view of the input as sent upstream this turn, including any
+    /// injected shared search context. Replay appends these items after the
+    /// materialized history.
     turn_input: Vec<Value>,
+    /// Portable view of the client's original input. This is what continuity
+    /// records, so injected search context never accumulates in replayed
+    /// history.
+    record_input: Vec<Value>,
 }
 
 async fn handle_responses(
@@ -777,15 +788,32 @@ async fn handle_responses(
         value: request,
         model,
         parent,
+        record_input: turn_input.clone(),
         turn_input,
     };
 
     if let Some(backend_model) = state.shared_search_backend()
         && wants_web_search(&request.value)
     {
-        let search_context =
-            shared_search_backend(&state, &headers, "responses", &request, &backend_model).await?;
-        inject_shared_search(&mut request, &search_context)?;
+        // Search only when this turn ends with new user text. Continuation
+        // turns that merely return tool results, and compaction requests,
+        // carry no new question; forcing a backend search there would add
+        // one blocking search per agentic step. CodexMux owns search while
+        // the shared backend is enabled, so on those turns the advertised
+        // tool is still removed instead of reaching an upstream that may
+        // reject it.
+        let query = if endpoint == "responses" {
+            trailing_user_text_messages(request.value.get("input"))
+        } else {
+            Vec::new()
+        };
+        if query.is_empty() {
+            strip_web_search_tools(&mut request)?;
+        } else {
+            let search_context =
+                shared_search_backend(&state, &headers, &backend_model, &query).await?;
+            inject_shared_search(&mut request, &search_context)?;
+        }
     }
 
     let catalog_route = match state.catalog.resolve_with_direct(
@@ -917,13 +945,15 @@ fn is_web_search_tool(tool: &Value) -> bool {
 }
 
 /// Run one shared Responses API `web_search` call and return a compact
-/// context block that can be injected into the original model request.
+/// context block that can be injected into the original model request. The
+/// backend receives only the turn's user text messages, never tool results,
+/// images, or other item types that a search backend may reject and that
+/// have no business reaching its provider.
 async fn shared_search_backend(
     state: &AppState,
     headers: &HeaderMap,
-    endpoint: &str,
-    request: &ResponseRequest,
     backend_model: &str,
+    query: &[Value],
 ) -> Result<String, ProxyError> {
     let backend_model = backend_model.trim();
     let direct = crate::cpa::declared_direct_models(&state.cpa_profiles_path);
@@ -949,14 +979,9 @@ async fn shared_search_backend(
             ));
         }
     };
-    let input = request
-        .value
-        .get("input")
-        .cloned()
-        .unwrap_or_else(|| Value::String(String::new()));
     let backend = json!({
         "model": upstream_model,
-        "input": input,
+        "input": query,
         "tools": [{"type": "web_search"}],
         "tool_choice": "required",
         "stream": false,
@@ -965,8 +990,20 @@ async fn shared_search_backend(
         serde_json::to_vec(&backend)
             .map_err(|error| ProxyError::bad_request("search_backend_json", error.to_string()))?,
     );
-    let upstream = send_upstream(state, headers, endpoint, &route, body).await?;
-    let response = read_backend_response(upstream).await?;
+    let response = tokio::time::timeout(SEARCH_BACKEND_TIMEOUT, async {
+        let upstream = send_upstream(state, headers, "responses", &route, body).await?;
+        read_backend_response(upstream).await
+    })
+    .await
+    .map_err(|_| {
+        ProxyError::bad_gateway(
+            "search_backend",
+            format!(
+                "shared web search backend timed out after {}s",
+                SEARCH_BACKEND_TIMEOUT.as_secs()
+            ),
+        )
+    })??;
     search_context_from_response(&response)
 }
 
@@ -1075,6 +1112,64 @@ fn search_context_from_response(response: &Value) -> Result<String, ProxyError> 
     Ok(context)
 }
 
+fn user_text_item(text: &str) -> Value {
+    json!({
+        "role": "user",
+        "content": [{"type": "input_text", "text": text}]
+    })
+}
+
+/// The new user text messages that end this turn's `input`, reduced to their
+/// text parts. An empty result means the turn continues earlier work (tool
+/// results, images only, or no input) and carries nothing to search for.
+fn trailing_user_text_messages(input: Option<&Value>) -> Vec<Value> {
+    let items = match input {
+        Some(Value::String(text)) => {
+            return if text.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![user_text_item(text)]
+            };
+        }
+        Some(Value::Array(items)) => items,
+        _ => return Vec::new(),
+    };
+    let mut collected: Vec<Value> = items.iter().rev().map_while(user_text_message).collect();
+    collected.reverse();
+    collected
+}
+
+/// A user message reduced to its `input_text` parts, or `None` when the item
+/// is not a user message with visible text.
+fn user_text_message(item: &Value) -> Option<Value> {
+    let object = item.as_object()?;
+    match object.get("type").and_then(Value::as_str) {
+        Some("message") | None => {}
+        Some(_) => return None,
+    }
+    if object.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let text = match object.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(user_text_item(&text))
+}
+
+/// Append the shared search context to the request input, then remove the
+/// web search tool that CodexMux has now satisfied. The recorded turn keeps
+/// the pre-injection view, so replayed history never accumulates injected
+/// search blocks.
 fn inject_shared_search(
     request: &mut ResponseRequest,
     search_context: &str,
@@ -1084,29 +1179,44 @@ fn inject_shared_search(
             .value
             .as_object_mut()
             .ok_or_else(|| ProxyError::bad_request("invalid_json", "request must be an object"))?;
-        let input = object
-            .remove("input")
-            .unwrap_or_else(|| Value::String(String::new()));
-        let mut items = match input {
-            Value::String(text) => vec![json!({
-                "role": "user",
-                "content": [{"type": "input_text", "text": text}]
-            })],
-            Value::Array(items) => items,
-            _ => Vec::new(),
+        let mut items = match object.get("input") {
+            None => Vec::new(),
+            Some(Value::String(text)) => vec![user_text_item(text)],
+            Some(Value::Array(items)) => items.clone(),
+            Some(_) => {
+                return Err(ProxyError::bad_request(
+                    "invalid_input",
+                    "input must be a string or an array of items",
+                ));
+            }
         };
-        items.push(json!({
-            "role": "user",
-            "content": [{"type": "input_text", "text": search_context}]
-        }));
+        items.push(user_text_item(search_context));
         object.insert("input".into(), Value::Array(items));
+    }
+    strip_web_search_tools(request)
+}
+
+/// Remove the web search tools that the shared backend owns. `tool_choice`
+/// is dropped only when it targeted a web search tool or when no tools
+/// remain for it to reference; a choice aimed at another tool is preserved.
+fn strip_web_search_tools(request: &mut ResponseRequest) -> Result<(), ProxyError> {
+    {
+        let object = request
+            .value
+            .as_object_mut()
+            .ok_or_else(|| ProxyError::bad_request("invalid_json", "request must be an object"))?;
         if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
             tools.retain(|tool| !is_web_search_tool(tool));
             if tools.is_empty() {
                 object.remove("tools");
             }
         }
-        object.remove("tool_choice");
+        let choice_targets_web_search = object.get("tool_choice").is_some_and(is_web_search_tool);
+        if choice_targets_web_search
+            || (object.contains_key("tool_choice") && !object.contains_key("tools"))
+        {
+            object.remove("tool_choice");
+        }
     }
     request.turn_input = portable_input_items(request.value.get("input"));
     request.body = Bytes::from(
@@ -1193,7 +1303,7 @@ async fn forward_response_inner(
     finish_response(
         upstream,
         request.parent.clone(),
-        request.turn_input.clone(),
+        request.record_input.clone(),
         route_id,
         state.continuity.clone(),
         &request.model,
@@ -3118,6 +3228,150 @@ mod tests {
         let context = search_context_from_response(&response).unwrap();
         assert!(context.len() <= MAX_SEARCH_CONTEXT_BYTES);
         assert!(context.is_char_boundary(context.len()));
+    }
+
+    fn search_request(value: Value) -> ResponseRequest {
+        let turn_input = portable_input_items(value.get("input"));
+        ResponseRequest {
+            body: Bytes::new(),
+            model: "custom".into(),
+            parent: None,
+            record_input: turn_input.clone(),
+            turn_input,
+            value,
+        }
+    }
+
+    #[test]
+    fn trailing_user_text_messages_gate_turns_without_new_user_text() {
+        assert_eq!(
+            trailing_user_text_messages(Some(&json!("question"))),
+            vec![user_text_item("question")]
+        );
+        assert!(trailing_user_text_messages(Some(&json!("  "))).is_empty());
+        assert!(trailing_user_text_messages(None).is_empty());
+
+        let tool_only = json!([
+            {"type": "function_call_output", "call_id": "call_1", "output": "listing"}
+        ]);
+        assert!(trailing_user_text_messages(Some(&tool_only)).is_empty());
+
+        let steering = json!([
+            {"type": "function_call_output", "call_id": "call_1", "output": "listing"},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "also check the docs"}]}
+        ]);
+        assert_eq!(
+            trailing_user_text_messages(Some(&steering)),
+            vec![user_text_item("also check the docs")]
+        );
+
+        // A user message that precedes trailing tool results is history, not
+        // a new question.
+        let leading = json!([
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "old question"}]},
+            {"type": "function_call_output", "call_id": "call_1", "output": "listing"}
+        ]);
+        assert!(trailing_user_text_messages(Some(&leading)).is_empty());
+    }
+
+    #[test]
+    fn trailing_user_text_messages_reduce_to_text_parts() {
+        let mixed = json!([
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "find docs"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+            ]}
+        ]);
+        assert_eq!(
+            trailing_user_text_messages(Some(&mixed)),
+            vec![user_text_item("find docs")]
+        );
+
+        let image_only = json!([
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+            ]}
+        ]);
+        assert!(trailing_user_text_messages(Some(&image_only)).is_empty());
+
+        let string_content = json!([
+            {"role": "user", "content": "plain"},
+            {"role": "user", "content": "second"}
+        ]);
+        assert_eq!(
+            trailing_user_text_messages(Some(&string_content)),
+            vec![user_text_item("plain"), user_text_item("second")]
+        );
+    }
+
+    #[test]
+    fn strip_web_search_tools_keeps_targeted_tool_choice() {
+        let mut request = search_request(json!({
+            "model": "custom",
+            "input": "question",
+            "tools": [{"type": "web_search"}, {"type": "function", "name": "apply_patch"}],
+            "tool_choice": {"type": "function", "name": "apply_patch"}
+        }));
+        strip_web_search_tools(&mut request).unwrap();
+        assert_eq!(
+            request.value["tools"],
+            json!([{"type": "function", "name": "apply_patch"}])
+        );
+        assert_eq!(
+            request.value["tool_choice"],
+            json!({"type": "function", "name": "apply_patch"})
+        );
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body, request.value);
+    }
+
+    #[test]
+    fn strip_web_search_tools_drops_choice_without_remaining_tools() {
+        let mut request = search_request(json!({
+            "model": "custom",
+            "input": "question",
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "auto"
+        }));
+        strip_web_search_tools(&mut request).unwrap();
+        assert!(request.value.get("tools").is_none());
+        assert!(request.value.get("tool_choice").is_none());
+
+        let mut targeted = search_request(json!({
+            "model": "custom",
+            "input": "question",
+            "tools": [{"type": "web_search"}, {"type": "function", "name": "apply_patch"}],
+            "tool_choice": {"type": "web_search"}
+        }));
+        strip_web_search_tools(&mut targeted).unwrap();
+        assert!(targeted.value.get("tool_choice").is_none());
+        assert_eq!(
+            targeted.value["tools"],
+            json!([{"type": "function", "name": "apply_patch"}])
+        );
+    }
+
+    #[test]
+    fn inject_shared_search_records_the_pre_injection_turn() {
+        let mut request = search_request(json!({
+            "model": "custom",
+            "input": "question",
+            "tools": [{"type": "web_search"}]
+        }));
+        inject_shared_search(&mut request, "Web search results:\n\nanswer").unwrap();
+        assert_eq!(request.turn_input.len(), 2);
+        assert_eq!(request.record_input, vec![user_text_item("question")]);
+
+        let mut invalid = search_request(json!({
+            "model": "custom",
+            "input": 42,
+            "tools": [{"type": "web_search"}]
+        }));
+        let error = inject_shared_search(&mut invalid, "context").unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.value["input"], 42);
     }
 
     #[test]
