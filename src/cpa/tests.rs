@@ -494,6 +494,38 @@ alias = \"gpt-5.6-terra\"
     }
 
     #[test]
+    fn provider_import_rejects_empty_or_duplicate_model_aliases() {
+        let empty_alias = r#"
+[[codex-api-key]]
+base-url = "https://example.com/acid/v1"
+
+[[codex-api-key.models]]
+name = "gpt-5.6-terra"
+alias = ""
+"#;
+        let error = providers_yaml(empty_alias).unwrap_err();
+        assert!(error.to_string().contains("nonempty provider-specific alias"));
+
+        let duplicate_alias = r#"
+[[openai-compatibility]]
+name = "provider-a"
+
+[[openai-compatibility.models]]
+name = "model-a"
+alias = "shared-model"
+
+[[openai-compatibility]]
+name = "provider-b"
+
+[[openai-compatibility.models]]
+name = "model-b"
+alias = "shared-model"
+"#;
+        let error = providers_yaml(duplicate_alias).unwrap_err();
+        assert!(error.to_string().contains("duplicates provider model alias shared-model"));
+    }
+
+    #[test]
     fn plist_renders_config_path_and_escapes_paths() {
         let plist = render_agent(
             Path::new("/tmp/a&b/cli-proxy-api"),
@@ -556,6 +588,25 @@ alias = \"gpt-5.6-terra\"
         assert_eq!(remaining.len(), 1);
         let error = remove_profile(&paths, "local").unwrap_err();
         assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn catalog_model_overrides_load_from_profile_config() {
+        let paths = paths();
+        fs::write(
+            &paths.cpa_profiles,
+            r#"
+[model-overrides."cpa/gpt-6-astra"]
+context_window = 1000000
+max_context_window = 1000000
+"#,
+        )
+        .unwrap();
+
+        let overrides = catalog_model_overrides(&paths.cpa_profiles);
+        let metadata = overrides.get("cpa/gpt-6-astra").unwrap();
+        assert_eq!(metadata.context_window, Some(1_000_000));
+        assert_eq!(metadata.max_context_window, Some(1_000_000));
     }
 
     #[test]

@@ -64,6 +64,39 @@ CodexMux 负责动态模型目录合并、精确请求路由、凭据隔离与�
 | `codexmux install` | （无菜单栏时）注册并启动后台 LaunchAgent 并接管配置 |
 | `codexmux uninstall` | 停止后台 LaunchAgent 并还原 Codex 配置 |
 
+### 多服务商模型命名
+
+CodexMux 使用 CPA 返回的模型 alias 作为唯一路由身份。同一个上游模型如果由
+多个服务商提供，CPA 里必须给不同服务商配置不同 alias；否则 CodexMux 无法
+可靠地区分请求应该发往哪一家。
+
+推荐使用 `服务商-模型` 的稳定 ID，并用 `display-name` 写人类可读名称：
+
+```toml
+[[openai-compatibility]]
+name = "example-provider"
+base-url = "https://provider.example/v1"
+
+[[openai-compatibility.models]]
+name = "gpt-6-astra"
+alias = "example-provider-gpt-6-astra"
+display-name = "GPT-6 Astra · Example"
+```
+
+合并后，Codex 模型列表中的 slug 会是 `cpa/codeapi-gpt-6-astra`。同样的模型
+从 Lxns 接入时就使用另一个 alias，例如 `lxns-gpt-6-astra`，最终显示为
+`cpa/lxns-gpt-6-astra`。`codexmux cpa provider import` 会拒绝空 alias 和跨
+provider 重复 alias，避免两个服务商占据同一个路由身份。
+
+如需修正某些 CPA/OAuth 模型下发给 Codex 的上下文元数据，可用精确的合并后
+slug 做本地覆盖；覆盖只影响模型目录展示，不改变 CPA 路由：
+
+```toml
+[model-overrides."cpa/gpt-6-astra"]
+context_window = 1000000
+max_context_window = 1000000
+```
+
 ### 常见问题排查
 
 - **`CODEXMUX_PROXY_TOKEN is missing or does not match`**：退出并重新打开 CodexMux；App 会重新准备 GUI 会话令牌并重启正在运行的 Codex Desktop。仅手动运行 CLI 时才需要自行导出该环境变量。

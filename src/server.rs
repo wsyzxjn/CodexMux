@@ -337,6 +337,9 @@ async fn handle_models(
 /// snapshot, and the CPA-unavailable degraded view alike, and disabling one
 /// restores the upstream metadata on the next model refresh.
 fn served_catalog(state: &AppState, mut catalog: Value) -> Result<Value, ProxyError> {
+    let overrides = crate::cpa::catalog_model_overrides(&state.cpa_profiles_path);
+    catalog::apply_model_overrides(&mut catalog, &overrides)
+        .map_err(|error| ProxyError::bad_gateway("catalog", error.to_string()))?;
     if state.settings.catalog.unify_comp_hash {
         catalog::unify_comp_hash_all(&mut catalog)
             .map_err(|error| ProxyError::bad_gateway("catalog", error.to_string()))?;

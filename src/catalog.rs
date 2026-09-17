@@ -1,11 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
     path::PathBuf,
     sync::RwLock,
 };
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{config::CPA_MODEL_PREFIX, fsutil::atomic_write};
@@ -70,6 +71,23 @@ pub struct DirectModel {
     pub display_name: Option<String>,
 }
 
+/// Optional serve-time metadata for a merged catalog model. These fields do
+/// not affect routing and are intentionally not persisted into the upstream
+/// snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CatalogModelOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
+}
+
+impl CatalogModelOverride {
+    pub fn is_empty(&self) -> bool {
+        self.context_window.is_none() && self.max_context_window.is_none()
+    }
+}
+
 impl DirectModel {
     pub fn new(upstream_model: impl Into<String>, base_url: impl Into<String>) -> Self {
         let upstream_model = upstream_model.into();
@@ -98,7 +116,7 @@ impl CatalogStore {
             }
             let mut catalog: Value = serde_json::from_slice(&bytes)
                 .with_context(|| format!("invalid catalog snapshot {}", path.display()))?;
-            hide_auto_review_models(&mut catalog)?;
+            hide_internal_models(&mut catalog)?;
             Some(Snapshot {
                 routes: route_table_from_merged(&catalog)?,
                 catalog,
@@ -365,6 +383,43 @@ pub fn unify_comp_hash_all(catalog: &mut Value) -> Result<()> {
     Ok(())
 }
 
+/// Apply local serve-time metadata overrides to exact merged catalog slugs.
+pub fn apply_model_overrides(
+    catalog: &mut Value,
+    overrides: &BTreeMap<String, CatalogModelOverride>,
+) -> Result<()> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    for model in models_mut(catalog)? {
+        let slug =
+            model_slug(model).context("merged catalog contains a model without a nonempty slug")?;
+        let Some(overrides) = overrides.get(slug) else {
+            continue;
+        };
+        if overrides.is_empty() {
+            continue;
+        }
+        let object = model
+            .as_object_mut()
+            .context("merged catalog contains a non-object model")?;
+        if let Some(window) = overrides.context_window {
+            object.insert("context_window".into(), json!(window));
+            if overrides.max_context_window.is_none() {
+                let current_max = object
+                    .get("max_context_window")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(window);
+                object.insert("max_context_window".into(), json!(window.max(current_max)));
+            }
+        }
+        if let Some(window) = overrides.max_context_window {
+            object.insert("max_context_window".into(), json!(window));
+        }
+    }
+    Ok(())
+}
+
 /// The hash Codex already applies to its default official model: the listed
 /// official entry with the strongest display precedence. Hidden entries are a
 /// last resort, and catalog order breaks ties so the choice stays stable
@@ -530,7 +585,7 @@ fn merge_declared_direct(catalog: &mut Value, direct: &[DirectModel]) -> Result<
             json!(format!("{} · Direct", model.upstream_model)),
         );
         object.insert("priority".into(), json!(next_priority));
-        let visibility = if model.upstream_model == AUTO_REVIEW_MODEL {
+        let visibility = if should_hide_from_picker(&model.upstream_model) {
             "hide"
         } else {
             "list"
@@ -560,14 +615,15 @@ pub fn merge(official: &Value, cpa: &Value) -> Result<Value> {
     {
         bail!("official model catalog reserves CPA namespace slug {reserved}");
     }
-    if let Some(official_auto_review) = output_models
-        .iter_mut()
-        .find(|model| model_slug(model) == Some(AUTO_REVIEW_MODEL))
-    {
-        official_auto_review
-            .as_object_mut()
-            .context("official auto-review model is not an object")?
-            .insert("visibility".into(), json!("hide"));
+    for model in output_models.iter_mut() {
+        let slug = model_slug(model)
+            .context("official model catalog contains a model without a nonempty slug")?;
+        if should_hide_from_picker(slug) {
+            model
+                .as_object_mut()
+                .context("internal official model is not an object")?
+                .insert("visibility".into(), json!("hide"));
+        }
     }
     let max_priority = output_models
         .iter()
@@ -582,8 +638,8 @@ pub fn merge(official: &Value, cpa: &Value) -> Result<Value> {
         if !seen_upstream.insert(upstream.to_owned()) {
             bail!("CPA model catalog contains duplicate slug {upstream}");
         }
-        let is_auto_review = upstream == AUTO_REVIEW_MODEL;
-        if source.get("visibility").and_then(Value::as_str) == Some("hide") && !is_auto_review
+        let is_internal = should_hide_from_picker(upstream);
+        if source.get("visibility").and_then(Value::as_str) == Some("hide") && !is_internal
             || source.get("supported_in_api").and_then(Value::as_bool) == Some(false)
         {
             continue;
@@ -611,7 +667,7 @@ pub fn merge(official: &Value, cpa: &Value) -> Result<Value> {
                     .saturating_add(index as i64)
             ),
         );
-        if is_auto_review {
+        if is_internal {
             object.insert("visibility".into(), json!("hide"));
         }
         output_models.push(model);
@@ -619,22 +675,32 @@ pub fn merge(official: &Value, cpa: &Value) -> Result<Value> {
     Ok(output)
 }
 
-fn hide_auto_review_models(catalog: &mut Value) -> Result<()> {
+fn hide_internal_models(catalog: &mut Value) -> Result<()> {
     for model in models_mut(catalog)? {
         let slug =
             model_slug(model).context("merged catalog contains a model without a nonempty slug")?;
-        let is_auto_review = slug == AUTO_REVIEW_MODEL
-            || slug
-                .strip_prefix(CPA_MODEL_PREFIX)
-                .is_some_and(|model| model == AUTO_REVIEW_MODEL);
-        if is_auto_review {
+        let upstream = slug.strip_prefix(CPA_MODEL_PREFIX).unwrap_or(slug);
+        if should_hide_from_picker(upstream) {
             model
                 .as_object_mut()
-                .context("auto-review model is not an object")?
+                .context("internal model is not an object")?
                 .insert("visibility".into(), json!("hide"));
         }
     }
     Ok(())
+}
+
+fn should_hide_from_picker(slug: &str) -> bool {
+    let slug = slug.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+    is_auto_review_slug(&slug) || is_image_model_slug(&slug)
+}
+
+fn is_auto_review_slug(slug: &str) -> bool {
+    slug == AUTO_REVIEW_MODEL || slug.ends_with("-codex-auto-review")
+}
+
+fn is_image_model_slug(slug: &str) -> bool {
+    slug.contains("gpt-image") || slug.contains("imagine-image")
 }
 
 fn route_table_from_merged(catalog: &Value) -> Result<RouteTable> {
@@ -725,6 +791,47 @@ mod tests {
     }
 
     #[test]
+    fn hides_review_and_image_models_without_dropping_their_routes() {
+        let official = json!({"models":[
+            {"slug":"gpt-6-astra", "visibility":"list", "priority":1},
+            {"slug":"codex-auto-review", "visibility":"list", "priority":2}
+        ]});
+        let cpa = json!({"models":[
+            {"slug":"codeapi-codex-auto-review", "display_name":"Codex Auto Review · CodeAPI"},
+            {"slug":"acid-cpa-codex-auto-review", "display_name":"Codex Auto Review · Acid CPA"},
+            {"slug":"codeapi-gpt-image-2", "display_name":"GPT Image 2 · CodeAPI"},
+            {"slug":"grok-imagine-image-quality", "display_name":"Grok Imagine Image Quality"},
+            {"slug":"codeapi-gpt-6-astra", "display_name":"GPT 6.0 Astra · CodeAPI"}
+        ]});
+
+        let merged = merge(&official, &cpa).unwrap();
+        let visibility = |slug: &str| {
+            merged["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["slug"] == slug)
+                .and_then(|model| model.get("visibility"))
+                .cloned()
+                .unwrap_or_else(|| json!("list"))
+        };
+        assert_eq!(visibility("codex-auto-review"), "hide");
+        for slug in [
+            "cpa/codeapi-codex-auto-review",
+            "cpa/acid-cpa-codex-auto-review",
+            "cpa/codeapi-gpt-image-2",
+            "cpa/grok-imagine-image-quality",
+        ] {
+            assert_eq!(visibility(slug), "hide", "{slug} stayed visible");
+        }
+        assert_eq!(visibility("cpa/codeapi-gpt-6-astra"), "list");
+
+        let routes = route_table_from_merged(&merged).unwrap();
+        assert!(routes.contains_key("cpa/codeapi-codex-auto-review"));
+        assert!(routes.contains_key("cpa/codeapi-gpt-image-2"));
+    }
+
+    #[test]
     fn ultra_advertisement_applies_to_every_merged_entry_when_enabled() {
         let root = tempdir().unwrap();
         let path = root.path().join("catalog.json");
@@ -805,6 +912,27 @@ mod tests {
             assert_eq!(model["supports_search_tool"], true);
             assert_eq!(model["web_search_tool_type"], "text_and_image");
         }
+    }
+
+    #[test]
+    fn model_overrides_only_change_exact_serve_time_metadata() {
+        let mut catalog = json!({"models":[
+            {"slug":"cpa/gpt-6-astra", "context_window":272000, "max_context_window":872000, "priority":10},
+            {"slug":"cpa/codeapi-gpt-6-astra", "context_window":272000, "max_context_window":872000}
+        ]});
+        let overrides = BTreeMap::from([(
+            "cpa/gpt-6-astra".to_owned(),
+            CatalogModelOverride {
+                context_window: Some(1_000_000),
+                max_context_window: Some(1_000_000),
+            },
+        )]);
+
+        apply_model_overrides(&mut catalog, &overrides).unwrap();
+        assert_eq!(catalog["models"][0]["context_window"], 1_000_000);
+        assert_eq!(catalog["models"][0]["max_context_window"], 1_000_000);
+        assert_eq!(catalog["models"][0]["priority"], 10);
+        assert_eq!(catalog["models"][1]["context_window"], 272_000);
     }
 
     #[test]

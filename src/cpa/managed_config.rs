@@ -241,6 +241,7 @@ fn set_private(path: &Path) -> Result<()> {
 /// Convert `[[openai-compatibility]]` / `[[codex-api-key]]` TOML tables to CPA YAML.
 fn providers_yaml(providers_toml: &str) -> Result<String> {
     let value: toml::Value = toml::from_str(providers_toml).context("provider TOML is invalid")?;
+    validate_provider_model_aliases(&value)?;
     let mut yaml = String::new();
     for kind in ["openai-compatibility", "codex-api-key"] {
         let Some(entries) = value.get(kind).and_then(|v| v.as_array()) else {
@@ -265,6 +266,52 @@ fn providers_yaml(providers_toml: &str) -> Result<String> {
         "provider TOML contains no provider tables"
     );
     Ok(yaml)
+}
+
+/// Provider imports must use explicit, globally unique model aliases. The
+/// alias is the only stable identity CodexMux receives from CPA, so an empty
+/// alias or the same alias on two providers makes exact routing ambiguous.
+fn validate_provider_model_aliases(value: &toml::Value) -> Result<()> {
+    let mut seen = HashSet::new();
+    for kind in ["openai-compatibility", "codex-api-key"] {
+        let Some(entries) = value.get(kind).and_then(toml::Value::as_array) else {
+            continue;
+        };
+        for (provider_index, entry) in entries.iter().enumerate() {
+            let provider = entry
+                .as_table()
+                .with_context(|| format!("{kind}[{provider_index}] must be a table"))?;
+            let models = provider
+                .get("models")
+                .and_then(toml::Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for (model_index, model) in models.iter().enumerate() {
+                let model = model
+                    .as_table()
+                    .with_context(|| format!("{kind}[{provider_index}].models[{model_index}] must be a table"))?;
+                let name = model
+                    .get("name")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("<unnamed>");
+                let alias = model
+                    .get("alias")
+                    .and_then(toml::Value::as_str)
+                    .map(str::trim)
+                    .filter(|alias| !alias.is_empty())
+                    .with_context(|| {
+                        format!(
+                            "{kind}[{provider_index}].models[{model_index}] ({name}) must define a nonempty provider-specific alias"
+                        )
+                    })?;
+                anyhow::ensure!(
+                    seen.insert(alias.to_ascii_lowercase()),
+                    "{kind}[{provider_index}].models[{model_index}] duplicates provider model alias {alias}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Render one provider field. `prefix` precedes this field (a `- ` list dash

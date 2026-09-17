@@ -52,6 +52,14 @@ struct ProfileStore {
         skip_serializing_if = "Vec::is_empty"
     )]
     direct_routes: Vec<DirectRoute>,
+    /// Serve-time metadata overrides for exact merged catalog slugs. These do
+    /// not change routing and are applied after the catalog is merged.
+    #[serde(
+        rename = "model-overrides",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    model_overrides: BTreeMap<String, crate::catalog::CatalogModelOverride>,
     /// Whether the CPA service should run when CodexMux starts. Updated by
     /// `cpa start` / `cpa stop` so the menu bar follows the user's last choice.
     #[serde(
@@ -530,6 +538,17 @@ pub fn declared_direct_models(profiles_path: &Path) -> Vec<crate::catalog::Direc
                 model
             })
         })
+        .collect()
+}
+
+/// Serve-time metadata overrides for exact merged catalog slugs.
+pub fn catalog_model_overrides(
+    profiles_path: &Path,
+) -> BTreeMap<String, crate::catalog::CatalogModelOverride> {
+    load_profile_store_from(profiles_path)
+        .model_overrides
+        .into_iter()
+        .filter(|(_, metadata)| !metadata.is_empty())
         .collect()
 }
 

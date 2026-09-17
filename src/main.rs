@@ -234,6 +234,9 @@ enum CpaCommand {
         /// Catalog max context window.
         #[arg(long)]
         max_context_window: Option<u64>,
+        /// Picker display name; CodexMux appends ` · Direct`.
+        #[arg(long)]
+        display_name: Option<String>,
     },
     /// Remove all direct routes (everything goes through CPA again).
     DirectClear,
@@ -1131,7 +1134,12 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
                         .max_context_window
                         .map(|window| format!("max_context_window={window}"))
                         .unwrap_or_else(|| "max_context_window=default".into());
-                    println!("  {slug}: {context} {max_context}");
+                    let display_name = metadata
+                        .display_name
+                        .as_deref()
+                        .map(|name| format!("display_name={name:?}"))
+                        .unwrap_or_else(|| "display_name=default".into());
+                    println!("  {slug}: {context} {max_context} {display_name}");
                 }
             }
         }
@@ -1139,6 +1147,7 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             model,
             context_window,
             max_context_window,
+            display_name,
         } => {
             codexmux::cpa::set_direct_model_metadata(
                 paths,
@@ -1146,7 +1155,7 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
                 codexmux::cpa::DirectModelMetadata {
                     context_window,
                     max_context_window,
-                    display_name: None,
+                    display_name,
                 },
             )?;
             println!("direct model metadata updated for {model}");
