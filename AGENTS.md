@@ -48,7 +48,9 @@ value.
   model id, or the opt-in shared web search backend injects search results and
   removes the `web_search` tool it owns. Shared search runs only for turns
   that end with new user text; the backend receives just that text, and the
-  injected context stays out of recorded replay history.
+  injected context stays out of recorded replay history. Official targets and
+  slugs a real probe verified keep their native `web_search` untouched; the
+  shared backend serves only models without confirmed native search.
 - Route by exact model slug from the last complete catalog snapshot, falling
   back to declared direct-route models when no snapshot exists. Official slugs
   are unchanged; CPA slugs use `cpa/`. Direct overrides apply only after that

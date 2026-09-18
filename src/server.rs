@@ -174,6 +174,20 @@ impl AppState {
             .map(|cached| cached.value.clone())
     }
 
+    /// Whether a real probe marked this exact merged slug as searching
+    /// natively. The capability cache lives beside `cpa-profiles.toml` in
+    /// the data root (see `Paths::from_root`) and is read per request so
+    /// `search-detect --verify` results apply without a proxy restart.
+    fn native_search_verified(&self, slug: &str) -> bool {
+        let Some(root) = self.cpa_profiles_path.parent() else {
+            return false;
+        };
+        crate::cpa::load_search_capabilities(&root.join("search-capabilities.json"))
+            .ok()
+            .and_then(|store| store.status(slug))
+            == Some(crate::cpa::SearchCapabilityStatus::Verified)
+    }
+
     fn current_cpa_catalog(&self) -> Option<Value> {
         self.cpa_catalog
             .read()
@@ -792,30 +806,6 @@ async fn handle_responses(
         turn_input,
     };
 
-    if let Some(backend_model) = state.shared_search_backend()
-        && wants_web_search(&request.value)
-    {
-        // Search only when this turn ends with new user text. Continuation
-        // turns that merely return tool results, and compaction requests,
-        // carry no new question; forcing a backend search there would add
-        // one blocking search per agentic step. CodexMux owns search while
-        // the shared backend is enabled, so on those turns the advertised
-        // tool is still removed instead of reaching an upstream that may
-        // reject it.
-        let query = if endpoint == "responses" {
-            trailing_user_text_messages(request.value.get("input"))
-        } else {
-            Vec::new()
-        };
-        if query.is_empty() {
-            strip_web_search_tools(&mut request)?;
-        } else {
-            let search_context =
-                shared_search_backend(&state, &headers, &backend_model, &query).await?;
-            inject_shared_search(&mut request, &search_context)?;
-        }
-    }
-
     let catalog_route = match state.catalog.resolve_with_direct(
         &request.model,
         &crate::cpa::declared_direct_models(&state.cpa_profiles_path),
@@ -834,6 +824,31 @@ async fn handle_responses(
             return Err(error);
         }
     };
+
+    if let Some(backend_model) = state.shared_search_backend()
+        && wants_web_search(&request.value)
+        && !native_search_target(&state, &catalog_route, &request.model)
+    {
+        // Search only when this turn ends with new user text. Continuation
+        // turns that merely return tool results, and compaction requests,
+        // carry no new question; forcing a backend search there would add
+        // one blocking search per agentic step. CodexMux owns search for
+        // these non-native targets while the shared backend is enabled, so
+        // on those turns the advertised tool is still removed instead of
+        // reaching an upstream that may reject it.
+        let query = if endpoint == "responses" {
+            trailing_user_text_messages(request.value.get("input"))
+        } else {
+            Vec::new()
+        };
+        if query.is_empty() {
+            strip_web_search_tools(&mut request)?;
+        } else {
+            let search_context =
+                shared_search_backend(&state, &headers, &backend_model, &query).await?;
+            inject_shared_search(&mut request, &search_context)?;
+        }
+    }
     tracing::debug!(
         model = %request.model,
         endpoint,
@@ -935,6 +950,18 @@ fn wants_web_search(request: &Value) -> bool {
         .get("tools")
         .and_then(Value::as_array)
         .is_some_and(|tools| tools.iter().any(is_web_search_tool))
+}
+
+/// Targets that already run `web_search` natively keep the tool untouched,
+/// so Codex renders the real search calls in the transcript: the official
+/// route always supports it, and a CPA or direct slug qualifies once a real
+/// `search-detect --verify` probe confirmed it. The shared backend serves
+/// only the remaining models.
+fn native_search_target(state: &AppState, route: &CatalogRoute, slug: &str) -> bool {
+    match route {
+        CatalogRoute::Official | CatalogRoute::AutoReview => true,
+        CatalogRoute::Cpa { .. } => state.native_search_verified(slug),
+    }
 }
 
 fn is_web_search_tool(tool: &Value) -> bool {

@@ -69,6 +69,7 @@ async fn spawn_codexmux_with_shared_search(
     official_models: &[&str],
     cpa_models: &[&str],
     backend_model: &str,
+    verified_models: &[&str],
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let root = tempfile::tempdir().unwrap().keep();
     let path = root.join("model-catalog.json");
@@ -81,6 +82,22 @@ async fn spawn_codexmux_with_shared_search(
         )
         .unwrap();
     drop(store);
+    if !verified_models.is_empty() {
+        let entries: serde_json::Map<String, Value> = verified_models
+            .iter()
+            .map(|slug| {
+                (
+                    (*slug).to_owned(),
+                    json!({"status": "verified", "checked_at": 1}),
+                )
+            })
+            .collect();
+        std::fs::write(
+            root.join("search-capabilities.json"),
+            serde_json::to_vec(&json!({"entries": entries})).unwrap(),
+        )
+        .unwrap();
+    }
     let mut settings = Settings {
         cpa: Cpa {
             base_url: cpa_base_url,
@@ -275,6 +292,7 @@ async fn shared_web_search_runs_backend_and_injects_results_into_custom_model() 
         &[],
         &["custom-model", "shared-search"],
         "cpa/shared-search",
+        &[],
     )
     .await;
 
@@ -375,6 +393,7 @@ async fn shared_web_search_skips_continuation_turns_and_keeps_replay_clean() {
         &[],
         &["custom-model", "shared-search"],
         "cpa/shared-search",
+        &[],
     )
     .await;
 
@@ -490,6 +509,7 @@ async fn shared_web_search_backend_receives_only_trailing_user_text() {
         &[],
         &["custom-model", "shared-search"],
         "cpa/shared-search",
+        &[],
     )
     .await;
 
@@ -576,6 +596,7 @@ async fn shared_web_search_never_runs_for_compaction_requests() {
         &[],
         &["custom-model", "shared-search"],
         "cpa/shared-search",
+        &[],
     )
     .await;
 
@@ -601,6 +622,88 @@ async fn shared_web_search_never_runs_for_compaction_requests() {
     assert_eq!(forwarded["model"], "custom-model");
     assert_eq!(forwarded["input"], "summarize this conversation");
     assert!(forwarded.get("tools").is_none());
+    drop(captured);
+
+    proxy_handle.abort();
+    cpa_handle.abort();
+}
+
+#[tokio::test]
+async fn shared_web_search_passes_through_for_verified_native_models() {
+    async fn upstream(
+        State(capture): State<RawCapture>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        capture
+            .0
+            .lock()
+            .await
+            .push((headers, Bytes::from(serde_json::to_vec(&body).unwrap())));
+        Json(json!({
+            "id": "resp_native",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {"type": "web_search_call", "action": {"type": "search", "query": "native"}},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}]
+                }
+            ]
+        }))
+    }
+
+    let capture = RawCapture::default();
+    let (cpa_address, cpa_handle) = spawn(
+        Router::new()
+            .route("/v1/responses", post(upstream))
+            .with_state(capture.clone()),
+    )
+    .await;
+    let (proxy_address, proxy_handle) = spawn_codexmux_with_shared_search(
+        format!("http://{cpa_address}/v1"),
+        &[],
+        &["custom-model", "shared-search"],
+        "cpa/shared-search",
+        &["cpa/custom-model"],
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy_address}/v1/responses"))
+        .header("x-codexmux-token", "proxy-token")
+        .json(&json!({
+            "model": "cpa/custom-model",
+            "input": "search something current",
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "apply_patch"}
+            ],
+            "tool_choice": "auto",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let captured = capture.0.lock().await;
+    // A verified native searcher keeps its tool: no backend prefetch, no
+    // injection, no stripping, so the provider runs the real search loop.
+    assert_eq!(captured.len(), 1);
+    let forwarded: Value = serde_json::from_slice(&captured[0].1).unwrap();
+    assert_eq!(forwarded["model"], "custom-model");
+    assert_eq!(forwarded["input"], "search something current");
+    assert_eq!(
+        forwarded["tools"],
+        json!([
+            {"type": "web_search"},
+            {"type": "function", "name": "apply_patch"}
+        ])
+    );
+    assert_eq!(forwarded["tool_choice"], "auto");
     drop(captured);
 
     proxy_handle.abort();
