@@ -17,6 +17,7 @@ struct PreparedAppUpdate {
 enum AppUpdaterError: Error {
     case invalidResponse
     case invalidRelease
+    case unsupportedArchitecture
     case missingAsset(String)
     case checksumMismatch
     case invalidBundle
@@ -77,6 +78,10 @@ final class AppUpdater {
             }
 
             let architecture = Self.releaseArchitecture
+            guard architecture != "unsupported" else {
+                completion(.failure(AppUpdaterError.unsupportedArchitecture))
+                return
+            }
             let archiveName = "CodexMux-\(version)-macos-\(architecture).zip"
             guard let archiveURL = payload.asset(named: archiveName),
                   let checksumsURL = payload.asset(named: "SHA256SUMS"),
@@ -120,17 +125,24 @@ final class AppUpdater {
         let backupURL = currentAppURL.deletingLastPathComponent().appendingPathComponent(
             "CodexMux.app.backup-\(Int(Date().timeIntervalSince1970))"
         )
+        // The backup exists only to restore the current app if the
+        // replacement fails; a verified replacement removes it before launch.
         let script = """
         while /bin/kill -0 "$PARENT_PID" 2>/dev/null; do /bin/sleep 0.1; done
-        if ! /bin/mv "$CURRENT_APP" "$BACKUP_APP"; then exit 1; fi
+        if ! /bin/mv "$CURRENT_APP" "$BACKUP_APP"; then
+          /bin/rm -rf "$STAGING_ROOT"
+          /usr/bin/open "$CURRENT_APP"
+          exit 1
+        fi
         if /usr/bin/ditto "$STAGED_APP" "$CURRENT_APP" && \
            /usr/bin/codesign --verify --deep --strict "$CURRENT_APP"; then
+          /bin/rm -rf "$BACKUP_APP" "$STAGING_ROOT"
           /usr/bin/open "$CURRENT_APP"
-          /bin/rm -rf "$STAGING_ROOT"
           exit 0
         fi
         /bin/rm -rf "$CURRENT_APP"
         /bin/mv "$BACKUP_APP" "$CURRENT_APP"
+        /bin/rm -rf "$STAGING_ROOT"
         /usr/bin/open "$CURRENT_APP"
         exit 1
         """
@@ -185,8 +197,6 @@ final class AppUpdater {
     private static var releaseArchitecture: String {
         #if arch(arm64)
         return "arm64"
-        #elseif arch(x86_64)
-        return "x86_64"
         #else
         return "unsupported"
         #endif
@@ -221,6 +231,7 @@ final class AppUpdater {
         let (downloadedURL, archiveResponse) = try await session.download(from: release.archiveURL)
         guard let http = archiveResponse as? HTTPURLResponse,
               http.statusCode == 200 else {
+            try? FileManager.default.removeItem(at: downloadedURL)
             throw AppUpdaterError.invalidResponse
         }
 
@@ -241,6 +252,9 @@ final class AppUpdater {
             try run("/usr/bin/ditto", ["-x", "-k", archive.path, unpacked.path])
 
             let app = unpacked.appendingPathComponent("CodexMux.app", isDirectory: true)
+            // Verify the signature before trusting anything in the bundle,
+            // including the CLI that the version check below executes.
+            try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
             guard let bundle = Bundle(url: app),
                   bundle.bundleIdentifier == "dev.codexmux.menubar",
                   bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
@@ -253,7 +267,6 @@ final class AppUpdater {
                     == Substring(release.version) else {
                 throw AppUpdaterError.invalidBundle
             }
-            try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
             return PreparedAppUpdate(stagedAppURL: app, stagingRootURL: root)
         } catch {
             try? FileManager.default.removeItem(at: root)

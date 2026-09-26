@@ -23,9 +23,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Update Rust stable
-        run: rustup update stable
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
 
       - name: Validate tag and project versions
         id: version
@@ -36,9 +37,11 @@ jobs:
           version="${tag#v}"
           cargo_version="$(sed -nE 's/^version = "([^"]+)"$/\1/p' Cargo.toml | head -1)"
           app_version="$(plutil -extract CFBundleShortVersionString raw menubar/Resources/Info.plist)"
+          app_build="$(plutil -extract CFBundleVersion raw menubar/Resources/Info.plist)"
           test "$tag" = "v$version"
           test "$version" = "$cargo_version"
           test "$version" = "$app_version"
+          test "$version" = "$app_build"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Verify Rust
@@ -46,6 +49,7 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked --all-targets
+          swift test --package-path menubar
 
       - name: Build release artifacts
         run: |

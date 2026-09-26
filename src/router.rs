@@ -51,9 +51,9 @@ pub fn official_image_headers(incoming: &HeaderMap) -> Result<HeaderMap> {
     Ok(preserve_content_type(official_headers(incoming)?, incoming))
 }
 
-/// Same as `cpa_headers` for an image request pinned to a CPA or direct
-/// upstream: the caller's `content-type` is preserved and only that route's
-/// own token is attached.
+/// Same as `cpa_headers` for an image request pinned to a CPA image model:
+/// the caller's `content-type` is preserved and only the CPA token is
+/// attached.
 pub fn cpa_image_headers(incoming: &HeaderMap, token: &str) -> Result<HeaderMap> {
     Ok(preserve_content_type(
         cpa_headers(incoming, token)?,

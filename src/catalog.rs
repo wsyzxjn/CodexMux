@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
     path::PathBuf,
-    sync::RwLock,
+    sync::{Mutex, RwLock},
 };
 
 use anyhow::{Context, Result, bail};
@@ -20,6 +20,10 @@ type RouteTable = HashMap<String, CatalogRoute>;
 struct Snapshot {
     catalog: Value,
     routes: RouteTable,
+    /// True when the view was built from both upstream catalogs. An
+    /// official-only view exists only so official models stay routable before
+    /// any complete catalog has been seen, and it never replaces one.
+    complete: bool,
 }
 
 #[derive(Debug)]
@@ -31,8 +35,10 @@ struct StoreState {
 #[derive(Debug)]
 pub struct CatalogStore {
     path: PathBuf,
-    advertise_ultra: bool,
     state: RwLock<StoreState>,
+    /// Serializes every view change so the persisted snapshot and the
+    /// in-memory view are always installed in the same order.
+    updates: Mutex<()>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,25 +58,6 @@ impl fmt::Display for CatalogRoute {
     }
 }
 
-/// A model declared by a direct route: proxied straight to an upstream even
-/// when it is absent from the CPA catalog.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DirectModel {
-    /// Local catalog slug (no `cpa/` prefix).
-    pub upstream_model: String,
-    /// Native model id sent to the direct endpoint. Alias targets use this to
-    /// copy matching official metadata; identical to `upstream_model` otherwise.
-    pub native_model: String,
-    /// Upstream base URL, used to group models per route in listings.
-    pub base_url: String,
-    /// Optional context window overlay from the direct-route declaration.
-    pub context_window: Option<u64>,
-    /// Optional max context window overlay from the direct-route declaration.
-    pub max_context_window: Option<u64>,
-    /// Optional picker name overlay; CodexMux still suffixes ` · Direct`.
-    pub display_name: Option<String>,
-}
-
 /// Optional serve-time metadata for a merged catalog model. These fields do
 /// not affect routing and are intentionally not persisted into the upstream
 /// snapshot.
@@ -88,39 +75,23 @@ impl CatalogModelOverride {
     }
 }
 
-impl DirectModel {
-    pub fn new(upstream_model: impl Into<String>, base_url: impl Into<String>) -> Self {
-        let upstream_model = upstream_model.into();
-        Self {
-            native_model: upstream_model.clone(),
-            upstream_model,
-            base_url: base_url.into(),
-            context_window: None,
-            max_context_window: None,
-            display_name: None,
-        }
-    }
-}
-
 impl CatalogStore {
+    /// Load the persisted snapshot. A snapshot that cannot be read is only a
+    /// cache of upstream data, so it is ignored with a warning and rebuilt by
+    /// the next complete refresh instead of preventing startup.
     pub fn load(path: PathBuf) -> Result<Self> {
-        Self::load_with_options(path, false)
-    }
-
-    pub fn load_with_options(path: PathBuf, advertise_ultra: bool) -> Result<Self> {
         let snapshot = if path.exists() {
-            let bytes = fs::read(&path)
-                .with_context(|| format!("failed to read catalog snapshot {}", path.display()))?;
-            if bytes.len() > MAX_CATALOG_BYTES {
-                bail!("catalog snapshot exceeds 16 MiB");
+            match load_snapshot(&path) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %format!("{error:#}"),
+                        "ignoring unreadable catalog snapshot"
+                    );
+                    None
+                }
             }
-            let mut catalog: Value = serde_json::from_slice(&bytes)
-                .with_context(|| format!("invalid catalog snapshot {}", path.display()))?;
-            hide_internal_models(&mut catalog)?;
-            Some(Snapshot {
-                routes: route_table_from_merged(&catalog)?,
-                catalog,
-            })
         } else {
             None
         };
@@ -130,8 +101,8 @@ impl CatalogStore {
             .transpose()?;
         Ok(Self {
             path,
-            advertise_ultra,
             state: RwLock::new(StoreState { snapshot, official }),
+            updates: Mutex::new(()),
         })
     }
 
@@ -147,26 +118,6 @@ impl CatalogStore {
             .with_context(|| format!("no route for model {model}"))
     }
 
-    /// Resolve a model, falling back to declared direct routes when the
-    /// catalog has no snapshot at all. Existing snapshots stay authoritative:
-    /// a slug present in the snapshot resolves exactly as stored.
-    pub fn resolve_with_direct(&self, model: &str, direct: &[DirectModel]) -> Result<CatalogRoute> {
-        if let Ok(route) = self.resolve(model) {
-            return Ok(route);
-        }
-        let upstream = model
-            .strip_prefix(CPA_MODEL_PREFIX)
-            .filter(|upstream| !upstream.is_empty());
-        if let Some(upstream) = upstream
-            && direct.iter().any(|entry| entry.upstream_model == upstream)
-        {
-            return Ok(CatalogRoute::Cpa {
-                upstream_model: upstream.to_owned(),
-            });
-        }
-        self.resolve(model)
-    }
-
     pub fn current(&self) -> Option<Value> {
         self.state
             .read()
@@ -176,9 +127,9 @@ impl CatalogStore {
             .map(|snapshot| snapshot.catalog.clone())
     }
 
-    /// True once an official catalog has passed the full two-upstream refresh.
-    /// The CPA-only background sync may then refresh the in-memory view from
-    /// this base, but it must not persist without validating both catalogs.
+    /// True once a valid official catalog is known. The CPA-only background
+    /// sync may then refresh the in-memory view from this base, but it must
+    /// not persist without validating both catalogs.
     pub fn has_validated_official(&self) -> bool {
         self.state
             .read()
@@ -187,27 +138,24 @@ impl CatalogStore {
             .is_some()
     }
 
-    /// Keep a valid official catalog for background CPA-only refreshes. This
-    /// is intentionally separate from the persisted snapshot: both upstreams
-    /// must still validate before a memory-only view can be written to disk.
-    pub fn store_official(&self, official: &Value) -> Result<()> {
-        validate_catalog(official).context("invalid official model catalog")?;
-        let mut state = self.state.write().expect("catalog snapshot lock poisoned");
-        state.official = Some(official.clone());
-        Ok(())
-    }
-
-    pub fn replace(&self, official: &Value, cpa: &Value, direct: &[DirectModel]) -> Result<Value> {
-        let (catalog, routes) = self.build(official, cpa, direct)?;
+    /// Install a complete view built from both upstream catalogs and persist
+    /// it. Unchanged bytes are not rewritten.
+    pub fn replace(&self, official: &Value, cpa: &Value) -> Result<Value> {
+        let _update = self.updates.lock().expect("catalog update lock poisoned");
+        let catalog = merge(official, cpa)?;
+        let routes = route_table_from_merged(&catalog)?;
         let bytes = serde_json::to_vec_pretty(&catalog)?;
         if bytes.len() > MAX_CATALOG_BYTES {
             bail!("merged model catalog exceeds 16 MiB");
         }
-        atomic_write(&self.path, &bytes)?;
+        if fs::read(&self.path).ok().as_deref() != Some(bytes.as_slice()) {
+            atomic_write(&self.path, &bytes)?;
+        }
         let mut state = self.state.write().expect("catalog snapshot lock poisoned");
         state.snapshot = Some(Snapshot {
             catalog: catalog.clone(),
             routes,
+            complete: true,
         });
         state.official = Some(official.clone());
         Ok(catalog)
@@ -216,46 +164,65 @@ impl CatalogStore {
     /// Refresh the served catalog and route table from the latest CPA catalog
     /// without writing a new snapshot. The persisted snapshot still requires a
     /// full refresh that validates both upstream catalogs.
-    pub fn replace_memory_from_cpa(&self, cpa: &Value, direct: &[DirectModel]) -> Result<Value> {
-        let official = {
-            let state = self.state.read().expect("catalog snapshot lock poisoned");
-            state
-                .official
-                .clone()
-                .context("official model catalog has not been validated yet")?
-        };
-        self.replace_memory(&official, cpa, direct)
-    }
-
-    fn replace_memory(
-        &self,
-        official: &Value,
-        cpa: &Value,
-        direct: &[DirectModel],
-    ) -> Result<Value> {
-        let (catalog, routes) = self.build(official, cpa, direct)?;
+    pub fn replace_memory_from_cpa(&self, cpa: &Value) -> Result<Value> {
+        let _update = self.updates.lock().expect("catalog update lock poisoned");
+        let official = self
+            .state
+            .read()
+            .expect("catalog snapshot lock poisoned")
+            .official
+            .clone()
+            .context("official model catalog has not been validated yet")?;
+        let catalog = merge(&official, cpa)?;
+        let routes = route_table_from_merged(&catalog)?;
         let mut state = self.state.write().expect("catalog snapshot lock poisoned");
         state.snapshot = Some(Snapshot {
             catalog: catalog.clone(),
             routes,
+            complete: true,
         });
         Ok(catalog)
     }
 
-    fn build(
-        &self,
-        official: &Value,
-        cpa: &Value,
-        direct: &[DirectModel],
-    ) -> Result<(Value, RouteTable)> {
-        let mut catalog = merge(official, cpa)?;
-        merge_declared_direct(&mut catalog, direct)?;
-        if self.advertise_ultra {
-            advertise_ultra_all(&mut catalog)?;
-        }
+    /// The official-only view served while CPA is unavailable. It is never
+    /// persisted. Its routes are installed only when no complete view exists,
+    /// so official models work before CPA has ever answered, while a CPA
+    /// outage never removes the `cpa/` routes of the last complete view.
+    pub fn official_only(&self, official: &Value) -> Result<Value> {
+        let _update = self.updates.lock().expect("catalog update lock poisoned");
+        let catalog = prepare_official(official)?;
         let routes = route_table_from_merged(&catalog)?;
-        Ok((catalog, routes))
+        let mut state = self.state.write().expect("catalog snapshot lock poisoned");
+        state.official = Some(official.clone());
+        if state
+            .snapshot
+            .as_ref()
+            .is_none_or(|snapshot| !snapshot.complete)
+        {
+            state.snapshot = Some(Snapshot {
+                catalog: catalog.clone(),
+                routes,
+                complete: false,
+            });
+        }
+        Ok(catalog)
     }
+}
+
+fn load_snapshot(path: &std::path::Path) -> Result<Snapshot> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read catalog snapshot {}", path.display()))?;
+    if bytes.len() > MAX_CATALOG_BYTES {
+        bail!("catalog snapshot exceeds 16 MiB");
+    }
+    let mut catalog: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid catalog snapshot {}", path.display()))?;
+    hide_internal_models(&mut catalog)?;
+    Ok(Snapshot {
+        routes: route_table_from_merged(&catalog)?,
+        catalog,
+        complete: true,
+    })
 }
 
 fn official_catalog_from_merged(catalog: &Value) -> Result<Value> {
@@ -276,53 +243,22 @@ pub fn parse(bytes: &[u8], source: &str) -> Result<Value> {
     Ok(value)
 }
 
-/// Merge only the official catalog with declared direct-route models. Used
-/// when CPA is unreachable (or never installed) so Codex still gets a usable
-/// model list. The result is served but never persisted: a stored snapshot
-/// still requires both upstream catalogs to validate.
-pub fn merge_official_direct(official: &Value, direct: &[DirectModel]) -> Result<Value> {
-    validate_catalog(official).context("invalid official model catalog")?;
-    let mut output = official.clone();
-    merge_declared_direct(&mut output, direct)?;
-    Ok(output)
-}
-
-/// Degraded-view variant that also advertises the Codex-side `ultra` preset.
-pub fn merge_official_direct_with_ultra(official: &Value, direct: &[DirectModel]) -> Result<Value> {
-    let mut output = merge_official_direct(official, direct)?;
-    advertise_ultra_all(&mut output)?;
-    Ok(output)
-}
-
-/// Codex maps the `ultra` preset to a real model-supported effort before the
-/// request leaves the client, so advertising it only changes catalog metadata.
-fn advertise_ultra_all(catalog: &mut Value) -> Result<()> {
+/// Advertise the Codex-side `ultra` preset in a served catalog. Codex maps the
+/// preset to a real model-supported effort before the request leaves the
+/// client, so only models that already declare reasoning levels gain it; a
+/// model without levels keeps its upstream metadata untouched.
+pub fn advertise_ultra(catalog: &mut Value) -> Result<()> {
     for model in models_mut(catalog)? {
         let object = model
             .as_object_mut()
-            .context("merged catalog contains a non-object model")?;
-        let levels = object
-            .entry("supported_reasoning_levels")
-            .or_insert_with(|| json!([]));
-        let levels = levels
-            .as_array_mut()
-            .context("supported_reasoning_levels must be an array")?;
-        if levels.is_empty() {
-            for (effort, description) in [
-                ("low", "Fast responses with lighter reasoning"),
-                (
-                    "medium",
-                    "Balances speed and reasoning depth for everyday tasks",
-                ),
-                ("high", "Greater reasoning depth for complex problems"),
-                (
-                    "max",
-                    "Maximum available reasoning depth for complex problems",
-                ),
-            ] {
-                levels.push(json!({ "effort": effort, "description": description }));
-            }
-        }
+            .context("catalog contains a non-object model")?;
+        let Some(levels) = object
+            .get_mut("supported_reasoning_levels")
+            .and_then(Value::as_array_mut)
+            .filter(|levels| !levels.is_empty())
+        else {
+            continue;
+        };
         let has_ultra = levels.iter().any(|entry| {
             entry.get("effort").and_then(Value::as_str) == Some(ULTRA_REASONING_EFFORT)
         });
@@ -454,170 +390,18 @@ fn default_official_comp_hash(catalog: &Value) -> Result<Option<String>> {
     Ok(best.map(|(_, hash)| hash.to_owned()))
 }
 
-/// Official Codex client protocol flags that change the Responses request
-/// shape. `use_responses_lite` plus `tool_mode: code_mode_only` make Codex
-/// omit the `tools` array and speak an internal GPT-6 dialect. That is valid
-/// when a direct route actually proxies that official model; a third-party
-/// Codex-compatible API expects the public tools schema instead.
-const CODE_MODE_ONLY: &str = "code_mode_only";
-
-/// Metadata template for a synthesized direct-route entry.
-///
-/// Codex deserializes the whole model list into one strict struct, so a single
-/// entry missing a required field (`shell_type`, for example) makes the client
-/// discard the entire catalog and fall back to its built-in models. A declared
-/// model therefore copies a real upstream entry and overrides only identity,
-/// which also keeps it valid as the upstream schema grows.
-///
-/// The second return value is true when the template is the official/CPA
-/// entry for one of `slugs`. A fallback copy of an unrelated official model
-/// still supplies required fields, but must not advertise that model's
-/// private client protocol.
-fn direct_template(models: &[Value], slugs: &[&str]) -> Option<(Value, bool)> {
-    for slug in slugs {
-        if slug.is_empty() {
-            continue;
-        }
-        if let Some(model) = models.iter().find(|model| model_slug(model) == Some(*slug)) {
-            return Some((model.clone(), true));
-        }
-    }
-    let listed_official = models.iter().find(|model| {
-        model_slug(model).is_some_and(|slug| !slug.starts_with(CPA_MODEL_PREFIX))
-            && model.get("visibility").and_then(Value::as_str) != Some("hide")
-    });
-    listed_official
-        .or_else(|| models.first())
-        .cloned()
-        .map(|model| (model, false))
-}
-
-fn apply_declared_direct_metadata(
-    object: &mut serde_json::Map<String, Value>,
-    model: &DirectModel,
-) {
-    if let Some(window) = model.context_window {
-        object.insert("context_window".into(), json!(window));
-        if model.max_context_window.is_none() {
-            let current_max = object
-                .get("max_context_window")
-                .and_then(Value::as_u64)
-                .unwrap_or(window);
-            object.insert("max_context_window".into(), json!(window.max(current_max)));
-        }
-    }
-    if let Some(window) = model.max_context_window {
-        object.insert("max_context_window".into(), json!(window));
-    }
-    if let Some(name) = model
-        .display_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        object.insert("display_name".into(), json!(format!("{name} · Direct")));
-    }
-}
-
-fn classic_responses_protocol(model: &mut serde_json::Map<String, Value>) {
-    if model.contains_key("use_responses_lite") {
-        model.insert("use_responses_lite".into(), json!(false));
-    }
-    if model.get("tool_mode").and_then(Value::as_str) == Some(CODE_MODE_ONLY) {
-        model.remove("tool_mode");
-    }
-    if model.contains_key("prefer_websockets") {
-        model.insert("prefer_websockets".into(), json!(false));
-    }
-}
-
-/// Append direct-route model declarations to an already-merged catalog so
-/// declared models stay routable even when CPA's catalog omits them.
-fn merge_declared_direct(catalog: &mut Value, direct: &[DirectModel]) -> Result<()> {
-    if direct.is_empty() {
-        return Ok(());
-    }
-    let output_models = models_mut(catalog)?;
-    let mut known: HashSet<String> = output_models
-        .iter()
-        .filter_map(model_slug)
-        .map(str::to_owned)
-        .collect();
-    let max_priority = output_models
-        .iter()
-        .filter_map(|model| model.get("priority").and_then(Value::as_i64))
-        .max()
-        .unwrap_or(0);
-    let mut next_priority = max_priority.saturating_add(100);
-    for model in direct {
-        let local = format!("{CPA_MODEL_PREFIX}{}", model.upstream_model);
-        if let Some(existing) = output_models
-            .iter_mut()
-            .find(|entry| model_slug(entry) == Some(local.as_str()))
-        {
-            let object = existing
-                .as_object_mut()
-                .expect("merged catalog contains a non-object model");
-            object.insert(
-                "display_name".into(),
-                json!(format!("{} · Direct", model.upstream_model)),
-            );
-            apply_declared_direct_metadata(object, model);
-            continue;
-        }
-        if !known.insert(local.clone()) {
-            continue;
-        }
-        let (mut declared, copied_known_slug) = direct_template(
-            output_models,
-            &[model.native_model.as_str(), model.upstream_model.as_str()],
-        )
-        .unwrap_or_else(|| (json!({}), false));
-        let object = declared
-            .as_object_mut()
-            .context("catalog contains a non-object model")?;
-        if !copied_known_slug {
-            classic_responses_protocol(object);
-        }
-        object.insert("slug".into(), json!(local));
-        object.insert(
-            "display_name".into(),
-            json!(format!("{} · Direct", model.upstream_model)),
-        );
-        object.insert("priority".into(), json!(next_priority));
-        let visibility = if should_hide_from_picker(&model.upstream_model) {
-            "hide"
-        } else {
-            "list"
-        };
-        object.insert("visibility".into(), json!(visibility));
-        apply_declared_direct_metadata(object, model);
-        next_priority = next_priority.saturating_add(1);
-        output_models.push(declared);
-    }
-    Ok(())
-}
-
-pub fn merge(official: &Value, cpa: &Value) -> Result<Value> {
+/// Validate the official catalog for serving: slugs are unique, the `cpa/`
+/// namespace stays reserved, and internal review and image models are hidden
+/// from the picker without losing their routes.
+fn prepare_official(official: &Value) -> Result<Value> {
     validate_catalog(official).context("invalid official model catalog")?;
-    validate_catalog(cpa).context("invalid CPA model catalog")?;
-
     let mut output = official.clone();
-    let output_models = models_mut(&mut output)?;
-    let official_slugs: HashSet<String> = output_models
-        .iter()
-        .filter_map(model_slug)
-        .map(str::to_owned)
-        .collect();
-    if let Some(reserved) = official_slugs
-        .iter()
-        .find(|slug| slug.starts_with(CPA_MODEL_PREFIX))
-    {
-        bail!("official model catalog reserves CPA namespace slug {reserved}");
-    }
-    for model in output_models.iter_mut() {
+    for model in models_mut(&mut output)? {
         let slug = model_slug(model)
             .context("official model catalog contains a model without a nonempty slug")?;
+        if slug.starts_with(CPA_MODEL_PREFIX) {
+            bail!("official model catalog reserves CPA namespace slug {slug}");
+        }
         if should_hide_from_picker(slug) {
             model
                 .as_object_mut()
@@ -625,6 +409,13 @@ pub fn merge(official: &Value, cpa: &Value) -> Result<Value> {
                 .insert("visibility".into(), json!("hide"));
         }
     }
+    Ok(output)
+}
+
+pub fn merge(official: &Value, cpa: &Value) -> Result<Value> {
+    validate_catalog(cpa).context("invalid CPA model catalog")?;
+    let mut output = prepare_official(official)?;
+    let output_models = models_mut(&mut output)?;
     let max_priority = output_models
         .iter()
         .filter_map(|model| model.get("priority").and_then(Value::as_i64))
@@ -831,31 +622,6 @@ mod tests {
         assert!(routes.contains_key("cpa/codeapi-gpt-image-2"));
     }
 
-    #[test]
-    fn ultra_advertisement_applies_to_every_merged_entry_when_enabled() {
-        let root = tempdir().unwrap();
-        let path = root.path().join("catalog.json");
-        let store = CatalogStore::load_with_options(path.clone(), true).unwrap();
-        store
-            .replace(
-                &json!({"models":[{"slug":"gpt-5.6","priority":1,"supported_reasoning_levels":[{"effort":"high","description":"High"}]}]}),
-                &json!({"models":[{"slug":"deepseek","priority":1,"supported_reasoning_levels":[{"effort":"max","description":"Max"}]}]}),
-                &[DirectModel::new("direct-model", "https://direct.example/v1")],
-            )
-            .unwrap();
-        let catalog = store.current().unwrap();
-        let models = catalog["models"].as_array().unwrap();
-        for slug in ["gpt-5.6", "cpa/deepseek", "cpa/direct-model"] {
-            let model = models.iter().find(|model| model["slug"] == slug).unwrap();
-            let has_ultra = model["supported_reasoning_levels"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["effort"] == "ultra");
-            assert!(has_ultra, "{slug} did not advertise ultra");
-        }
-    }
-
     /// Codex compacts on the *previous* model whenever consecutive turns
     /// disagree about `comp_hash`, so every route must report the value Codex
     /// already uses for its default official model.
@@ -936,29 +702,6 @@ mod tests {
     }
 
     #[test]
-    fn ultra_advertisement_remains_off_by_default() {
-        let root = tempdir().unwrap();
-        let path = root.path().join("catalog.json");
-        let store = CatalogStore::load(path.clone()).unwrap();
-        store
-            .replace(
-                &json!({"models":[{"slug":"gpt-5.6","priority":1,"supported_reasoning_levels":[{"effort":"high","description":"High"}]}]}),
-                &json!({"models":[]}),
-                &[],
-            )
-            .unwrap();
-        let catalog = store.current().unwrap();
-        let model = &catalog["models"][0];
-        assert!(
-            !model["supported_reasoning_levels"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["effort"] == "ultra")
-        );
-    }
-
-    #[test]
     fn snapshot_restores_exact_routes_after_restart() {
         let root = tempdir().unwrap();
         let path = root.path().join("catalog.json");
@@ -967,7 +710,6 @@ mod tests {
             .replace(
                 &json!({"models":[{"slug":"gpt-5.6"}]}),
                 &json!({"models":[{"slug":"gpt-5.6"},{"slug":"claude"}]}),
-                &[],
             )
             .unwrap();
         drop(store);
@@ -992,16 +734,12 @@ mod tests {
             .replace(
                 &json!({"models":[{"slug":"gpt-5.6"}]}),
                 &json!({"models":[{"slug":"claude"}]}),
-                &[],
             )
             .unwrap();
         let persisted = std::fs::read(&path).unwrap();
 
         let refreshed = store
-            .replace_memory_from_cpa(
-                &json!({"models":[{"slug":"claude"},{"slug":"gemini"}]}),
-                &[],
-            )
+            .replace_memory_from_cpa(&json!({"models":[{"slug":"claude"},{"slug":"gemini"}]}))
             .unwrap();
         assert_eq!(refreshed["models"].as_array().unwrap().len(), 3);
         assert_eq!(
@@ -1029,310 +767,6 @@ mod tests {
     }
 
     #[test]
-    fn declared_direct_models_merge_into_the_stored_catalog() {
-        let root = tempdir().unwrap();
-        let path = root.path().join("catalog.json");
-        let store = CatalogStore::load(path.clone()).unwrap();
-        store
-            .replace(
-                &json!({"models":[{"slug":"gpt-5.6","priority":3}]}),
-                &json!({"models":[]}),
-                &[DirectModel::new("gpt-5.6-sol", "https://direct.example/v1")],
-            )
-            .unwrap();
-        assert_eq!(
-            store.resolve("cpa/gpt-5.6-sol").unwrap(),
-            CatalogRoute::Cpa {
-                upstream_model: "gpt-5.6-sol".into()
-            }
-        );
-        let catalog = store.current().unwrap();
-        let merged = catalog["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["slug"] == "cpa/gpt-5.6-sol")
-            .unwrap();
-        assert_eq!(merged["display_name"], "gpt-5.6-sol · Direct");
-        // A direct route overrides the CPA display name while preserving metadata.
-        drop(store);
-        let store = CatalogStore::load(path).unwrap();
-        store
-            .replace(
-                &json!({"models":[]}),
-                &json!({"models":[{"slug":"gpt-5.6-sol","display_name":"Sol","context_window":200_000}]}),
-                &[DirectModel::new("gpt-5.6-sol", "https://direct.example/v1")],
-            )
-            .unwrap();
-        let catalog = store.current().unwrap();
-        let from_cpa = catalog["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["slug"] == "cpa/gpt-5.6-sol")
-            .unwrap();
-        assert_eq!(from_cpa["display_name"], "gpt-5.6-sol · Direct");
-        assert_eq!(from_cpa["context_window"], 200_000);
-    }
-
-    /// Codex parses the model list into one strict struct: an entry missing a
-    /// required field makes the client discard the whole catalog and show only
-    /// its built-in models. Declared direct models must therefore carry every
-    /// field of the entry they were modelled on.
-    #[test]
-    fn synthesized_direct_models_keep_every_template_field() {
-        let official = json!({"models":[{
-            "slug":"gpt-5.6", "display_name":"5.6", "priority":3,
-            "shell_type":"shell_command", "context_window":400_000,
-            "base_instructions":"official instructions", "visibility":"list",
-            "model_messages":{"limit":"stop"}, "truncation_policy":"auto"
-        }]});
-        let direct = [DirectModel::new(
-            "sol-only-on-direct",
-            "https://direct.example/v1",
-        )];
-
-        for merged in [
-            merge_official_direct(&official, &direct).unwrap(),
-            merge(&official, &json!({"models":[]}))
-                .map(|mut catalog| {
-                    merge_declared_direct(&mut catalog, &direct).unwrap();
-                    catalog
-                })
-                .unwrap(),
-        ] {
-            let models = merged["models"].as_array().unwrap();
-            let template = models
-                .iter()
-                .find(|model| model["slug"] == "gpt-5.6")
-                .unwrap();
-            let declared = models
-                .iter()
-                .find(|model| model["slug"] == "cpa/sol-only-on-direct")
-                .unwrap();
-            for field in template.as_object().unwrap().keys() {
-                assert!(
-                    declared.get(field).is_some(),
-                    "declared direct model dropped {field}"
-                );
-            }
-            assert_eq!(declared["shell_type"], "shell_command");
-            assert_eq!(declared["context_window"], 400_000);
-            assert_eq!(declared["display_name"], "sol-only-on-direct · Direct");
-            assert_eq!(declared["visibility"], "list");
-            assert_eq!(declared["priority"], 103);
-        }
-    }
-
-    #[test]
-    fn synthesized_direct_models_prefer_the_matching_official_metadata() {
-        let official = json!({"models":[
-            {"slug":"gpt-reserve", "visibility":"hide", "shell_type":"shell_command",
-             "context_window":100, "priority":1},
-            {"slug":"gpt-5.6-sol", "visibility":"list", "shell_type":"local_shell",
-             "context_window":999_999, "description":"Sol", "priority":2}
-        ]});
-        let direct = [DirectModel::new("gpt-5.6-sol", "https://direct.example/v1")];
-
-        let merged = merge_official_direct(&official, &direct).unwrap();
-        let declared = merged["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["slug"] == "cpa/gpt-5.6-sol")
-            .unwrap();
-        // The same-named official entry wins over the first visible model, so a
-        // direct route advertises the metadata of the model it actually proxies.
-        assert_eq!(declared["shell_type"], "local_shell");
-        assert_eq!(declared["context_window"], 999_999);
-        assert_eq!(declared["description"], "Sol");
-    }
-
-    #[test]
-    fn synthesized_direct_models_keep_official_client_protocol_when_slug_matches() {
-        let official = json!({"models":[{
-            "slug":"gpt-5.6-sol", "visibility":"list", "shell_type":"shell_command",
-            "use_responses_lite": true, "tool_mode": "code_mode_only",
-            "prefer_websockets": true, "priority": 2
-        }]});
-        let merged = merge_official_direct(
-            &official,
-            &[DirectModel::new("gpt-5.6-sol", "https://direct.example/v1")],
-        )
-        .unwrap();
-        let declared = merged["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["slug"] == "cpa/gpt-5.6-sol")
-            .unwrap();
-        assert_eq!(declared["use_responses_lite"], true);
-        assert_eq!(declared["tool_mode"], "code_mode_only");
-        assert_eq!(declared["prefer_websockets"], true);
-    }
-
-    #[test]
-    fn synthesized_direct_models_copy_alias_target_official_protocol() {
-        let official = json!({"models":[{
-            "slug":"gpt-5.6-luna", "visibility":"list", "shell_type":"shell_command",
-            "use_responses_lite": true, "tool_mode": "code_mode_only",
-            "description": "Luna", "priority": 2
-        }]});
-        let mut direct = DirectModel::new("lxns-gpt-5.6-luna", "https://direct.example/v1");
-        direct.native_model = "gpt-5.6-luna".into();
-        let merged = merge_official_direct(&official, &[direct]).unwrap();
-        let declared = merged["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["slug"] == "cpa/lxns-gpt-5.6-luna")
-            .unwrap();
-        assert_eq!(declared["use_responses_lite"], true);
-        assert_eq!(declared["tool_mode"], "code_mode_only");
-        assert_eq!(declared["description"], "Luna");
-    }
-
-    #[test]
-    fn synthesized_unmatched_direct_models_use_classic_responses_protocol() {
-        let official = json!({"models":[{
-            "slug":"gpt-6-astra", "visibility":"list", "shell_type":"shell_command",
-            "use_responses_lite": true, "tool_mode": "code_mode_only",
-            "prefer_websockets": true, "description": "Astra",
-            "context_window": 272000, "priority": 1
-        }]});
-        let merged = merge_official_direct(
-            &official,
-            &[DirectModel::new(
-                "deepseek-v4-flash-vision-exp",
-                "https://api.deepseek.com",
-            )],
-        )
-        .unwrap();
-        let declared = merged["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["slug"] == "cpa/deepseek-v4-flash-vision-exp")
-            .unwrap();
-        assert_eq!(declared["use_responses_lite"], false);
-        assert!(declared.get("tool_mode").is_none());
-        assert_eq!(declared["prefer_websockets"], false);
-        assert_eq!(declared["shell_type"], "shell_command");
-        assert_eq!(declared["context_window"], 272000);
-        assert_eq!(
-            declared["display_name"],
-            "deepseek-v4-flash-vision-exp · Direct"
-        );
-    }
-
-    #[test]
-    fn synthesized_direct_models_apply_declared_context_metadata() {
-        let official = json!({"models":[{
-            "slug":"gpt-6-astra", "visibility":"list", "shell_type":"shell_command",
-            "context_window": 272000, "max_context_window": 872000, "priority": 1
-        }]});
-        let mut direct =
-            DirectModel::new("deepseek-v4-flash-vision-exp", "https://api.deepseek.com");
-        direct.context_window = Some(1_000_000);
-        direct.display_name = Some("DeepSeek V4 Flash".into());
-        let merged = merge_official_direct(&official, &[direct]).unwrap();
-        let declared = merged["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["slug"] == "cpa/deepseek-v4-flash-vision-exp")
-            .unwrap();
-        assert_eq!(declared["context_window"], 1_000_000);
-        assert_eq!(declared["max_context_window"], 1_000_000);
-        assert_eq!(declared["display_name"], "DeepSeek V4 Flash · Direct");
-        assert_eq!(declared["shell_type"], "shell_command");
-    }
-
-    /// A hidden template must not hide the declared model, and a declared
-    /// auto-review override stays hidden from the picker.
-    #[test]
-    fn synthesized_direct_models_normalize_visibility() {
-        let official = json!({"models":[
-            {"slug":"gpt-reserve", "visibility":"hide", "shell_type":"shell_command"}
-        ]});
-        let direct = [
-            DirectModel::new("custom", "https://direct.example/v1"),
-            DirectModel::new(AUTO_REVIEW_MODEL, "https://direct.example/v1"),
-        ];
-
-        let merged = merge_official_direct(&official, &direct).unwrap();
-        let models = merged["models"].as_array().unwrap();
-        let visibility = |slug: &str| {
-            models.iter().find(|model| model["slug"] == slug).unwrap()["visibility"].clone()
-        };
-        assert_eq!(visibility("cpa/custom"), "list");
-        assert_eq!(visibility(&format!("cpa/{AUTO_REVIEW_MODEL}")), "hide");
-    }
-
-    #[test]
-    fn merge_official_direct_serves_without_cpa_and_respects_declarations() {
-        let official = json!({"models":[{"slug":"gpt-5.6","priority":1}]});
-        let direct = [DirectModel::new("gpt-5.6-sol", "https://direct.example/v1")];
-        let merged = merge_official_direct(&official, &direct).unwrap();
-        let slugs: Vec<&str> = merged["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|model| model["slug"].as_str().unwrap())
-            .collect();
-        assert_eq!(slugs, vec!["gpt-5.6", "cpa/gpt-5.6-sol"]);
-        let routes = route_table_from_merged(&merged).unwrap();
-        assert_eq!(routes["gpt-5.6"], CatalogRoute::Official);
-        assert_eq!(
-            routes["cpa/gpt-5.6-sol"],
-            CatalogRoute::Cpa {
-                upstream_model: "gpt-5.6-sol".into()
-            }
-        );
-    }
-
-    #[test]
-    fn resolve_with_direct_falls_back_when_no_snapshot_exists() {
-        let root = tempdir().unwrap();
-        let store = CatalogStore::load(root.path().join("catalog.json")).unwrap();
-        let direct = [DirectModel::new("gpt-5.6-sol", "https://direct.example/v1")];
-        assert!(store.resolve("cpa/gpt-5.6-sol").is_err());
-        assert_eq!(
-            store
-                .resolve_with_direct("cpa/gpt-5.6-sol", &direct)
-                .unwrap(),
-            CatalogRoute::Cpa {
-                upstream_model: "gpt-5.6-sol".into()
-            }
-        );
-        assert!(store.resolve_with_direct("cpa/other", &direct).is_err());
-        assert!(store.resolve_with_direct("gpt-5.6", &direct).is_err());
-    }
-
-    #[test]
-    fn resolve_with_direct_prefers_a_stored_snapshot() {
-        let root = tempdir().unwrap();
-        let path = root.path().join("catalog.json");
-        let store = CatalogStore::load(path.clone()).unwrap();
-        store
-            .replace(
-                &json!({"models":[]}),
-                &json!({"models":[{"slug":"declared"}]}),
-                &[DirectModel::new("declared", "https://direct.example/v1")],
-            )
-            .unwrap();
-        let direct = [DirectModel::new("declared", "https://other.example/v1")];
-        // The snapshot already routes cpa/declared; the fallback never wins.
-        assert_eq!(
-            store.resolve_with_direct("cpa/declared", &direct).unwrap(),
-            CatalogRoute::Cpa {
-                upstream_model: "declared".into()
-            }
-        );
-        assert!(store.resolve_with_direct("cpa/absent", &direct).is_err());
-    }
-
-    #[test]
     fn cpa_model_omission_drops_the_model_immediately() {
         let root = tempdir().unwrap();
         let path = root.path().join("catalog.json");
@@ -1343,13 +777,12 @@ mod tests {
                 &json!({"models":[{
                     "slug":"glm-5.3-uni", "display_name":"GLM 5.3 Uni"
                 }]}),
-                &[],
             )
             .unwrap();
         assert!(store.resolve("cpa/glm-5.3-uni").is_ok());
 
         let after_omission = store
-            .replace(&json!({"models":[]}), &json!({"models":[]}), &[])
+            .replace(&json!({"models":[]}), &json!({"models":[]}))
             .unwrap();
         assert!(
             after_omission["models"]
@@ -1359,5 +792,169 @@ mod tests {
                 .all(|model| model["slug"] != "cpa/glm-5.3-uni")
         );
         assert!(store.resolve("cpa/glm-5.3-uni").is_err());
+    }
+
+    #[test]
+    fn official_only_view_keeps_the_complete_routes_during_a_cpa_outage() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("catalog.json");
+        let store = CatalogStore::load(path.clone()).unwrap();
+        store
+            .replace(
+                &json!({"models":[{"slug":"gpt-5.6"}]}),
+                &json!({"models":[{"slug":"claude"}]}),
+            )
+            .unwrap();
+        let persisted = std::fs::read(&path).unwrap();
+
+        let served = store
+            .official_only(&json!({"models":[{"slug":"gpt-5.6"},{"slug":"gpt-5.7"}]}))
+            .unwrap();
+        let slugs: Vec<_> = served["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["slug"].as_str().unwrap())
+            .collect();
+        assert_eq!(slugs, ["gpt-5.6", "gpt-5.7"]);
+        assert_eq!(
+            store.resolve("cpa/claude").unwrap(),
+            CatalogRoute::Cpa {
+                upstream_model: "claude".into()
+            }
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), persisted);
+    }
+
+    #[test]
+    fn official_only_view_is_routable_before_any_complete_catalog() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("catalog.json");
+        let store = CatalogStore::load(path.clone()).unwrap();
+        store
+            .official_only(&json!({"models":[
+                {"slug":"gpt-5.6"},
+                {"slug":"codex-auto-review", "visibility":"list"}
+            ]}))
+            .unwrap();
+        assert_eq!(store.resolve("gpt-5.6").unwrap(), CatalogRoute::Official);
+        assert_eq!(
+            store.resolve(AUTO_REVIEW_MODEL).unwrap(),
+            CatalogRoute::AutoReview
+        );
+        assert_eq!(store.current().unwrap()["models"][1]["visibility"], "hide");
+        assert!(
+            !path.exists(),
+            "the official-only view must not be persisted"
+        );
+
+        // A later official-only refresh replaces an earlier official-only view.
+        store
+            .official_only(&json!({"models":[{"slug":"gpt-5.7"}]}))
+            .unwrap();
+        assert!(store.resolve("gpt-5.6").is_err());
+        assert_eq!(store.resolve("gpt-5.7").unwrap(), CatalogRoute::Official);
+
+        // The first complete catalog replaces the official-only view.
+        store
+            .replace(
+                &json!({"models":[{"slug":"gpt-5.7"}]}),
+                &json!({"models":[{"slug":"claude"}]}),
+            )
+            .unwrap();
+        assert!(store.resolve("cpa/claude").is_ok());
+    }
+
+    #[test]
+    fn official_only_view_reserves_the_cpa_namespace() {
+        let root = tempdir().unwrap();
+        let store = CatalogStore::load(root.path().join("catalog.json")).unwrap();
+        let error = store
+            .official_only(&json!({"models":[{"slug":"cpa/claude"}]}))
+            .unwrap_err();
+        assert!(error.to_string().contains("reserves CPA namespace"));
+        assert!(store.current().is_none());
+    }
+
+    #[test]
+    fn ultra_is_served_only_for_models_with_reasoning_levels() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("catalog.json");
+        let store = CatalogStore::load(path.clone()).unwrap();
+        let catalog = store
+            .replace(
+                &json!({"models":[{"slug":"gpt-5.6","supported_reasoning_levels":[{"effort":"high","description":"High"}]}]}),
+                &json!({"models":[{"slug":"plain"},{"slug":"empty","supported_reasoning_levels":[]}]}),
+            )
+            .unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !persisted.contains("ultra"),
+            "ultra leaked into the snapshot"
+        );
+
+        let mut served = catalog;
+        advertise_ultra(&mut served).unwrap();
+        advertise_ultra(&mut served).unwrap();
+        let levels = |slug: &str| {
+            served["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["slug"] == slug)
+                .unwrap()
+                .get("supported_reasoning_levels")
+                .cloned()
+        };
+        let official = levels("gpt-5.6").unwrap();
+        assert_eq!(
+            official
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["effort"] == "ultra")
+                .count(),
+            1
+        );
+        assert_eq!(levels("cpa/plain"), None);
+        assert_eq!(levels("cpa/empty"), Some(json!([])));
+    }
+
+    #[test]
+    fn unreadable_snapshot_is_ignored_instead_of_blocking_startup() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("catalog.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        let store = CatalogStore::load(path.clone()).unwrap();
+        assert!(store.current().is_none());
+        assert!(!store.has_validated_official());
+
+        store
+            .replace(
+                &json!({"models":[{"slug":"gpt-5.6"}]}),
+                &json!({"models":[{"slug":"claude"}]}),
+            )
+            .unwrap();
+        assert!(
+            CatalogStore::load(path)
+                .unwrap()
+                .resolve("cpa/claude")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn unchanged_catalog_is_not_rewritten() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("catalog.json");
+        let store = CatalogStore::load(path.clone()).unwrap();
+        let official = json!({"models":[{"slug":"gpt-5.6"}]});
+        let cpa = json!({"models":[{"slug":"claude"}]});
+        store.replace(&official, &cpa).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        store.replace(&official, &cpa).unwrap();
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after);
     }
 }

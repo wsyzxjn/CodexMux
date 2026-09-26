@@ -2,8 +2,12 @@ use std::{
     ffi::CString,
     fs,
     io::{Read, Write},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -203,4 +207,139 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
     sync_parent(parent);
     Ok(())
+}
+
+/// Atomically replace `path` with a file only its owner can read.
+///
+/// The temporary file is created with mode 0600 before any byte is written,
+/// so private content is never readable by other users, not even briefly. It
+/// is synced, renamed over `path`, and the directory entry is synced.
+pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut temporary = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o600))
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create a temporary file in {}", parent.display()))?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to atomically replace {}", path.display()))?;
+    sync_parent(parent);
+    Ok(())
+}
+
+/// An exclusive advisory lock on a sidecar file, released when dropped.
+#[derive(Debug)]
+pub struct FileLock {
+    _file: fs::File,
+}
+
+fn open_lock_file(path: &Path) -> Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to open lock file {}", path.display()))
+}
+
+/// Block until this process holds the exclusive lock on `path`.
+pub fn lock_exclusive(path: &Path) -> Result<FileLock> {
+    let file = open_lock_file(path)?;
+    file.lock()
+        .with_context(|| format!("failed to lock {}", path.display()))?;
+    Ok(FileLock { _file: file })
+}
+
+/// Take the exclusive lock on `path`, polling for at most `timeout`.
+/// Returns `None` when another holder still has it at the deadline.
+pub fn try_lock_exclusive_for(
+    path: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<Option<FileLock>> {
+    let file = open_lock_file(path)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(FileLock { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                std::thread::sleep(poll_interval);
+            }
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("failed to lock {}", path.display()));
+            }
+        }
+    }
+}
+
+/// Seconds since the Unix epoch. A clock before 1970 reads as zero.
+pub fn unix_time_secs() -> i64 {
+    unix_time_nanos().div_euclid(1_000_000_000) as i64
+}
+
+/// Nanoseconds since the Unix epoch. A clock before 1970 reads as zero.
+pub fn unix_time_nanos() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as i128)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_writes_replace_wider_permissions_with_0600() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nested/secret.json");
+        atomic_write_private(&path, b"first").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_private(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn timed_lock_gives_up_while_another_holder_keeps_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state/op.lock");
+        let held = lock_exclusive(&path).unwrap();
+        let contended =
+            try_lock_exclusive_for(&path, Duration::from_millis(30), Duration::from_millis(5))
+                .unwrap();
+        assert!(contended.is_none());
+
+        drop(held);
+        let acquired =
+            try_lock_exclusive_for(&path, Duration::from_millis(30), Duration::from_millis(5))
+                .unwrap();
+        assert!(acquired.is_some());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }

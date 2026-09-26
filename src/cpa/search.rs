@@ -1,3 +1,15 @@
+use std::{collections::BTreeMap, fs, path::Path, time::Duration};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use super::config_path;
+use crate::{
+    catalog::{AUTO_REVIEW_MODEL, CatalogStore},
+    config::{CPA_MODEL_PREFIX, Credentials, Paths, Settings},
+    fsutil::atomic_write,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchCapabilityStatus {
@@ -71,44 +83,37 @@ pub fn load_search_capabilities(path: &Path) -> Result<SearchCapabilityStore> {
     serde_json::from_slice(&bytes).context("invalid search capabilities cache")
 }
 
-pub fn save_search_capabilities(
-    path: &Path,
-    store: &SearchCapabilityStore,
-) -> Result<()> {
+fn save_search_capabilities(path: &Path, store: &SearchCapabilityStore) -> Result<()> {
     atomic_write(
         path,
         &serde_json::to_vec_pretty(store).context("serialize search capabilities")?,
     )
 }
 
-pub fn record_search_capability(
-    path: &Path,
-    slug: &str,
-    status: SearchCapabilityStatus,
-) -> Result<()> {
-    let mut store = load_search_capabilities(path)?;
-    store.apply(
-        slug,
-        status,
-        time::OffsetDateTime::now_utc().unix_timestamp(),
-    );
-    save_search_capabilities(path, &store)
-}
-
-pub fn catalog_slugs(paths: &Paths) -> Result<Vec<String>> {
-    let store = crate::catalog::CatalogStore::load(paths.catalog.clone())?;
-    let catalog = store
-        .current()
-        .context("model catalog snapshot has not been built yet")?;
+/// Slugs of the persisted merged catalog in served order, or `None` before
+/// the first complete refresh. A snapshot that exists but cannot be read is
+/// an error.
+pub fn catalog_slugs(paths: &Paths) -> Result<Option<Vec<String>>> {
+    let store = CatalogStore::load(paths.catalog.clone())?;
+    let Some(catalog) = store.current() else {
+        anyhow::ensure!(
+            !paths.catalog.exists(),
+            "model catalog snapshot {} is unreadable",
+            paths.catalog.display()
+        );
+        return Ok(None);
+    };
     let models = catalog
         .get("models")
         .and_then(serde_json::Value::as_array)
         .context("model catalog has no models array")?;
-    Ok(models
-        .iter()
-        .filter_map(|model| model.get("slug").and_then(serde_json::Value::as_str))
-        .map(str::to_owned)
-        .collect())
+    Ok(Some(
+        models
+            .iter()
+            .filter_map(|model| model.get("slug").and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+            .collect(),
+    ))
 }
 
 pub fn detect_search_capabilities(
@@ -121,30 +126,29 @@ pub fn detect_search_capabilities(
         "--verify requires --model to avoid probing every provider"
     );
     enum Detector {
-        Verify(crate::config::Settings, crate::config::Credentials),
+        Verify(Settings, Credentials),
         Quick(QuickDetect),
     }
     let detector = if verify {
         Detector::Verify(
-            crate::config::Settings::load(&paths.settings)?,
+            Settings::load(&paths.settings)?,
             crate::secrets::load(&paths.credentials)?,
         )
     } else {
         Detector::Quick(QuickDetect::load(paths))
     };
     let mut store = load_search_capabilities(&paths.search_capabilities)?;
-    let checked_at = time::OffsetDateTime::now_utc().unix_timestamp();
+    let checked_at = crate::fsutil::unix_time_secs();
     let mut results = Vec::new();
-    for slug in catalog_slugs(paths)? {
+    let slugs = catalog_slugs(paths)?.context("model catalog snapshot has not been built yet")?;
+    for slug in slugs {
         if let Some(only) = only
             && !only.eq_ignore_ascii_case(&slug)
         {
             continue;
         }
         let status = match &detector {
-            Detector::Verify(settings, credentials) => {
-                verify_one(paths, settings, credentials, &slug)
-            }
+            Detector::Verify(settings, credentials) => verify_one(settings, credentials, &slug),
             Detector::Quick(quick) => quick.capability(&slug),
         };
         store.apply(&slug, status, checked_at);
@@ -155,24 +159,19 @@ pub fn detect_search_capabilities(
 }
 
 fn verify_one(
-    paths: &Paths,
-    settings: &crate::config::Settings,
-    credentials: &crate::config::Credentials,
+    settings: &Settings,
+    credentials: &Credentials,
     slug: &str,
 ) -> SearchCapabilityStatus {
-    if slug == crate::catalog::AUTO_REVIEW_MODEL {
+    if slug == AUTO_REVIEW_MODEL {
         // The proxy refuses codex-auto-review as a shared search backend.
         return SearchCapabilityStatus::Unsupported;
     }
-    let Some(upstream) = slug.strip_prefix(crate::config::CPA_MODEL_PREFIX) else {
+    let Some(upstream) = slug.strip_prefix(CPA_MODEL_PREFIX) else {
         // Official models search natively on the official route; the CLI
         // holds no ChatGPT OAuth, so there is nothing it could probe.
         return SearchCapabilityStatus::Verified;
     };
-    let direct = crate::cpa::direct_route_for(&paths.cpa_profiles, upstream);
-    if direct.ok().flatten().is_some() {
-        return SearchCapabilityStatus::Unknown;
-    }
     match probe_via_cpa(settings, credentials, upstream) {
         Ok(status) => status,
         Err(_) => SearchCapabilityStatus::Error,
@@ -182,39 +181,28 @@ fn verify_one(
 /// Inputs for quick capability detection, loaded once per detection run
 /// instead of once per catalog slug.
 struct QuickDetect {
-    direct_models: HashSet<String>,
     config: Option<CpaConfig>,
 }
 
 impl QuickDetect {
     fn load(paths: &Paths) -> Self {
-        let direct_models = crate::cpa::declared_direct_models(&paths.cpa_profiles)
-            .into_iter()
-            .map(|model| model.upstream_model)
-            .collect();
-        let config = fs::read_to_string(crate::cpa::config_path(paths))
+        let config = fs::read_to_string(config_path(paths))
             .ok()
             .and_then(|text| serde_yaml::from_str::<CpaConfig>(&text).ok());
-        Self {
-            direct_models,
-            config,
-        }
+        Self { config }
     }
 
     /// Local heuristic only, with no network traffic. `Supported` means the
     /// provider family is expected to accept `web_search`; run
     /// `search-detect --model <slug> --verify` for real confirmation.
     fn capability(&self, slug: &str) -> SearchCapabilityStatus {
-        if slug == crate::catalog::AUTO_REVIEW_MODEL {
+        if slug == AUTO_REVIEW_MODEL {
             // The proxy refuses codex-auto-review as a shared search backend.
             return SearchCapabilityStatus::Unsupported;
         }
-        let Some(upstream) = slug.strip_prefix(crate::config::CPA_MODEL_PREFIX) else {
+        let Some(upstream) = slug.strip_prefix(CPA_MODEL_PREFIX) else {
             return SearchCapabilityStatus::Verified;
         };
-        if self.direct_models.contains(upstream) {
-            return SearchCapabilityStatus::Unknown;
-        }
         let lower = upstream.to_lowercase();
         if lower.starts_with("claude-") || lower.contains("gemini") || lower.starts_with("grok") {
             return SearchCapabilityStatus::Supported;
@@ -226,7 +214,10 @@ impl QuickDetect {
             .claude
             .iter()
             .any(|provider| provider.has_model(upstream))
-            || config.xai.iter().any(|provider| provider.has_model(upstream))
+            || config
+                .xai
+                .iter()
+                .any(|provider| provider.has_model(upstream))
             || config
                 .gemini
                 .iter()
@@ -277,8 +268,8 @@ impl ProviderConfig {
 }
 
 fn probe_via_cpa(
-    settings: &crate::config::Settings,
-    credentials: &crate::config::Credentials,
+    settings: &Settings,
+    credentials: &Credentials,
     upstream_model: &str,
 ) -> Result<SearchCapabilityStatus> {
     let url = format!("{}/responses", settings.cpa.base_url.trim_end_matches('/'));
@@ -327,4 +318,134 @@ fn classify_search_probe(http_status: u16, body: &str) -> SearchCapabilityStatus
         return SearchCapabilityStatus::Unsupported;
     }
     SearchCapabilityStatus::Error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpa::test_support::test_root;
+
+    #[test]
+    fn search_capability_cache_round_trips() {
+        let root = test_root();
+        let path = &root.paths.search_capabilities;
+        assert!(load_search_capabilities(path).unwrap().entries.is_empty());
+        let mut store = SearchCapabilityStore::default();
+        store.apply("gpt-5.6-sol", SearchCapabilityStatus::Verified, 1);
+        store.apply("cpa/deepseek", SearchCapabilityStatus::Unsupported, 2);
+        save_search_capabilities(path, &store).unwrap();
+
+        let store = load_search_capabilities(path).unwrap();
+        assert_eq!(
+            store.status("gpt-5.6-sol"),
+            Some(SearchCapabilityStatus::Verified)
+        );
+        assert_eq!(
+            store.status("cpa/deepseek"),
+            Some(SearchCapabilityStatus::Unsupported)
+        );
+    }
+
+    #[test]
+    fn catalog_slugs_follow_the_snapshot_and_report_unreadable_ones() {
+        let root = test_root();
+        let paths = &root.paths;
+        assert_eq!(catalog_slugs(paths).unwrap(), None);
+
+        CatalogStore::load(paths.catalog.clone())
+            .unwrap()
+            .replace(
+                &serde_json::json!({"models": [{"slug": "gpt-5.6-sol"}]}),
+                &serde_json::json!({"models": [{"slug": "glm-5.3"}]}),
+            )
+            .unwrap();
+        let slugs = catalog_slugs(paths).unwrap().unwrap();
+        assert!(slugs.contains(&"gpt-5.6-sol".to_owned()));
+        assert!(slugs.contains(&"cpa/glm-5.3".to_owned()));
+
+        fs::write(&paths.catalog, b"{").unwrap();
+        assert!(catalog_slugs(paths).is_err());
+    }
+
+    #[test]
+    fn search_probe_classification() {
+        assert_eq!(
+            classify_search_probe(200, r#"{"output":[{"type":"web_search_call"}]}"#),
+            SearchCapabilityStatus::Verified
+        );
+        assert_eq!(
+            classify_search_probe(200, "{}"),
+            SearchCapabilityStatus::Supported
+        );
+        assert_eq!(
+            classify_search_probe(400, "unsupported web_search"),
+            SearchCapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            classify_search_probe(400, "tool type not supported"),
+            SearchCapabilityStatus::Unsupported
+        );
+        // A 4xx that merely mentions an unsupported parameter is not a tool
+        // rejection.
+        assert_eq!(
+            classify_search_probe(400, "Unsupported parameter: 'stream'"),
+            SearchCapabilityStatus::Error
+        );
+        assert_eq!(
+            classify_search_probe(401, "auth"),
+            SearchCapabilityStatus::Error
+        );
+    }
+
+    #[test]
+    fn failed_probes_never_erase_prior_capability_knowledge() {
+        let mut store = SearchCapabilityStore::default();
+        store.apply("model", SearchCapabilityStatus::Supported, 1);
+        store.apply("model", SearchCapabilityStatus::Error, 2);
+        let entry = store.entries.get("model").unwrap();
+        assert_eq!(entry.status, SearchCapabilityStatus::Supported);
+        assert_eq!(entry.checked_at, 1);
+
+        // Real knowledge changes still overwrite.
+        store.apply("model", SearchCapabilityStatus::Unsupported, 3);
+        assert_eq!(
+            store.status("model"),
+            Some(SearchCapabilityStatus::Unsupported)
+        );
+
+        // Errors land on empty, unknown, or already-failed entries.
+        store.apply("fresh", SearchCapabilityStatus::Error, 4);
+        assert_eq!(store.status("fresh"), Some(SearchCapabilityStatus::Error));
+        store.apply("unknown", SearchCapabilityStatus::Unknown, 5);
+        store.apply("unknown", SearchCapabilityStatus::Error, 6);
+        assert_eq!(store.status("unknown"), Some(SearchCapabilityStatus::Error));
+    }
+
+    #[test]
+    fn quick_search_capability_is_local_and_non_aborting() {
+        let root = test_root();
+        let quick = QuickDetect::load(&root.paths);
+        assert_eq!(
+            quick.capability("gpt-5.6-sol"),
+            SearchCapabilityStatus::Verified
+        );
+        assert_eq!(
+            quick.capability("cpa/claude-opus-5"),
+            SearchCapabilityStatus::Supported
+        );
+        assert_eq!(
+            quick.capability("cpa/gpt-5.6-sol"),
+            SearchCapabilityStatus::Unknown
+        );
+        assert_eq!(
+            quick.capability("cpa/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"),
+            SearchCapabilityStatus::Unknown
+        );
+        // The proxy refuses codex-auto-review as a shared search backend, so
+        // detection must not advertise it.
+        assert_eq!(
+            quick.capability(AUTO_REVIEW_MODEL),
+            SearchCapabilityStatus::Unsupported
+        );
+    }
 }

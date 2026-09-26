@@ -34,6 +34,9 @@ if [[ ! -x "$cli_binary" ]]; then
   exit 1
 fi
 
+# Assemble from scratch so files from an earlier build never end up sealed
+# into the signed bundle.
+rm -rf "$app_dir"
 mkdir -p "$contents_dir/MacOS" "$contents_dir/Resources"
 install -m 755 "$binary_dir/CodexMux" "$contents_dir/MacOS/CodexMux"
 install -m 755 "$cli_binary" "$contents_dir/Resources/codexmux"

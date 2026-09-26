@@ -1,10 +1,10 @@
 use std::{
-    fs,
+    fmt, fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::fsutil::atomic_write;
@@ -105,8 +105,10 @@ fn default_true() -> bool {
 
 impl Settings {
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        let settings: Self = toml::from_slice(&bytes).context("invalid CodexMux config.toml")?;
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let settings: Self =
+            toml::from_str(&text).map_err(|error| toml_parse_error(path, &text, &error))?;
         settings.validate()?;
         Ok(settings)
     }
@@ -236,31 +238,26 @@ impl Cpa {
         Ok(url)
     }
 
-    /// Origin the management UI should call for `/v0/management`.
-    pub fn management_api_base(&self) -> Result<String> {
-        let mut base = self.management_url()?;
-        let path = base
-            .path()
-            .trim_end_matches("/management.html")
-            .trim_end_matches('/')
-            .to_owned();
-        base.set_query(None);
-        base.set_fragment(None);
-        base.set_path(if path.is_empty() { "/" } else { &path });
-        Ok(base.as_str().trim_end_matches('/').to_owned())
-    }
-
-    /// Loopback management URL with login query so the bundled Web UI can
-    /// auto-fill the current endpoint and management key. Remote endpoints
-    /// keep a bare page URL; CodexMux must not put their key in a query.
+    /// Local management page URL that signs the bundled Web UI in.
+    ///
+    /// The key travels only in the fragment (`#cmk=`), which browsers never
+    /// send to a server or write to access logs. The injected bootstrap stores
+    /// it and strips the fragment, and it derives the API base from the page
+    /// location, so the URL carries nothing else.
     pub fn management_connect_url(&self, management_key: &str) -> Result<reqwest::Url> {
+        anyhow::ensure!(
+            self.is_loopback(),
+            "management auto-connect only applies to a local CPA"
+        );
+        anyhow::ensure!(
+            !management_key.trim().is_empty(),
+            "CPA management key must not be empty"
+        );
         let mut url = self.management_url()?;
-        if self.is_loopback() && !management_key.trim().is_empty() {
-            let api_base = self.management_api_base()?;
-            url.query_pairs_mut()
-                .append_pair("cmb", &api_base)
-                .append_pair("cmk", management_key);
-        }
+        // Reuse the URL library's form encoder; URLSearchParams decodes it.
+        let mut encoder = reqwest::Url::parse("http://127.0.0.1/").expect("static URL");
+        encoder.query_pairs_mut().append_pair("cmk", management_key);
+        url.set_fragment(encoder.query());
         Ok(url)
     }
 }
@@ -279,14 +276,27 @@ fn is_loopback_host(host: Option<&str>) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Credentials {
     pub proxy_token: String,
     pub cpa_token: String,
-    #[serde(default)]
     pub cpa_management_key: String,
 }
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Credentials")
+            .field("proxy_token", &REDACTED)
+            .field("cpa_token", &REDACTED)
+            .field("cpa_management_key", &REDACTED)
+            .finish()
+    }
+}
+
+/// Placeholder shown instead of a credential in `Debug` output.
+pub const REDACTED: &str = "[redacted]";
 
 impl Credentials {
     pub fn validate(&self) -> Result<()> {
@@ -313,6 +323,32 @@ impl Credentials {
             bail!("proxy token, CPA token, and CPA management key must be different");
         }
         Ok(())
+    }
+}
+
+/// Describe a TOML parse failure by file, position, and message only.
+///
+/// The rendered `toml` error quotes the offending source line, and a private
+/// file's line can hold a token (a missing quote is enough), so the snippet is
+/// never included.
+pub(crate) fn toml_parse_error(path: &Path, text: &str, error: &toml::de::Error) -> anyhow::Error {
+    let message = error.message().trim_end();
+    match error.span() {
+        Some(span) => {
+            let mut offset = span.start.min(text.len());
+            while !text.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            let before = &text[..offset];
+            let line = before.matches('\n').count() + 1;
+            let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+            let column = before[line_start..].chars().count() + 1;
+            anyhow!(
+                "invalid {} at line {line}, column {column}: {message}",
+                path.display()
+            )
+        }
+        None => anyhow!("invalid {}: {message}", path.display()),
     }
 }
 
@@ -368,7 +404,6 @@ mod tests {
             cpa.management_url().unwrap().as_str(),
             "http://127.0.0.1:8317/management.html"
         );
-        assert_eq!(cpa.management_api_base().unwrap(), "http://127.0.0.1:8317");
 
         let cpa = Cpa {
             base_url: "https://cpa.example.com/proxy/v1".into(),
@@ -377,35 +412,54 @@ mod tests {
             cpa.management_url().unwrap().as_str(),
             "https://cpa.example.com/proxy/management.html"
         );
-        assert_eq!(
-            cpa.management_api_base().unwrap(),
-            "https://cpa.example.com/proxy"
-        );
     }
 
     #[test]
-    fn loopback_management_connect_url_carries_current_endpoint() {
+    fn management_connect_url_carries_the_key_only_in_the_fragment() {
         let cpa = Cpa {
             base_url: "http://127.0.0.1:8317/v1".into(),
         };
         let url = cpa.management_connect_url("mgmt-key").unwrap();
-        assert_eq!(url.scheme(), "http");
-        assert_eq!(url.host_str(), Some("127.0.0.1"));
-        assert_eq!(url.path(), "/management.html");
-        let query: Vec<(String, String)> = url
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
-        assert!(query.contains(&("cmb".into(), "http://127.0.0.1:8317".into())));
-        assert!(query.contains(&("cmk".into(), "mgmt-key".into())));
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:8317/management.html#cmk=mgmt-key"
+        );
+        assert_eq!(url.query(), None);
+
+        // The fragment is form-encoded so URLSearchParams restores the key.
+        let url = cpa.management_connect_url("a b&c=d#e").unwrap();
+        assert_eq!(url.fragment(), Some("cmk=a+b%26c%3Dd%23e"));
+        assert_eq!(url.query(), None);
 
         let remote = Cpa {
             base_url: "https://cpa.example.com/v1".into(),
         };
-        assert_eq!(
-            remote.management_connect_url("mgmt-key").unwrap().as_str(),
-            "https://cpa.example.com/management.html"
-        );
+        assert!(remote.management_connect_url("mgmt-key").is_err());
+        assert!(cpa.management_connect_url(" ").is_err());
+    }
+
+    #[test]
+    fn credentials_debug_output_never_contains_secrets() {
+        let credentials = Credentials {
+            proxy_token: "proxy-secret".into(),
+            cpa_token: "cpa-secret".into(),
+            cpa_management_key: "management-secret".into(),
+        };
+        let debug = format!("{credentials:?}");
+        assert!(!debug.contains("secret"));
+        assert_eq!(debug.matches(REDACTED).count(), 3);
+    }
+
+    #[test]
+    fn toml_errors_report_position_without_quoting_the_source() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let text = "listen = \"127.0.0.1:48682\"\n[cpa]\nbase_url = sk-secret-token\n";
+        std::fs::write(&path, text).unwrap();
+        let error = Settings::load(&path).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("at line 3, column 12"), "{rendered}");
+        assert!(!rendered.contains("sk-secret-token"), "{rendered}");
     }
 
     #[test]

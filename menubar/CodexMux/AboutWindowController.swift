@@ -42,9 +42,7 @@ final class AboutWindowController: NSWindowController {
         versionLabel.stringValue = l10n.isChinese
             ? "App 版本：\(appVersion)"
             : "App version: \(appVersion)"
-        cliVersionLabel.stringValue = l10n.isChinese
-            ? "内置 CLI：\(cliVersion)"
-            : "Bundled CLI: \(cliVersion)"
+        setCLIVersion(cliVersion)
         repositoryButton.title = repositoryURL.absoluteString
         repositoryButton.toolTip = l10n.openRepository
         updateButton.title = isChecking ? l10n.checkingAppUpdates : l10n.checkAppUpdates
@@ -53,6 +51,12 @@ final class AboutWindowController: NSWindowController {
             statusLabel.stringValue = ""
         }
         window?.title = l10n.about.replacingOccurrences(of: "…", with: "")
+    }
+
+    func setCLIVersion(_ version: String) {
+        cliVersionLabel.stringValue = l10n.isChinese
+            ? "内置 CLI：\(version)"
+            : "Bundled CLI: \(version)"
     }
 
     func setUpdateState(message: String, isChecking: Bool) {

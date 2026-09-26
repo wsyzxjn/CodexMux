@@ -1,0 +1,15 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_crlf","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_weather","name":"get_weather","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"city\":\"杭"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"州\"}"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_crlf","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_weather","name":"get_weather","arguments":"{\"city\":\"杭州\"}"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"杭州今天晴 🌤"}]}]}}
+

@@ -23,9 +23,13 @@ use std::{
 
 use serde_json::{Map, Value, json};
 
-/// A single turn larger than this is not recorded; later references to it fail
-/// closed because the local chain is incomplete.
+/// A turn larger than this keeps only its route identity: same-route
+/// follow-ups may still pass the id through, but the chain can no longer be
+/// replayed to another route.
 const MAX_NODE_BYTES: usize = 4 * 1024 * 1024;
+/// Stands in for tool output that has no portable text (an image, for
+/// example), so the call it answers is never left without an output.
+const OMITTED_TOOL_OUTPUT: &str = "[non-text tool output omitted]";
 /// Past this budget whole least-recently-used chains are evicted.
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
@@ -35,7 +39,8 @@ struct Node {
     /// Topmost recorded ancestor; eviction removes a whole chain at once so a
     /// materialization never sees a hole the store itself created.
     root: String,
-    items: Vec<Value>,
+    /// `None` for a turn over the per-node budget: routable, not replayable.
+    items: Option<Vec<Value>>,
 }
 
 struct Chain {
@@ -63,12 +68,15 @@ impl ContinuityStore {
     }
 
     /// Record one completed turn: the portable input the client sent plus the
-    /// portable output the provider returned.
+    /// portable output the provider returned. A turn over the per-node budget
+    /// is kept as a stub that still knows its route but cannot be replayed.
     pub fn record(&self, id: &str, parent: Option<&str>, route_id: &str, items: Vec<Value>) {
         let bytes: usize = items.iter().map(approximate_size).sum();
-        if bytes > MAX_NODE_BYTES {
-            return;
-        }
+        let (items, bytes) = if bytes > MAX_NODE_BYTES {
+            (None, 0)
+        } else {
+            (Some(items), bytes)
+        };
         let mut inner = self.inner.lock().expect("continuity store mutex poisoned");
         if inner.nodes.contains_key(id) {
             inner.ambiguous_ids.insert(id.to_owned());
@@ -98,8 +106,9 @@ impl ContinuityStore {
         evict_over_budget(&mut inner);
     }
 
-    /// The full portable history ending at `id` when the chain is complete.
-    /// `None` means the id is unknown or at least one ancestor is missing.
+    /// The full portable history ending at `id` when the chain is complete
+    /// and replayable. `None` means the id is unknown, an ancestor is
+    /// missing, or a turn in the chain was too large to keep.
     pub fn materialize(&self, id: &str) -> Option<Vec<Value>> {
         let mut inner = self.inner.lock().expect("continuity store mutex poisoned");
         if inner.ambiguous_ids.contains(id) {
@@ -116,11 +125,10 @@ impl ContinuityStore {
             current = inner.nodes.get(parent)?;
             path.push(parent.to_owned());
         }
-        let items = path
-            .iter()
-            .rev()
-            .flat_map(|id| inner.nodes[id].items.iter().cloned())
-            .collect();
+        let mut items = Vec::new();
+        for id in path.iter().rev() {
+            items.extend(inner.nodes[id].items.as_ref()?.iter().cloned());
+        }
         if let Some(chain) = inner.chains.get_mut(&root) {
             chain.last_used = Instant::now();
         }
@@ -185,10 +193,7 @@ pub fn portable_input_items(input: Option<&Value>) -> Vec<Value> {
             "role": "user",
             "content": [{"type": "input_text", "text": text}]
         })],
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| portable_item(item, true))
-            .collect(),
+        Some(Value::Array(items)) => items.iter().filter_map(portable_item).collect(),
         _ => Vec::new(),
     }
 }
@@ -196,10 +201,7 @@ pub fn portable_input_items(input: Option<&Value>) -> Vec<Value> {
 /// Filter a response `output` array to its portable items.
 pub fn portable_output_items(output: Option<&Value>) -> Vec<Value> {
     match output {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| portable_item(item, false))
-            .collect(),
+        Some(Value::Array(items)) => items.iter().filter_map(portable_item).collect(),
         _ => Vec::new(),
     }
 }
@@ -207,7 +209,7 @@ pub fn portable_output_items(output: Option<&Value>) -> Vec<Value> {
 /// Keep an item only when its type is portable; strip the provider-assigned
 /// `id` and `status` fields so a replay never carries another provider's
 /// identifiers.
-fn portable_item(item: &Value, allow_images: bool) -> Option<Value> {
+fn portable_item(item: &Value) -> Option<Value> {
     let object = item.as_object()?;
     let kind = object.get("type").and_then(Value::as_str);
     match kind {
@@ -215,10 +217,7 @@ fn portable_item(item: &Value, allow_images: bool) -> Option<Value> {
             let mut kept = Map::new();
             kept.insert("type".into(), json!("message"));
             copy_string(&mut kept, object, "role");
-            kept.insert(
-                "content".into(),
-                public_content(object.get("content"), allow_images)?,
-            );
+            kept.insert("content".into(), public_content(object.get("content"))?);
             Some(Value::Object(kept))
         }
         Some("function_call") => {
@@ -250,7 +249,7 @@ fn portable_item(item: &Value, allow_images: bool) -> Option<Value> {
             if let Some(summary) = public_text_value(object.get("summary")) {
                 kept.insert("summary".into(), summary);
             }
-            if let Some(content) = public_content(object.get("content"), allow_images) {
+            if let Some(content) = public_content(object.get("content")) {
                 kept.insert("content".into(), content);
             }
             (kept.len() > 1).then_some(Value::Object(kept))
@@ -258,10 +257,7 @@ fn portable_item(item: &Value, allow_images: bool) -> Option<Value> {
         None if object.contains_key("role") => {
             let mut kept = Map::new();
             copy_string(&mut kept, object, "role");
-            kept.insert(
-                "content".into(),
-                public_content(object.get("content"), allow_images)?,
-            );
+            kept.insert("content".into(), public_content(object.get("content"))?);
             Some(Value::Object(kept))
         }
         _ => None,
@@ -281,26 +277,41 @@ fn required_string(source: &Map<String, Value>, key: &str) -> Option<Value> {
         .map(|value| Value::String(value.to_owned()))
 }
 
+/// Tool output keeps only public text. Output with no public text at all
+/// becomes a placeholder rather than disappearing, because dropping it would
+/// leave the matching call unanswered and the upstream would reject the
+/// replay.
 fn public_tool_output(value: Option<&Value>) -> Option<Value> {
-    match value? {
-        Value::String(text) => Some(Value::String(text.clone())),
+    let placeholder = || Value::String(OMITTED_TOOL_OUTPUT.into());
+    Some(match value? {
+        Value::String(text) => Value::String(text.clone()),
         Value::Array(parts) => {
-            let sanitized: Vec<Value> = parts
-                .iter()
-                .filter_map(|part| public_content_part(part, true))
-                .collect();
-            (!sanitized.is_empty()).then_some(Value::Array(sanitized))
+            let sanitized: Vec<Value> = parts.iter().filter_map(public_content_part).collect();
+            if sanitized.is_empty() {
+                placeholder()
+            } else {
+                Value::Array(sanitized)
+            }
         }
-        _ => None,
-    }
+        _ => placeholder(),
+    })
 }
 
+/// Public compaction summary text. Only parts whose type is a known public
+/// text type are kept, so a provider cannot smuggle reasoning text into a
+/// replay by attaching a `text` field to some other part type.
 fn public_text_value(value: Option<&Value>) -> Option<Value> {
     match value? {
         Value::String(text) => Some(Value::String(text.clone())),
         Value::Array(parts) => {
             let texts: Vec<Value> = parts
                 .iter()
+                .filter(|part| {
+                    matches!(
+                        part.get("type").and_then(Value::as_str),
+                        Some("summary_text" | "output_text" | "text" | "input_text")
+                    )
+                })
                 .filter_map(|part| {
                     part.get("text")
                         .and_then(Value::as_str)
@@ -313,36 +324,66 @@ fn public_text_value(value: Option<&Value>) -> Option<Value> {
     }
 }
 
-fn public_content(value: Option<&Value>, allow_images: bool) -> Option<Value> {
+fn public_content(value: Option<&Value>) -> Option<Value> {
     match value? {
         Value::String(text) => Some(Value::String(text.clone())),
         Value::Array(parts) => {
-            let sanitized: Vec<Value> = parts
-                .iter()
-                .filter_map(|part| public_content_part(part, allow_images))
-                .collect();
+            let sanitized: Vec<Value> = parts.iter().filter_map(public_content_part).collect();
             (!sanitized.is_empty()).then_some(Value::Array(sanitized))
         }
         _ => None,
     }
 }
 
-fn public_content_part(part: &Value, allow_images: bool) -> Option<Value> {
+/// Only text parts are portable. Images and every other part type are
+/// dropped on handoff.
+fn public_content_part(part: &Value) -> Option<Value> {
     if let Value::String(text) = part {
         return Some(Value::String(text.clone()));
     }
     let object = part.as_object()?;
     let kind = object.get("type").and_then(Value::as_str)?;
+    if !matches!(kind, "input_text" | "output_text" | "text") {
+        return None;
+    }
     let mut kept = Map::new();
     kept.insert("type".into(), Value::String(kind.into()));
-    match kind {
-        "input_text" | "output_text" | "text" => {
-            copy_string(&mut kept, object, "text");
-        }
-        "input_image" | "image_url" if allow_images => return None,
-        _ => return None,
-    }
+    copy_string(&mut kept, object, "text");
     (kept.len() > 1).then_some(Value::Object(kept))
+}
+
+/// Drop tool calls without an output and outputs without a call. Replay
+/// input must pair every call with its output by `call_id`; a provider
+/// rejects either half on its own. Run this on the complete replay list
+/// (history plus the current turn), where both halves of a pair are present.
+pub fn balance_tool_calls(items: &mut Vec<Value>) {
+    fn pair(item: &Value) -> Option<(bool, &str)> {
+        let kind = item.get("type").and_then(Value::as_str)?;
+        let is_call = match kind {
+            "function_call" | "custom_tool_call" => true,
+            "function_call_output" | "custom_tool_call_output" => false,
+            _ => return None,
+        };
+        Some((is_call, item.get("call_id").and_then(Value::as_str)?))
+    }
+    let mut calls = HashSet::new();
+    let mut outputs = HashSet::new();
+    for item in items.iter() {
+        match pair(item) {
+            Some((true, call_id)) => {
+                calls.insert(call_id.to_owned());
+            }
+            Some((false, call_id)) => {
+                outputs.insert(call_id.to_owned());
+            }
+            None => {}
+        }
+    }
+    items.retain(|item| match pair(item) {
+        Some((true, call_id)) => outputs.contains(call_id),
+        Some((false, call_id)) => calls.contains(call_id),
+        None => true,
+    });
 }
 
 fn approximate_size(value: &Value) -> usize {
@@ -490,23 +531,82 @@ mod tests {
     }
 
     #[test]
-    fn image_replay_rejects_nonpublic_urls() {
-        for url in [
-            "file:///tmp/private",
-            "data:image/png;base64,AA==",
-            "http://example.com/image.png",
-            "https://user:pass@example.com/image.png",
-            "https://127.0.0.1/image.png",
-            "https://10.0.0.1/image.png",
-            "https://[::1]/image.png",
-            "https://[::ffff:127.0.0.1]/image.png",
-        ] {
-            let input = json!([{
-                "type":"message", "role":"user",
-                "content":[{"type":"input_image","image_url":url}]
-            }]);
-            assert!(portable_input_items(Some(&input)).is_empty(), "{url}");
-        }
+    fn image_only_tool_output_keeps_its_call_answered() {
+        let input = json!([{
+            "type":"function_call_output", "call_id":"call-1",
+            "output":[{"type":"input_image","image_url":"https://example.com/a.png"}]
+        }, {
+            "type":"custom_tool_call_output", "call_id":"call-2", "output":{"unexpected":true}
+        }]);
+        assert_eq!(
+            portable_input_items(Some(&input)),
+            vec![
+                json!({"type":"function_call_output", "call_id":"call-1", "output":OMITTED_TOOL_OUTPUT}),
+                json!({"type":"custom_tool_call_output", "call_id":"call-2", "output":OMITTED_TOOL_OUTPUT}),
+            ]
+        );
+    }
+
+    #[test]
+    fn unpaired_tool_items_are_removed_from_a_replay() {
+        let mut items = vec![
+            json!({"type":"function_call", "call_id":"paired", "name":"a", "arguments":"{}"}),
+            json!({"type":"function_call", "call_id":"lonely-call", "name":"b", "arguments":"{}"}),
+            message("between"),
+            json!({"type":"function_call_output", "call_id":"paired", "output":"ok"}),
+            json!({"type":"custom_tool_call_output", "call_id":"lonely-output", "output":"x"}),
+        ];
+        balance_tool_calls(&mut items);
+        let call_ids: Vec<_> = items
+            .iter()
+            .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(call_ids, ["paired", "paired"]);
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn oversized_turns_stay_routable_but_are_never_replayed() {
+        let store = ContinuityStore::new();
+        store.record("resp-1", None, "official:gpt", vec![message("first")]);
+        let big = "x".repeat(MAX_NODE_BYTES + 1);
+        store.record(
+            "resp-2",
+            Some("resp-1"),
+            "official:gpt",
+            vec![message(&big)],
+        );
+        store.record(
+            "resp-3",
+            Some("resp-2"),
+            "official:gpt",
+            vec![message("third")],
+        );
+
+        assert_eq!(store.route_of("resp-2").as_deref(), Some("official:gpt"));
+        assert!(store.is_complete("resp-3"));
+        assert!(store.materialize("resp-2").is_none());
+        assert!(store.materialize("resp-3").is_none());
+        assert!(store.materialize("resp-1").is_some());
+        assert_eq!(
+            store.inner.lock().unwrap().total_bytes,
+            approximate_size(&message("first")) + approximate_size(&message("third"))
+        );
+    }
+
+    #[test]
+    fn compaction_summary_keeps_only_public_text_types() {
+        let input = json!([{
+            "type":"compaction",
+            "summary":[
+                {"type":"summary_text","text":"public"},
+                {"type":"reasoning_text","text":"private"}
+            ]
+        }]);
+        assert_eq!(
+            portable_input_items(Some(&input)),
+            vec![json!({"type":"compaction", "summary":[{"type":"summary_text","text":"public"}]})]
+        );
     }
 
     #[test]

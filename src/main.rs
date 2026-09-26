@@ -1,13 +1,23 @@
-use std::{future::Future, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    io::{IsTerminal, Write},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use codexmux::{
     codex_config::{ConfigLease, ConfigManager, PROXY_TOKEN_ENV},
     config::{Credentials, Paths, Settings},
-    launch_agent, secrets,
+    cpa::{self, SearchCapabilityStatus},
+    launch_agent::{self, RuntimeState},
+    secrets,
     server::{self, AppState},
 };
+use serde::Serialize;
+use tracing_appender::{non_blocking::WorkerGuard, rolling::RollingFileAppender};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -34,8 +44,7 @@ enum Command {
     },
     /// Show paths and managed configuration state.
     Status {
-        /// Skip reading the managed Codex configuration. Used by the menu bar
-        /// status poll so it never touches a TCC-gated external volume.
+        /// Skip reading the managed Codex configuration.
         #[arg(long)]
         no_codex_config: bool,
     },
@@ -43,8 +52,11 @@ enum Command {
     Doctor,
     /// Install and start the per-user macOS LaunchAgent.
     Install,
-    /// Stop the LaunchAgent and restore Codex configuration.
+    /// Restore the Codex configuration, then remove the LaunchAgent.
     Uninstall,
+    /// Print the menu bar state as one JSON object. Reads local files and
+    /// launchd only: no Codex config, network, proxy connection, or locks.
+    MenubarState,
     /// Manage the local CLIProxyAPI instance that serves CPA models.
     Cpa {
         #[command(subcommand)]
@@ -98,13 +110,9 @@ enum CpaCommand {
     },
     /// Restore the previous CPA binary after an update.
     Rollback,
-    /// Start the CPA LaunchAgent (installs the managed config).
+    /// Start the local CPA and make starting it the startup preference.
     Start,
-    /// Bring the CPA service in line with the saved startup preference:
-    /// start it when enabled, stop it when disabled, leave it untouched
-    /// when no preference exists.
-    SyncStart,
-    /// Stop the CPA LaunchAgent.
+    /// Stop the local CPA.
     Stop {
         /// Stop without updating the startup preference (app shutdown).
         #[arg(long)]
@@ -116,12 +124,12 @@ enum CpaCommand {
     ModelList,
     /// Print the CPA web management page URL.
     ManagementUrl {
-        /// For loopback CPA, attach the current endpoint and management key
-        /// so the Web UI can auto-connect. Remote URLs stay unmodified.
+        /// For the local CPA, sign the Web UI in with the management key,
+        /// which travels only in the URL fragment.
         #[arg(long)]
         connect: bool,
     },
-    /// Print the CPA web management key for explicit user handoff.
+    /// Print the local CPA web management key for explicit user handoff.
     ManagementKey,
     /// Import provider definitions from a TOML file and restart CPA.
     ProviderImport {
@@ -146,18 +154,34 @@ enum CpaCommand {
         /// Profile name.
         name: String,
     },
+    /// Make a saved profile the CPA endpoint CodexMux uses; rolls back on failure.
+    ProfileSwitch {
+        /// Profile name.
+        name: String,
+    },
     /// Show the review model override (None = official route).
     ReviewGet,
+    /// Route `codex-auto-review` straight to a CPA model (empty to clear).
+    ReviewSet {
+        /// Upstream CPA model slug; empty string clears the override.
+        slug: String,
+    },
     /// Show the image route override (None = official route).
     ImageGet,
+    /// Route Codex image generation to a CPA image model (empty to clear).
+    ImageSet {
+        /// Upstream CPA image model slug; empty string clears the override.
+        slug: String,
+    },
     /// List image model slugs the configured CPA endpoint reports.
     ImageModelList,
     /// Show the shared Responses web search backend override.
     SearchGet,
-    /// Select the shared web search backend. Use `default` to follow
-    /// `config.toml`, or an empty slug to disable the menu override.
+    /// Select the shared web search backend: a merged catalog slug enables
+    /// it, `off` (or an empty value) disables it, and `default` follows
+    /// `config.toml`.
     SearchSet {
-        /// `default`, empty, or a merged catalog model slug.
+        /// A merged catalog model slug, `off`, or `default`.
         value: String,
     },
     /// Print the cached shared web search capability status.
@@ -173,119 +197,23 @@ enum CpaCommand {
         #[arg(long)]
         verify: bool,
     },
-    /// Route `cpa/<slug>` requests directly to an upstream, bypassing CPA.
-    DirectSet {
-        /// Comma-separated cpa/ model slugs (without the cpa/ prefix).
-        models: String,
-        /// Upstream Responses API base URL.
-        #[arg(long)]
-        base_url: String,
-        /// Environment variable containing the direct upstream token.
-        #[arg(long, default_value = "CODEXMUX_DIRECT_TOKEN")]
-        token_env: String,
-        /// Native upstream model id when it differs from the local slug.
-        /// Requires exactly one local model.
-        #[arg(long)]
-        upstream_model: Option<String>,
-        /// Catalog context window for these local slugs.
-        #[arg(long)]
-        context_window: Option<u64>,
-        /// Catalog max context window for these local slugs.
-        #[arg(long)]
-        max_context_window: Option<u64>,
-    },
-    /// Add models to a direct upstream, merging with an existing route.
-    DirectAdd {
-        /// Comma-separated local model slugs (without the cpa/ prefix).
-        models: String,
-        /// Upstream Responses API base URL.
-        #[arg(long)]
-        base_url: String,
-        /// Environment variable containing the direct upstream token.
-        #[arg(long, default_value = "CODEXMUX_DIRECT_TOKEN")]
-        token_env: String,
-        /// Native upstream model id when it differs from the local slug.
-        /// Requires exactly one local model.
-        #[arg(long)]
-        upstream_model: Option<String>,
-        /// Catalog context window for these local slugs.
-        #[arg(long)]
-        context_window: Option<u64>,
-        /// Catalog max context window for these local slugs.
-        #[arg(long)]
-        max_context_window: Option<u64>,
-    },
-    /// Remove models (or a whole route) from direct upstreams.
-    DirectRemove {
-        /// Upstream Responses API base URL of the route.
-        #[arg(long)]
-        base_url: String,
-        /// Comma-separated upstream model slugs to remove; empty removes the
-        /// whole route.
-        models: Option<String>,
-    },
-    /// List direct routes without printing their tokens.
-    DirectList,
-    /// Set catalog metadata for an existing direct-route model.
-    DirectMetadataSet {
-        /// cpa/ model slug (without the cpa/ prefix).
-        model: String,
-        /// Catalog context window.
-        #[arg(long)]
-        context_window: Option<u64>,
-        /// Catalog max context window.
-        #[arg(long)]
-        max_context_window: Option<u64>,
-        /// Picker display name; CodexMux appends ` · Direct`.
-        #[arg(long)]
-        display_name: Option<String>,
-    },
-    /// Remove all direct routes (everything goes through CPA again).
-    DirectClear,
-    /// List model ids exposed by a direct Responses endpoint.
-    DirectDiscover {
-        /// Upstream Responses API base URL.
-        #[arg(long)]
-        base_url: String,
-        /// Environment variable containing the direct upstream token.
-        #[arg(long, default_value = "CODEXMUX_DIRECT_TOKEN")]
-        token_env: String,
-    },
-    /// Show whether the CPA service should start with CodexMux.
+    /// Show whether the local CPA runs while Codex is active.
     AutostartGet,
-    /// Set whether the CPA service should start with CodexMux.
+    /// Set whether the local CPA runs while Codex is active.
     AutostartSet {
         /// `true`/`false`: whether CPA starts together with CodexMux.
         enabled: String,
     },
-    /// Route `codex-auto-review` straight to a CPA model (empty to clear).
-    ReviewSet {
-        /// Upstream CPA model slug; empty string clears the override.
-        slug: String,
-    },
-    /// Route Codex image generation to a CPA image model (empty to clear).
-    ImageSet {
-        /// Upstream CPA image model slug; empty string clears the override.
-        slug: String,
-    },
-    /// Validate a saved endpoint and switch to it; rolls back on failure.
-    ProfileSwitch {
-        /// Profile name.
-        name: String,
-    },
-    /// Remove the CPA LaunchAgent (keeps the binary, config, and auth files).
+    /// Stop CPA and remove its job definition (keeps the binary, config, and auth files).
     Uninstall,
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "codexmux=info".into()),
-        )
-        .init();
+    let cli = Cli::parse();
     let paths = Paths::discover()?;
-    match Cli::parse().command {
+    // Held until exit so the rolling log writer flushes everything.
+    let _log_guard = init_logging(&cli.command, &paths);
+    match cli.command {
         Command::Init => init(&paths),
         Command::Serve {
             no_codex_config,
@@ -293,45 +221,63 @@ fn main() -> Result<()> {
         } => run_async(serve(&paths, no_codex_config, launchd_socket)),
         Command::Status { no_codex_config } => status(&paths, no_codex_config),
         Command::Doctor => run_async(doctor(&paths)),
-        Command::Install => {
-            ensure_initialized(&paths)?;
-            let settings = Settings::load(&paths.settings)?;
-            let credentials = secrets::load(&paths.credentials)?;
-            // Enable the Codex configuration from the caller's context: the
-            // LaunchAgent runs serve --no-codex-config because background
-            // processes may be denied access to the Codex config's volume by
-            // macOS TCC, which blocks open() indefinitely.
-            let manager = config_manager(&paths)?;
-            let lease = manager
-                .enable(&format!("http://{}/v1", settings.listen))
-                .context("failed to enable the managed Codex configuration")?;
-            let executable = std::env::current_exe()?.canonicalize()?;
-            let install_result =
-                launch_agent::install(&paths, &executable, &codex_config_path()?, settings.listen);
-            // Keep the configuration enabled only when the agent was installed.
-            match install_result {
-                Ok(plist) => {
-                    if let Err(error) = set_launchctl_proxy_token(&credentials.proxy_token) {
-                        launch_agent::uninstall().ok();
-                        lease.restore().ok();
-                        return Err(error).context(
-                            "failed to prepare the Codex environment; installation rolled back",
-                        );
-                    }
-                    println!("installed {}", plist.display());
-                    std::mem::forget(lease);
-                    Ok(())
-                }
-                Err(error) => {
-                    lease.restore().ok();
-                    Err(error)
-                }
-            }
-        }
+        Command::Install => install(&paths),
         Command::Uninstall => uninstall(&paths),
-        Command::Cpa { command } => cpa(&paths, command),
+        Command::MenubarState => print_menubar_state(&paths),
+        Command::Cpa { command } => cpa_command(&paths, command),
         Command::Catalog { command } => catalog(&paths, command),
     }
+}
+
+/// Route tracing output. The on-demand LaunchAgent writes a daily rolling
+/// file; every other command writes stderr, so stdout carries only command
+/// output such as `menubar-state` JSON or model lists.
+fn init_logging(command: &Command, paths: &Paths) -> Option<WorkerGuard> {
+    let filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("codexmux=info"));
+    if matches!(
+        command,
+        Command::Serve {
+            launchd_socket: true,
+            ..
+        }
+    ) {
+        match log_file_appender(&paths.root.join("logs")) {
+            Ok(appender) => {
+                let (writer, guard) = tracing_appender::non_blocking(appender);
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter())
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .init();
+                return Some(guard);
+            }
+            Err(error) => {
+                eprintln!("codexmux: cannot open the log file, logging to stderr: {error:#}");
+            }
+        }
+    }
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    tracing_subscriber::fmt()
+        .with_env_filter(filter())
+        .with_ansi(std::io::stderr().is_terminal() && !no_color)
+        .with_writer(std::io::stderr)
+        .init();
+    None
+}
+
+/// `logs/codexmux.YYYY-MM-DD.log`, rotated daily, keeping seven files. The
+/// LaunchAgent's stdout/stderr files still catch panics.
+fn log_file_appender(directory: &Path) -> Result<RollingFileAppender> {
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("failed to create {}", directory.display()))?;
+    RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("codexmux")
+        .filename_suffix("log")
+        .max_log_files(7)
+        .build(directory)
+        .with_context(|| format!("failed to open a log file in {}", directory.display()))
 }
 
 fn run_async<F>(future: F) -> Result<()>
@@ -360,54 +306,6 @@ fn init(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn catalog(paths: &Paths, command: CatalogCommand) -> Result<()> {
-    let mut settings = Settings::load(&paths.settings)?;
-    match command {
-        CatalogCommand::UltraGet => {
-            println!("ultra: {}", settings.catalog.advertise_ultra);
-            Ok(())
-        }
-        CatalogCommand::UltraSet { enabled } => {
-            let enabled = enabled
-                .parse::<bool>()
-                .context("enabled must be true or false")?;
-            settings.catalog.advertise_ultra = enabled;
-            settings.save(&paths.settings)?;
-            println!("ultra: {}", enabled);
-            Ok(())
-        }
-        CatalogCommand::CompHashGet => {
-            println!("unify-comp-hash: {}", settings.catalog.unify_comp_hash);
-            Ok(())
-        }
-        CatalogCommand::CompHashSet { enabled } => {
-            let enabled = enabled
-                .parse::<bool>()
-                .context("enabled must be true or false")?;
-            settings.catalog.unify_comp_hash = enabled;
-            settings.save(&paths.settings)?;
-            println!("unify-comp-hash: {}", enabled);
-            Ok(())
-        }
-        CatalogCommand::Models => {
-            let store = codexmux::catalog::CatalogStore::load(paths.catalog.clone())?;
-            let catalog = store
-                .current()
-                .context("model catalog snapshot has not been built yet")?;
-            let models = catalog
-                .get("models")
-                .and_then(serde_json::Value::as_array)
-                .context("model catalog has no models array")?;
-            for model in models {
-                if let Some(slug) = model.get("slug").and_then(serde_json::Value::as_str) {
-                    println!("{slug}");
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
 fn ensure_initialized(paths: &Paths) -> Result<()> {
     paths.ensure()?;
     if !paths.settings.exists() {
@@ -426,20 +324,47 @@ fn ensure_initialized(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn set_launchctl_proxy_token(token: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let status = std::process::Command::new("launchctl")
-            .args(["setenv", PROXY_TOKEN_ENV, token])
-            .status()
-            .context("failed to run launchctl setenv")?;
-        anyhow::ensure!(
-            status.success(),
-            "launchctl setenv {PROXY_TOKEN_ENV} failed with {status}"
-        );
+fn install(paths: &Paths) -> Result<()> {
+    ensure_initialized(paths)?;
+    let settings = Settings::load(&paths.settings)?;
+    let credentials = secrets::load(&paths.credentials)?;
+    // Enable the Codex configuration from the caller's context: the
+    // LaunchAgent runs serve --no-codex-config because background processes
+    // may be denied access to the Codex config's volume by macOS TCC, which
+    // blocks open() indefinitely.
+    let lease = config_manager(paths)?
+        .enable(&format!("http://{}/v1", settings.listen))
+        .context("failed to enable the managed Codex configuration")?;
+    let executable = std::env::current_exe()?.canonicalize()?;
+    // Keep the configuration enabled only when the agent was installed.
+    match launch_agent::install(paths, &executable, &codex_config_path()?, settings.listen) {
+        Ok(plist) => {
+            if let Err(error) = set_launchctl_proxy_token(&credentials.proxy_token) {
+                launch_agent::uninstall().ok();
+                lease.restore().ok();
+                return Err(error)
+                    .context("failed to prepare the Codex environment; installation rolled back");
+            }
+            println!("installed {}", plist.display());
+            std::mem::forget(lease);
+            Ok(())
+        }
+        Err(error) => {
+            lease.restore().ok();
+            Err(error)
+        }
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = token;
+}
+
+fn set_launchctl_proxy_token(token: &str) -> Result<()> {
+    let status = std::process::Command::new("launchctl")
+        .args(["setenv", PROXY_TOKEN_ENV, token])
+        .status()
+        .context("failed to run launchctl setenv")?;
+    anyhow::ensure!(
+        status.success(),
+        "launchctl setenv {PROXY_TOKEN_ENV} failed with {status}"
+    );
     Ok(())
 }
 
@@ -460,20 +385,9 @@ async fn serve(paths: &Paths, no_codex_config: bool, launchd_socket: bool) -> Re
             .await
             .with_context(|| format!("failed to bind {}", settings.listen))?
     };
-    let lifecycle_manages_cpa =
-        launchd_socket && codexmux::cpa::cpa_autostart(&paths.cpa_profiles) == Some(true);
-    let mut launched_cpa = false;
-    if lifecycle_manages_cpa && !codexmux::cpa::is_loaded()? {
-        codexmux::cpa::start(paths, &settings.cpa, &credentials.cpa_token)?;
-        tracing::info!("CPA started for active Codex client");
-        launched_cpa = true;
-    }
-    let state = AppState::new(
-        settings.clone(),
-        credentials,
-        paths.catalog.clone(),
-        paths.cpa_profiles.clone(),
-    )?;
+    let manage_cpa = launchd_socket && lifecycle_manages_cpa(paths, &settings);
+    let launched_cpa = manage_cpa && start_lifecycle_cpa(paths, &settings, &credentials).await;
+    let state = AppState::new(settings.clone(), credentials, paths)?;
     // The Codex request that socket-activated this process is already queued,
     // so let the CPA instance we just launched finish binding before answering
     // it; otherwise the first model refresh sees no CPA models at all.
@@ -525,12 +439,8 @@ async fn serve(paths: &Paths, no_codex_config: bool, launchd_socket: bool) -> Re
             }
         }
     };
-    if lifecycle_manages_cpa && codexmux::cpa::is_loaded()? {
-        if let Err(error) = codexmux::cpa::stop_service_only() {
-            tracing::warn!(%error, "failed to stop lifecycle-managed CPA");
-        } else {
-            tracing::info!("CPA stopped after Codex client became idle");
-        }
+    if manage_cpa {
+        stop_lifecycle_cpa(paths).await;
     }
     let restore = lease.map(ConfigLease::restore).transpose();
     match (result, restore) {
@@ -543,62 +453,129 @@ async fn serve(paths: &Paths, no_codex_config: bool, launchd_socket: bool) -> Re
     }
 }
 
-fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static> {
-    #[cfg(unix)]
-    {
-        let mut interrupt =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                .context("failed to install SIGINT handler")?;
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .context("failed to install SIGTERM handler")?;
-        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .context("failed to install SIGHUP handler")?;
-        Ok(async move {
-            tokio::select! {
-                _ = interrupt.recv() => {},
-                _ = terminate.recv() => {},
-                _ = hangup.recv() => {},
-            }
-        })
+/// The on-demand proxy runs the local CPA while Codex is active only for a
+/// local endpoint with an installed binary and an enabled startup preference.
+fn lifecycle_manages_cpa(paths: &Paths, settings: &Settings) -> bool {
+    if !settings.cpa.is_loopback() || !cpa::binary_path(paths).is_file() {
+        return false;
     }
-    #[cfg(not(unix))]
-    {
-        Ok(async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("failed to install Ctrl-C handler");
-        })
+    match cpa::cpa_autostart(&paths.cpa_profiles) {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "cannot read the CPA startup preference; leaving the local CPA alone"
+            );
+            false
+        }
     }
 }
 
+/// Start the local CPA for this proxy's lifetime. Failure only costs the CPA
+/// models: the proxy keeps serving official ones. Returns whether this call
+/// started CPA.
+async fn start_lifecycle_cpa(
+    paths: &Paths,
+    settings: &Settings,
+    credentials: &Credentials,
+) -> bool {
+    let (paths, cpa_settings, token) = (
+        paths.clone(),
+        settings.cpa.clone(),
+        credentials.cpa_token.clone(),
+    );
+    let started = tokio::task::spawn_blocking(move || -> Result<bool> {
+        if cpa::is_loaded()? {
+            return Ok(false);
+        }
+        cpa::start_service_only(&paths, &cpa_settings, &token)?;
+        Ok(true)
+    })
+    .await;
+    match started {
+        Ok(Ok(started)) => {
+            if started {
+                tracing::info!("CPA started for active Codex client");
+            }
+            started
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "failed to start the local CPA; serving without CPA models"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(%error, "the CPA start task failed; serving without CPA models");
+            false
+        }
+    }
+}
+
+async fn stop_lifecycle_cpa(paths: &Paths) {
+    let paths = paths.clone();
+    let stopped = tokio::task::spawn_blocking(move || -> Result<bool> {
+        if !cpa::is_loaded()? {
+            return Ok(false);
+        }
+        cpa::stop_service_only(&paths)?;
+        Ok(true)
+    })
+    .await;
+    match stopped {
+        Ok(Ok(true)) => tracing::info!("CPA stopped after Codex client became idle"),
+        Ok(Ok(false)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %format!("{error:#}"), "failed to stop lifecycle-managed CPA");
+        }
+        Err(error) => tracing::warn!(%error, "the CPA stop task failed"),
+    }
+}
+
+fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt =
+        signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
+    let mut terminate =
+        signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
+    let mut hangup = signal(SignalKind::hangup()).context("failed to install SIGHUP handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {},
+            _ = terminate.recv() => {},
+            _ = hangup.recv() => {},
+        }
+    })
+}
+
+/// Restore Codex first; the LaunchAgent is removed only afterwards, so Codex
+/// never points at a proxy that is gone. Either failure exits nonzero.
 fn uninstall(paths: &Paths) -> Result<()> {
+    let was_managed = paths.state.exists();
+    config_manager(paths)?.disable().context(
+        "failed to restore the Codex configuration; the CodexMux LaunchAgent was left installed",
+    )?;
+    if was_managed {
+        println!("restored Codex configuration");
+    }
     match launch_agent::uninstall()? {
         Some(path) => println!("removed {}", path.display()),
         None => println!("LaunchAgent is not installed"),
     }
-    let manager = config_manager(paths)?;
-    let was_managed = paths.state.exists();
-    manager.disable()?;
-    if was_managed {
-        println!("restored Codex configuration");
-    }
-    unset_launchctl_proxy_token()?;
-    Ok(())
+    unset_launchctl_proxy_token()
 }
 
 fn unset_launchctl_proxy_token() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let status = std::process::Command::new("launchctl")
-            .args(["unsetenv", PROXY_TOKEN_ENV])
-            .status()
-            .context("failed to run launchctl unsetenv")?;
-        anyhow::ensure!(
-            status.success(),
-            "launchctl unsetenv {PROXY_TOKEN_ENV} failed with {status}"
-        );
-    }
+    let status = std::process::Command::new("launchctl")
+        .args(["unsetenv", PROXY_TOKEN_ENV])
+        .status()
+        .context("failed to run launchctl unsetenv")?;
+    anyhow::ensure!(
+        status.success(),
+        "launchctl unsetenv {PROXY_TOKEN_ENV} failed with {status}"
+    );
     Ok(())
 }
 
@@ -610,9 +587,9 @@ fn status(paths: &Paths, no_codex_config: bool) -> Result<()> {
     println!(
         "proxy service: {}",
         match launch_agent::runtime_state()? {
-            launch_agent::RuntimeState::Running => "running",
-            launch_agent::RuntimeState::Idle => "idle",
-            launch_agent::RuntimeState::NotInstalled => "not installed",
+            RuntimeState::Running => "running",
+            RuntimeState::Idle => "idle",
+            RuntimeState::NotInstalled => "not installed",
         }
     );
     if no_codex_config {
@@ -646,10 +623,7 @@ async fn doctor(paths: &Paths) -> Result<()> {
     let cpa_models = format!("{}/models", settings.cpa.base_url.trim_end_matches('/'));
     match reqwest::Client::new()
         .get(cpa_models)
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", credentials.cpa_token),
-        )
+        .bearer_auth(&credentials.cpa_token)
         .send()
         .await
     {
@@ -681,18 +655,12 @@ fn proxy_token_is_available(expected: &str) -> bool {
     if std::env::var(PROXY_TOKEN_ENV).as_deref() == Ok(expected) {
         return true;
     }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("launchctl")
-            .args(["getenv", PROXY_TOKEN_ENV])
-            .output()
-            .is_ok_and(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).trim() == expected
-            })
-    }
-    #[cfg(not(target_os = "macos"))]
-    false
+    std::process::Command::new("launchctl")
+        .args(["getenv", PROXY_TOKEN_ENV])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == expected
+        })
 }
 
 fn config_manager(paths: &Paths) -> Result<ConfigManager> {
@@ -703,61 +671,88 @@ fn config_manager(paths: &Paths) -> Result<ConfigManager> {
     ))
 }
 
-fn apply_direct_context_metadata(
-    paths: &Paths,
-    slugs: &[String],
-    context_window: Option<u64>,
-    max_context_window: Option<u64>,
-) -> Result<()> {
-    if context_window.is_none() && max_context_window.is_none() {
-        return Ok(());
-    }
-    for slug in slugs {
-        codexmux::cpa::set_direct_model_metadata(
-            paths,
-            slug,
-            codexmux::cpa::DirectModelMetadata {
-                context_window,
-                max_context_window,
-                display_name: None,
-            },
-        )?;
+fn codex_config_path() -> Result<PathBuf> {
+    codexmux::codex_config::codex_config_path()
+}
+
+fn catalog(paths: &Paths, command: CatalogCommand) -> Result<()> {
+    let mut settings = Settings::load(&paths.settings)?;
+    match command {
+        CatalogCommand::UltraGet => println!("ultra: {}", settings.catalog.advertise_ultra),
+        CatalogCommand::UltraSet { enabled } => {
+            settings.catalog.advertise_ultra = parse_flag(&enabled)?;
+            settings.save(&paths.settings)?;
+            println!("ultra: {}", settings.catalog.advertise_ultra);
+        }
+        CatalogCommand::CompHashGet => {
+            println!("unify-comp-hash: {}", settings.catalog.unify_comp_hash);
+        }
+        CatalogCommand::CompHashSet { enabled } => {
+            settings.catalog.unify_comp_hash = parse_flag(&enabled)?;
+            settings.save(&paths.settings)?;
+            println!("unify-comp-hash: {}", settings.catalog.unify_comp_hash);
+        }
+        CatalogCommand::Models => {
+            let slugs = cpa::catalog_slugs(paths)?
+                .context("model catalog snapshot has not been built yet")?;
+            for slug in slugs {
+                println!("{slug}");
+            }
+        }
     }
     Ok(())
 }
 
-fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
+fn parse_flag(value: &str) -> Result<bool> {
+    match value.trim() {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        other => bail!("expected true or false, got {other:?}"),
+    }
+}
+
+/// Commands that manage the local CPA binary or service refuse to run while
+/// CodexMux uses a remote endpoint; its URL says nothing about a local CPA.
+fn require_local_cpa(settings: &Settings, command: &str) -> Result<()> {
+    anyhow::ensure!(
+        settings.cpa.is_loopback(),
+        "`codexmux cpa {command}` manages the local CLIProxyAPI, but CodexMux uses the remote CPA endpoint {}; switch to a local profile first",
+        settings.cpa.base_url
+    );
+    Ok(())
+}
+
+fn cpa_command(paths: &Paths, command: CpaCommand) -> Result<()> {
     let settings = Settings::load(&paths.settings)?;
     match command {
         CpaCommand::Install { archive } => {
-            let credentials = secrets::load(&paths.credentials)?;
-            match archive {
-                Some(archive) => codexmux::cpa::install_from_archive(
+            require_local_cpa(&settings, "install")?;
+            let token = secrets::load(&paths.credentials)?.cpa_token;
+            let installed = match archive {
+                Some(archive) => cpa::install_from_archive(
                     paths,
                     &settings.cpa,
                     &archive,
-                    codexmux::cpa::CPA_VERSION,
-                    codexmux::cpa::CPA_DARWIN_AARCH64_SHA256,
-                    &credentials.cpa_token,
+                    cpa::CPA_VERSION,
+                    cpa::CPA_DARWIN_AARCH64_SHA256,
+                    &token,
                 )?,
-                None => codexmux::cpa::install(paths, &settings.cpa, &credentials.cpa_token)?,
-            }
+                None => cpa::install(paths, &settings.cpa, &token)?,
+            };
             println!(
                 "CLIProxyAPI {} installed at {}",
-                codexmux::cpa::installed_version(paths)
-                    .map(|version| version.version)
-                    .unwrap_or_else(|| codexmux::cpa::CPA_VERSION.to_owned()),
-                codexmux::cpa::binary_path(paths).display()
+                installed.version,
+                cpa::binary_path(paths).display()
             );
-            println!("config: {}", codexmux::cpa::config_path(paths).display());
+            println!("config: {}", cpa::config_path(paths).display());
             println!(
                 "service: started ({}); logs: {}/logs/cpa-*.log",
-                codexmux::cpa::agent_label(),
+                cpa::agent_label(),
                 paths.root.display()
             );
         }
         CpaCommand::UpdateCheck => {
-            let check = codexmux::cpa::check_cpa_update(paths, None)?;
+            let check = cpa::check_cpa_update(paths, None)?;
             println!(
                 "current: {}",
                 check.current_version.as_deref().unwrap_or("not installed")
@@ -766,18 +761,10 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             println!("update available: {}", check.update_available);
         }
         CpaCommand::Update { version, dry_run } => {
-            anyhow::ensure!(
-                settings.cpa.is_loopback(),
-                "CPA update only applies to the managed local CLIProxyAPI; remote profiles are not updated"
-            );
-            let credentials = secrets::load(&paths.credentials)?;
-            let outcome = codexmux::cpa::update_cpa(
-                paths,
-                &settings.cpa,
-                &credentials.cpa_token,
-                version.as_deref(),
-                dry_run,
-            )?;
+            require_local_cpa(&settings, "update")?;
+            let token = secrets::load(&paths.credentials)?.cpa_token;
+            let outcome =
+                cpa::update_cpa(paths, &settings.cpa, &token, version.as_deref(), dry_run)?;
             if outcome.dry_run {
                 println!("current: {}", outcome.from_version);
                 println!("target: {}", outcome.to_version);
@@ -794,62 +781,40 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             }
         }
         CpaCommand::Rollback => {
-            anyhow::ensure!(
-                settings.cpa.is_loopback(),
-                "CPA rollback only applies to the managed local CLIProxyAPI; remote profiles are not updated"
-            );
-            let credentials = secrets::load(&paths.credentials)?;
-            codexmux::cpa::rollback_cpa(paths, &settings.cpa, &credentials.cpa_token)?;
+            require_local_cpa(&settings, "rollback")?;
+            let token = secrets::load(&paths.credentials)?.cpa_token;
+            cpa::rollback_cpa(paths, &settings.cpa, &token)?;
             println!(
                 "CPA rolled back to {}",
-                codexmux::cpa::installed_version(paths)
-                    .map(|version| version.version)
-                    .unwrap_or_else(|| "unknown".into())
+                cpa::installed_version(paths)?.map_or_else(|| "unknown".into(), |v| v.version)
             );
         }
         CpaCommand::Start => {
-            let credentials = secrets::load(&paths.credentials)?;
-            codexmux::cpa::start(paths, &settings.cpa, &credentials.cpa_token)?;
+            require_local_cpa(&settings, "start")?;
+            let token = secrets::load(&paths.credentials)?.cpa_token;
+            cpa::start(paths, &settings.cpa, &token)?;
             println!("CPA service started");
         }
-        CpaCommand::SyncStart => match codexmux::cpa::cpa_autostart(&paths.cpa_profiles) {
-            Some(true) => {
-                if !codexmux::cpa::is_loaded()? {
-                    let credentials = secrets::load(&paths.credentials)?;
-                    codexmux::cpa::start(paths, &settings.cpa, &credentials.cpa_token)?;
-                    println!("CPA service started (startup preference: enabled)");
-                } else {
-                    println!("CPA service already running (startup preference: enabled)");
-                }
-            }
-            Some(false) => {
-                if codexmux::cpa::is_loaded()? {
-                    codexmux::cpa::stop_service_only()?;
-                    println!("CPA service stopped (startup preference: disabled)");
-                } else {
-                    println!("CPA service already stopped (startup preference: disabled)");
-                }
-            }
-            None => println!("CPA startup preference not set; service left as-is"),
-        },
         CpaCommand::Stop { no_preference } => {
+            require_local_cpa(&settings, "stop")?;
             if no_preference {
-                codexmux::cpa::stop_service_only()?;
+                cpa::stop_service_only(paths)?;
             } else {
-                codexmux::cpa::stop(paths)?;
+                cpa::stop(paths)?;
             }
             println!("CPA service stopped");
         }
         CpaCommand::Status => {
-            match codexmux::cpa::installed_version(paths) {
-                Some(version) => {
+            match cpa::installed_version(paths) {
+                Ok(Some(version)) => {
                     println!("version: {} (sha256 {})", version.version, version.sha256);
                 }
-                None => println!("version: not installed"),
+                Ok(None) => println!("version: not installed"),
+                Err(error) => println!("version: unreadable ({error:#})"),
             }
             println!(
                 "binary: {}",
-                if codexmux::cpa::binary_path(paths).is_file() {
+                if cpa::binary_path(paths).is_file() {
                     "installed"
                 } else {
                     "missing"
@@ -857,7 +822,7 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             );
             println!(
                 "service: {}",
-                if codexmux::cpa::is_loaded()? {
+                if cpa::is_loaded()? {
                     "running"
                 } else {
                     "stopped"
@@ -865,61 +830,64 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             );
             println!(
                 "autostart: {}",
-                match codexmux::cpa::cpa_autostart(&paths.cpa_profiles) {
-                    Some(true) => "enabled",
-                    Some(false) => "disabled",
-                    None => "not set",
+                if cpa::cpa_autostart(&paths.cpa_profiles)? {
+                    "enabled"
+                } else {
+                    "disabled"
                 }
             );
             println!(
                 "rollback: {}",
-                if codexmux::cpa::rollback_available(paths) {
+                if cpa::rollback_available(paths) {
                     "available"
                 } else {
                     "no previous version"
                 }
             );
-            println!("config: {}", codexmux::cpa::config_path(paths).display());
+            println!("config: {}", cpa::config_path(paths).display());
         }
         CpaCommand::ModelList => {
-            let credentials = secrets::load(&paths.credentials)?;
-            for slug in codexmux::cpa::model_slugs(&settings.cpa, &credentials.cpa_token)? {
+            let token = secrets::load(&paths.credentials)?.cpa_token;
+            for slug in cpa::model_slugs(&settings.cpa, &token)? {
                 println!("{slug}");
             }
         }
         CpaCommand::ManagementUrl { connect } => {
-            if connect && settings.cpa.is_loopback() {
+            if connect {
+                require_local_cpa(&settings, "management-url --connect")?;
                 let management_key = secrets::load(&paths.credentials)?.cpa_management_key;
-                codexmux::cpa::sync_management_key(paths, &management_key)?;
-                codexmux::cpa::ensure_management_connect_bootstrap(paths)?;
+                cpa::sync_management_key(paths, &management_key)?;
+                cpa::ensure_management_connect_bootstrap(paths)?;
                 println!("{}", settings.cpa.management_connect_url(&management_key)?);
             } else {
                 println!("{}", settings.cpa.management_url()?);
             }
         }
         CpaCommand::ManagementKey => {
+            require_local_cpa(&settings, "management-key")?;
             let management_key = secrets::load(&paths.credentials)?.cpa_management_key;
-            if settings.cpa.is_loopback() {
-                codexmux::cpa::sync_management_key(paths, &management_key)?;
-            }
+            cpa::sync_management_key(paths, &management_key)?;
             println!("management-key: {management_key}");
         }
         CpaCommand::ProviderImport { file } => {
-            let credentials = secrets::load(&paths.credentials)?;
-            let providers = std::fs::read_to_string(&file)
-                .with_context(|| format!("failed to read {}", file.display()))?;
-            codexmux::cpa::import_providers(paths, &providers)?;
-            codexmux::cpa::restart(paths, &settings.cpa, &credentials.cpa_token)?;
+            require_local_cpa(&settings, "provider-import")?;
+            let token = secrets::load(&paths.credentials)?.cpa_token;
+            cpa::import_providers(paths, &settings.cpa, &token, &file)?;
             println!("imported providers from {}", file.display());
             println!(
                 "CPA service restarted with the new providers; config: {}",
-                codexmux::cpa::config_path(paths).display()
+                cpa::config_path(paths).display()
             );
         }
         CpaCommand::Uninstall => {
-            match codexmux::cpa::uninstall()? {
+            let outcome = cpa::uninstall(paths)?;
+            if outcome.stopped {
+                println!("stopped the CPA service");
+            }
+            match outcome.removed {
                 Some(plist) => println!("removed {}", plist.display()),
-                None => println!("CPA service is not installed"),
+                None if !outcome.stopped => println!("CPA service is not installed"),
+                None => {}
             }
             println!(
                 "kept binary and config under {}",
@@ -927,7 +895,7 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             );
         }
         CpaCommand::ProfileList => {
-            let (active, profiles) = codexmux::cpa::profiles(paths);
+            let (active, profiles) = cpa::profiles(paths)?;
             match active {
                 Some(active) => println!("active: {active}"),
                 None => println!("active: (none; using config.toml settings)"),
@@ -946,9 +914,9 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
         } => {
             let token = std::env::var(&token_env)
                 .with_context(|| format!("{token_env} must contain the CPA profile token"))?;
-            codexmux::cpa::save_profile(
+            cpa::save_profile(
                 paths,
-                codexmux::cpa::CpaProfile {
+                cpa::CpaProfile {
                     name,
                     base_url,
                     token,
@@ -957,28 +925,48 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
             println!("profile saved to {}", paths.cpa_profiles.display());
         }
         CpaCommand::ProfileRemove { name } => {
-            codexmux::cpa::remove_profile(paths, &name)?;
+            cpa::remove_profile(paths, &name)?;
             println!("profile {name} removed");
         }
         CpaCommand::ProfileSwitch { name } => {
-            codexmux::cpa::switch_profile(paths, &name)?;
+            cpa::switch_profile(paths, &name)?;
             println!("switched to profile {name}");
         }
-        CpaCommand::ReviewGet => match codexmux::cpa::review_override(&paths.cpa_profiles) {
+        CpaCommand::ReviewGet => match cpa::review_override(&paths.cpa_profiles)? {
             Some(slug) => println!("review override: {slug}"),
             None => println!("review override: (none; official route)"),
         },
-        CpaCommand::ImageGet => match codexmux::cpa::image_override(&paths.cpa_profiles) {
+        CpaCommand::ReviewSet { slug } => {
+            let slug = slug.trim().to_owned();
+            if slug.is_empty() {
+                cpa::set_review_override(&paths.cpa_profiles, None)?;
+                println!("review override cleared");
+            } else {
+                cpa::set_review_override(&paths.cpa_profiles, Some(slug.clone()))?;
+                println!("codex-auto-review now routes directly to {slug}");
+            }
+        }
+        CpaCommand::ImageGet => match cpa::image_override(&paths.cpa_profiles)? {
             Some(slug) => println!("image override: {slug}"),
             None => println!("image override: (none; official route)"),
         },
+        CpaCommand::ImageSet { slug } => {
+            let slug = slug.trim().to_owned();
+            if slug.is_empty() {
+                cpa::set_image_override(&paths.cpa_profiles, None)?;
+                println!("image override cleared");
+            } else {
+                cpa::set_image_override(&paths.cpa_profiles, Some(slug.clone()))?;
+                println!("image generation now routes to {slug}");
+            }
+        }
         CpaCommand::ImageModelList => {
-            let credentials = secrets::load(&paths.credentials)?;
-            for slug in codexmux::cpa::image_model_slugs(&settings.cpa, &credentials.cpa_token)? {
+            let token = secrets::load(&paths.credentials)?.cpa_token;
+            for slug in cpa::image_model_slugs(&settings.cpa, &token)? {
                 println!("{slug}");
             }
         }
-        CpaCommand::SearchGet => match codexmux::cpa::search_backend_setting(&paths.cpa_profiles) {
+        CpaCommand::SearchGet => match cpa::search_backend_setting(&paths.cpa_profiles)? {
             Some(setting) if setting.enabled => {
                 println!("shared search: enabled: {}", setting.backend_model);
             }
@@ -999,242 +987,257 @@ fn cpa(paths: &Paths, command: CpaCommand) -> Result<()> {
                 Some(None) => "shared search disabled".to_owned(),
                 Some(Some(slug)) => format!("shared search backend: {slug}"),
             };
-            codexmux::cpa::set_search_backend_setting(&paths.cpa_profiles, override_kind)?;
+            cpa::set_search_backend_setting(&paths.cpa_profiles, override_kind)?;
             println!("{message}");
         }
         CpaCommand::SearchCapabilities => {
-            let store = codexmux::cpa::load_search_capabilities(&paths.search_capabilities)?;
+            let store = cpa::load_search_capabilities(&paths.search_capabilities)?;
             for (slug, entry) in store.entries {
                 println!("{slug} {} {}", entry.status.label(), entry.checked_at);
             }
         }
         CpaCommand::SearchDetect { model, verify } => {
-            let results =
-                codexmux::cpa::detect_search_capabilities(paths, model.as_deref(), verify)?;
-            let count = results.len();
+            let results = cpa::detect_search_capabilities(paths, model.as_deref(), verify)?;
             for (slug, status) in &results {
                 println!("{slug} {}", status.label());
             }
             println!(
                 "cached {} results in {}",
-                count,
+                results.len(),
                 paths.search_capabilities.display()
             );
         }
-        CpaCommand::DirectSet {
-            models,
-            base_url,
-            token_env,
-            upstream_model,
-            context_window,
-            max_context_window,
-        } => {
-            let token = std::env::var(&token_env)
-                .with_context(|| format!("{token_env} must contain the direct route token"))?;
-            let slugs: Vec<String> = models
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect();
-            anyhow::ensure!(!slugs.is_empty(), "no model slugs given");
-            let configured_models = slugs.join(", ");
-            let (models, model_aliases) = match upstream_model {
-                Some(upstream) => {
-                    anyhow::ensure!(
-                        slugs.len() == 1,
-                        "--upstream-model requires exactly one local model"
-                    );
-                    (
-                        Vec::new(),
-                        std::collections::BTreeMap::from([(slugs[0].clone(), upstream)]),
-                    )
-                }
-                None => (slugs.clone(), std::collections::BTreeMap::new()),
-            };
-            codexmux::cpa::set_direct_routes(
-                paths,
-                vec![codexmux::cpa::DirectRoute {
-                    base_url,
-                    token,
-                    models,
-                    model_aliases,
-                    model_metadata: Default::default(),
-                }],
-            )?;
-            apply_direct_context_metadata(paths, &slugs, context_window, max_context_window)?;
-            println!("direct route configured for {configured_models}");
-        }
-        CpaCommand::DirectAdd {
-            models,
-            base_url,
-            token_env,
-            upstream_model,
-            context_window,
-            max_context_window,
-        } => {
-            let token = std::env::var(&token_env)
-                .with_context(|| format!("{token_env} must contain the direct route token"))?;
-            let slugs: Vec<String> = models
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect();
-            anyhow::ensure!(!slugs.is_empty(), "no model slugs given");
-            if let Some(upstream) = upstream_model {
-                anyhow::ensure!(
-                    slugs.len() == 1,
-                    "--upstream-model requires exactly one local model"
-                );
-                codexmux::cpa::add_direct_route_mapping(
-                    paths,
-                    base_url,
-                    token,
-                    slugs[0].clone(),
-                    upstream,
-                )?;
+        CpaCommand::AutostartGet => println!(
+            "cpa autostart: {}",
+            if cpa::cpa_autostart(&paths.cpa_profiles)? {
+                "enabled"
             } else {
-                codexmux::cpa::add_direct_route(paths, base_url, token, slugs.clone())?;
+                "disabled"
             }
-            apply_direct_context_metadata(paths, &slugs, context_window, max_context_window)?;
-            println!("direct route updated for {}", slugs.join(", "));
-        }
-        CpaCommand::DirectRemove { base_url, models } => {
-            let slugs: Vec<String> = models
-                .map(|models| {
-                    models
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            codexmux::cpa::remove_direct_routes(paths, &base_url, &slugs)?;
-            if slugs.is_empty() {
-                println!("direct route removed for {base_url}");
-            } else {
-                println!("removed {} from {base_url}", slugs.join(", "));
-            }
-        }
-        CpaCommand::DirectList => {
-            for route in codexmux::cpa::direct_routes(paths) {
-                let models: Vec<&str> = route
-                    .models
-                    .iter()
-                    .map(String::as_str)
-                    .chain(route.model_aliases.keys().map(String::as_str))
-                    .collect();
-                println!("{} -> {}", models.join(", "), route.base_url);
-                for (slug, metadata) in &route.model_metadata {
-                    let context = metadata
-                        .context_window
-                        .map(|window| format!("context_window={window}"))
-                        .unwrap_or_else(|| "context_window=default".into());
-                    let max_context = metadata
-                        .max_context_window
-                        .map(|window| format!("max_context_window={window}"))
-                        .unwrap_or_else(|| "max_context_window=default".into());
-                    let display_name = metadata
-                        .display_name
-                        .as_deref()
-                        .map(|name| format!("display_name={name:?}"))
-                        .unwrap_or_else(|| "display_name=default".into());
-                    println!("  {slug}: {context} {max_context} {display_name}");
-                }
-            }
-        }
-        CpaCommand::DirectMetadataSet {
-            model,
-            context_window,
-            max_context_window,
-            display_name,
-        } => {
-            codexmux::cpa::set_direct_model_metadata(
-                paths,
-                &model,
-                codexmux::cpa::DirectModelMetadata {
-                    context_window,
-                    max_context_window,
-                    display_name,
-                },
-            )?;
-            println!("direct model metadata updated for {model}");
-        }
-        CpaCommand::DirectClear => {
-            codexmux::cpa::set_direct_routes(paths, Vec::new())?;
-            println!("direct routes cleared");
-        }
-        CpaCommand::DirectDiscover {
-            base_url,
-            token_env,
-        } => {
-            let token = std::env::var(&token_env)
-                .with_context(|| format!("{token_env} must contain the direct route token"))?;
-            for model in codexmux::cpa::direct_model_slugs(&base_url, &token)? {
-                println!("{model}");
-            }
-        }
-        CpaCommand::AutostartGet => match codexmux::cpa::cpa_autostart(&paths.cpa_profiles) {
-            Some(true) => println!("cpa autostart: enabled"),
-            Some(false) => println!("cpa autostart: disabled"),
-            None => println!("cpa autostart: (not set; CPA stays as-is)"),
-        },
+        ),
         CpaCommand::AutostartSet { enabled } => {
-            let enabled = match enabled.trim() {
-                "true" | "1" | "yes" => true,
-                "false" | "0" | "no" => false,
-                other => bail!("enabled must be true or false, got {other:?}"),
-            };
-            codexmux::cpa::set_cpa_autostart(&paths.cpa_profiles, enabled)?;
+            let enabled = parse_flag(&enabled)?;
+            cpa::set_cpa_autostart(&paths.cpa_profiles, enabled)?;
             println!(
                 "cpa autostart: {}",
                 if enabled { "enabled" } else { "disabled" }
             );
         }
-        CpaCommand::ReviewSet { slug } => {
-            let slug = slug.trim().to_owned();
-            if slug.is_empty() {
-                codexmux::cpa::set_review_override(&paths.cpa_profiles, None)?;
-                println!("review override cleared");
-            } else {
-                codexmux::cpa::set_review_override(&paths.cpa_profiles, Some(slug.clone()))?;
-                println!("codex-auto-review now routes directly to {slug}");
-            }
-        }
-        CpaCommand::ImageSet { slug } => {
-            let slug = slug.trim().to_owned();
-            if slug.is_empty() {
-                codexmux::cpa::set_image_override(&paths.cpa_profiles, None)?;
-                println!("image override cleared");
-            } else {
-                codexmux::cpa::set_image_override(&paths.cpa_profiles, Some(slug.clone()))?;
-                println!("image generation now routes to {slug}");
-            }
-        }
     }
     Ok(())
 }
 
-fn codex_config_path() -> Result<PathBuf> {
-    codexmux::codex_config::codex_config_path()
+/// `codexmux menubar-state` output. Field names are a contract with the menu
+/// bar app.
+#[derive(Debug, Serialize)]
+struct MenubarState {
+    version: &'static str,
+    proxy: ProxyStatus,
+    cpa: MenubarCpa,
+    catalog: MenubarCatalog,
+    profiles: MenubarProfiles,
+    /// Stored upstream slug, without the `cpa/` prefix.
+    review_override: Option<String>,
+    /// Stored upstream slug, without the `cpa/` prefix.
+    image_override: Option<String>,
+    search: MenubarSearch,
+    search_capabilities: BTreeMap<String, SearchCapabilityStatus>,
+    errors: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProxyStatus {
+    Running,
+    Idle,
+    NotInstalled,
+}
+
+#[derive(Debug, Serialize)]
+struct MenubarCpa {
+    local: bool,
+    installed: bool,
+    running: bool,
+    version: Option<String>,
+    rollback_available: bool,
+    autostart: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MenubarCatalog {
+    advertise_ultra: bool,
+    unify_comp_hash: bool,
+    models: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MenubarProfiles {
+    active: Option<String>,
+    saved: Vec<MenubarProfile>,
+}
+
+#[derive(Debug, Serialize)]
+struct MenubarProfile {
+    name: String,
+    base_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MenubarSearch {
+    mode: SearchMode,
+    backend_model: Option<String>,
+    default_backend_model: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SearchMode {
+    Default,
+    Enabled,
+    Disabled,
+}
+
+fn print_menubar_state(paths: &Paths) -> Result<()> {
+    let state = menubar_state(paths, launch_agent::runtime_state(), cpa::is_loaded());
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &state)?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+/// Gather the menu bar state from local files. Nothing here takes a lock,
+/// opens a network connection, or reads the Codex config, and a section that
+/// cannot be read falls back to its default with the reason in `errors`.
+fn menubar_state(
+    paths: &Paths,
+    proxy: Result<RuntimeState>,
+    cpa_loaded: Result<bool>,
+) -> MenubarState {
+    let mut errors = Vec::new();
+    let mut note = |section: &str, error: anyhow::Error| {
+        errors.push(format!("{section}: {error:#}"));
+    };
+
+    let proxy = match proxy {
+        Ok(RuntimeState::Running) => ProxyStatus::Running,
+        Ok(RuntimeState::Idle) => ProxyStatus::Idle,
+        Ok(RuntimeState::NotInstalled) => ProxyStatus::NotInstalled,
+        Err(error) => {
+            note("proxy", error);
+            ProxyStatus::NotInstalled
+        }
+    };
+    let settings = Settings::load(&paths.settings).unwrap_or_else(|error| {
+        note("settings", error);
+        Settings::default()
+    });
+    let profile_settings = cpa::profile_settings(&paths.cpa_profiles)
+        .map_err(|error| note("profiles", error))
+        .ok();
+    let running = cpa_loaded.unwrap_or_else(|error| {
+        note("cpa", error);
+        false
+    });
+    let version = cpa::installed_version(paths).unwrap_or_else(|error| {
+        note("cpa version", error);
+        None
+    });
+    let models = cpa::catalog_slugs(paths).unwrap_or_else(|error| {
+        note("catalog", error);
+        None
+    });
+    let search_capabilities = cpa::load_search_capabilities(&paths.search_capabilities)
+        .map(|store| {
+            store
+                .entries
+                .into_iter()
+                .map(|(slug, entry)| (slug, entry.status))
+                .collect()
+        })
+        .unwrap_or_else(|error| {
+            note("search capabilities", error);
+            BTreeMap::new()
+        });
+
+    let profile_settings = profile_settings.as_ref();
+    let search_override = profile_settings.and_then(|profile| profile.search_backend.clone());
+    let (mode, backend_model) = match search_override {
+        None => (SearchMode::Default, None),
+        Some(setting) if setting.enabled => (SearchMode::Enabled, Some(setting.backend_model)),
+        Some(_) => (SearchMode::Disabled, None),
+    };
+    MenubarState {
+        version: env!("CARGO_PKG_VERSION"),
+        proxy,
+        cpa: MenubarCpa {
+            local: settings.cpa.is_loopback(),
+            installed: cpa::binary_path(paths).is_file(),
+            running,
+            version: version.map(|installed| installed.version),
+            rollback_available: cpa::rollback_available(paths),
+            // An unreadable preference means the proxy lifecycle leaves CPA
+            // alone, so it reads as disabled.
+            autostart: profile_settings.is_some_and(|profile| profile.cpa_autostart),
+        },
+        catalog: MenubarCatalog {
+            advertise_ultra: settings.catalog.advertise_ultra,
+            unify_comp_hash: settings.catalog.unify_comp_hash,
+            models: models.unwrap_or_default(),
+        },
+        profiles: MenubarProfiles {
+            active: profile_settings.and_then(|profile| profile.active.clone()),
+            saved: profile_settings
+                .map(|profile| {
+                    profile
+                        .profiles
+                        .iter()
+                        .map(|saved| MenubarProfile {
+                            name: saved.name.clone(),
+                            base_url: saved.base_url.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        },
+        review_override: profile_settings.and_then(|profile| profile.review_override.clone()),
+        image_override: profile_settings.and_then(|profile| profile.image_override.clone()),
+        search: MenubarSearch {
+            mode,
+            backend_model,
+            default_backend_model: settings
+                .web_search
+                .enabled
+                .then(|| settings.web_search.backend_model.clone()),
+        },
+        search_capabilities,
+        errors,
+    }
 }
 
 #[cfg(test)]
-mod bootstrap_tests {
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use serde_json::json;
+
     use super::*;
+
+    fn initialized_root() -> (tempfile::TempDir, Paths) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("CodexMux"));
+        ensure_initialized(&paths).unwrap();
+        (root, paths)
+    }
 
     #[test]
     fn initialization_creates_private_state_and_preserves_it() {
-        let root = tempfile::tempdir().unwrap();
-        let paths = Paths::from_root(root.path().join("CodexMux"));
-
-        ensure_initialized(&paths).unwrap();
+        let (_root, paths) = initialized_root();
         let first_settings = std::fs::read(&paths.settings).unwrap();
         let first_credentials = std::fs::read(&paths.credentials).unwrap();
-        let credentials = secrets::load(&paths.credentials).unwrap();
-        credentials.validate().unwrap();
+        secrets::load(&paths.credentials)
+            .unwrap()
+            .validate()
+            .unwrap();
 
         ensure_initialized(&paths).unwrap();
         assert_eq!(std::fs::read(&paths.settings).unwrap(), first_settings);
@@ -1242,18 +1245,219 @@ mod bootstrap_tests {
             std::fs::read(&paths.credentials).unwrap(),
             first_credentials
         );
+        assert_eq!(
+            std::fs::metadata(&paths.credentials)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&paths.credentials)
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
+    #[test]
+    fn menubar_state_field_names_and_values_are_a_stable_contract() {
+        let (_root, paths) = initialized_root();
+        let mut settings = Settings::load(&paths.settings).unwrap();
+        settings.catalog.advertise_ultra = true;
+        settings.web_search.enabled = true;
+        settings.web_search.backend_model = "gpt-5.6-sol".into();
+        settings.save(&paths.settings).unwrap();
+        std::fs::create_dir_all(cpa::binary_path(&paths).parent().unwrap()).unwrap();
+        std::fs::write(cpa::binary_path(&paths), "binary").unwrap();
+        std::fs::write(
+            paths.root.join("cpa/version.json"),
+            r#"{"version":"7.2.150","sha256":""}"#,
+        )
+        .unwrap();
+        cpa::save_profile(
+            &paths,
+            cpa::CpaProfile {
+                name: "remote".into(),
+                base_url: "https://cpa.example.com/v1".into(),
+                token: "remote-secret-token".into(),
+            },
+        )
+        .unwrap();
+        cpa::set_review_override(&paths.cpa_profiles, Some("glm-5.3-flash".into())).unwrap();
+        cpa::set_search_backend_setting(&paths.cpa_profiles, Some(Some("cpa/grok-4.6".into())))
+            .unwrap();
+        codexmux::catalog::CatalogStore::load(paths.catalog.clone())
+            .unwrap()
+            .replace(
+                &json!({"models": [{"slug": "gpt-5.6-sol"}]}),
+                &json!({"models": [{"slug": "grok-4.6"}]}),
+            )
+            .unwrap();
+        std::fs::write(
+            &paths.search_capabilities,
+            r#"{"entries":{"cpa/grok-4.6":{"status":"supported","checked_at":1}}}"#,
+        )
+        .unwrap();
+
+        let state = menubar_state(&paths, Ok(RuntimeState::Idle), Ok(true));
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "proxy": "idle",
+                "cpa": {
+                    "local": true,
+                    "installed": true,
+                    "running": true,
+                    "version": "7.2.150",
+                    "rollback_available": false,
+                    "autostart": true
+                },
+                "catalog": {
+                    "advertise_ultra": true,
+                    "unify_comp_hash": true,
+                    "models": value["catalog"]["models"].clone()
+                },
+                "profiles": {
+                    "active": null,
+                    "saved": [{"name": "remote", "base_url": "https://cpa.example.com/v1"}]
+                },
+                "review_override": "glm-5.3-flash",
+                "image_override": null,
+                "search": {
+                    "mode": "enabled",
+                    "backend_model": "cpa/grok-4.6",
+                    "default_backend_model": "gpt-5.6-sol"
+                },
+                "search_capabilities": {"cpa/grok-4.6": "supported"},
+                "errors": []
+            })
+        );
+        let models = value["catalog"]["models"].as_array().unwrap();
+        assert!(models.contains(&json!("gpt-5.6-sol")));
+        assert!(models.contains(&json!("cpa/grok-4.6")));
+        assert!(!value.to_string().contains("remote-secret-token"));
+    }
+
+    #[test]
+    fn menubar_state_reports_unreadable_sections_and_falls_back_to_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(root.path().join("CodexMux"));
+        std::fs::create_dir_all(paths.root.join("cpa")).unwrap();
+        std::fs::write(
+            &paths.cpa_profiles,
+            "[[profile]]\nname = \"remote\"\ntoken = sk-live-secret\n",
+        )
+        .unwrap();
+        std::fs::write(paths.root.join("cpa/version.json"), "{").unwrap();
+        std::fs::write(&paths.catalog, "{").unwrap();
+
+        let state = menubar_state(
+            &paths,
+            Err(anyhow::anyhow!("launchctl unavailable")),
+            Err(anyhow::anyhow!("launchctl unavailable")),
+        );
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(value["proxy"], "not_installed");
+        assert_eq!(value["cpa"]["running"], false);
+        assert_eq!(value["cpa"]["autostart"], false);
+        assert_eq!(value["cpa"]["version"], serde_json::Value::Null);
+        assert_eq!(value["catalog"]["models"], json!([]));
+        assert_eq!(value["profiles"], json!({"active": null, "saved": []}));
+        assert_eq!(value["search"]["mode"], "default");
+        let sections = state
+            .errors
+            .iter()
+            .map(|error| error.split(':').next().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sections,
+            [
+                "proxy",
+                "settings",
+                "profiles",
+                "cpa",
+                "cpa version",
+                "catalog"
+            ]
+        );
+        assert!(!value.to_string().contains("sk-live-secret"));
+    }
+
+    #[test]
+    fn lifecycle_manages_only_an_installed_local_cpa_with_autostart() {
+        let (_root, paths) = initialized_root();
+        let settings = Settings::load(&paths.settings).unwrap();
+        // A new user without a CPA binary: the proxy serves official models only.
+        assert!(!lifecycle_manages_cpa(&paths, &settings));
+
+        std::fs::create_dir_all(cpa::binary_path(&paths).parent().unwrap()).unwrap();
+        std::fs::write(cpa::binary_path(&paths), "binary").unwrap();
+        assert!(lifecycle_manages_cpa(&paths, &settings));
+
+        let mut remote = settings.clone();
+        remote.cpa.base_url = "https://cpa.example.com/v1".into();
+        assert!(!lifecycle_manages_cpa(&paths, &remote));
+
+        cpa::set_cpa_autostart(&paths.cpa_profiles, false).unwrap();
+        assert!(!lifecycle_manages_cpa(&paths, &settings));
+
+        std::fs::write(&paths.cpa_profiles, "[broken").unwrap();
+        assert!(!lifecycle_manages_cpa(&paths, &settings));
+    }
+
+    #[test]
+    fn local_cpa_commands_refuse_a_remote_endpoint() {
+        let mut settings = Settings::default();
+        require_local_cpa(&settings, "start").unwrap();
+        settings.cpa.base_url = "https://cpa.example.com/v1".into();
+        let error = require_local_cpa(&settings, "update").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("codexmux cpa update"));
+        assert!(message.contains("https://cpa.example.com/v1"));
+    }
+
+    #[test]
+    fn launchd_logs_rotate_daily_and_keep_seven_files() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = root.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        for day in 1..=9 {
+            std::fs::write(logs.join(format!("codexmux.2020-01-0{day}.log")), "old").unwrap();
         }
+        std::fs::write(logs.join("stderr.log"), "panic output").unwrap();
+
+        let mut appender = log_file_appender(&logs).unwrap();
+        appender.write_all(b"started\n").unwrap();
+        appender.flush().unwrap();
+
+        let mut names = std::fs::read_dir(&logs)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert!(names.contains(&"stderr.log".to_owned()));
+        let rolling = names
+            .iter()
+            .filter(|name| name.starts_with("codexmux.") && name.ends_with(".log"))
+            .collect::<Vec<_>>();
+        assert_eq!(rolling.len(), 7, "{names:?}");
+        let today = rolling
+            .iter()
+            .find(|name| !name.starts_with("codexmux.2020-"))
+            .expect("today's log file");
+        let date = today
+            .strip_prefix("codexmux.")
+            .and_then(|name| name.strip_suffix(".log"))
+            .unwrap();
+        assert_eq!(date.len(), "YYYY-MM-DD".len());
+        assert_eq!(
+            std::fs::read_to_string(logs.join(today)).unwrap(),
+            "started\n"
+        );
+    }
+
+    #[test]
+    fn flags_accept_only_boolean_words() {
+        assert!(parse_flag("true").unwrap());
+        assert!(!parse_flag(" no ").unwrap());
+        assert!(parse_flag("maybe").is_err());
     }
 }

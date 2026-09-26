@@ -21,9 +21,11 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Update Rust stable
-        run: rustup update stable
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
@@ -33,6 +35,9 @@ jobs:
 
       - name: Test Rust
         run: cargo test --locked --all-targets
+
+      - name: Test menu bar app
+        run: swift test --package-path menubar
 
       - name: Build release CLI
         run: cargo build --locked --release
